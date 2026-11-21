@@ -1,0 +1,9 @@
+{
+  "src": [
+    "pages/Index",
+    "pages/Configs",
+    "pages/AddConfig",
+    "pages/AddRules",
+    "pages/Connections"
+  ]
+}

@@ -1,0 +1,22 @@
+way — HarmonyOS 上的 xray 客户端
+Copyright (c) 2026 way contributors
+
+本仓库包含两部分不同来源的代码：
+
+1. 应用层（`app/`、`tools/`、`verify/`、文档）
+   由本项目作者编写，按 Mozilla Public License 2.0（MPL-2.0）发布，全文见 `LICENSE`。
+
+2. 内核与移植补丁（`kernel/`）
+   基于 aimalygin/xray-rust（https://github.com/aimalygin/xray-rust），
+   版权所有其作者，按 MPL-2.0 授权。`kernel/way-ohos.patch` 是对该项目的修改，
+   同样以 MPL-2.0 提供；应用补丁后的源文件即为修改后的版本。
+
+3. 第三方数据
+   `tools/` 与 `app/entry/src/main/resources/rawfile/` 中的分流规则数据来自
+   ACL4SSR（https://github.com/ACL4SSR/ACL4SSR），版权归其作者，
+   本项目仅将 Clash 清单转换为 way 的规则集 JSON 格式。
+
+MPL-2.0 全文：见 `LICENSE`。
+
+本项目为**非官方**移植，与 Xray-core、xray-rust、ACL4SSR 的维护者无隶属关系，
+也不代表其立场。仅供个人学习与技术研究使用；如有权利或授权问题，请通过 Issues 联系维护者。

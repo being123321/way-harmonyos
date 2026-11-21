@@ -1,0 +1,21 @@
+ACL4SSR -> way rule set (tools/acl4ssr2way.py)
+
+lists/targets (source order):
+  Tencent, LocalAreaNetwork, UnBan, ChinaDomain, GoogleCN, Microsoft, Apple, ChinaCompanyIp, ChinaIp -> direct
+  BanAD, BanProgramAD -> block
+  Telegram, Netflix, ProxyLite -> proxy
+
+generated: lists=14 rules=13086 domains=5246 ip=7840
+bundled rawfile: app/entry/src/main/resources/rawfile/acl4ssr-way-rules.json (263727 B)
+
+source cross-check (converter.convert_rules from subscription-forge): every source rule is covered by this set
+  (the source prunes redundant child suffixes; this set keeps them, same match result)
+
+core parser check (host-import --check-config -> xray_config::parse_xray_json):
+  outbounds=10 rules=16
+  tags=mwq58016qyv,mwq5800w134q,mwq5800z17hl,mwq58010135n,mwq580121l0u,mwq58014hwl,mwq580181af6,mwq5801a11x5,direct,block
+  diagnostic_errors=0 dangling_rules=0
+
+notes:
+  config = 8 node outbounds (tag=entry id) + direct/blackhole, 16 routing rules
+  (blockQuic + private CIDRs + 14 lists), 266 KB, 0 diagnostics, 0 dangling outboundTag

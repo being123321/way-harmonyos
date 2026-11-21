@@ -1,0 +1,388 @@
+diff --git a/crates/xray-config/src/model.rs b/crates/xray-config/src/model.rs
+index aacd18c..6451b27 100644
+--- a/crates/xray-config/src/model.rs
++++ b/crates/xray-config/src/model.rs
+@@ -364,6 +364,9 @@ pub struct RoutingRule {
+     pub protocols: Option<Vec<String>>,
+     /// `attrs`: patterns the flow's attributes of the same names must match.
+     pub attributes: Option<RoutingAttributes>,
++    /// `ruleTag`: an observability label a config may attach to a rule. Xray
++    /// keeps it beside the decision; the connection snapshot reports it.
++    pub rule_tag: Option<String>,
+     pub target: RoutingRuleTarget,
+ }
+ 
+diff --git a/crates/xray-config/src/parser/routing.rs b/crates/xray-config/src/parser/routing.rs
+index 523425d..88c2003 100644
+--- a/crates/xray-config/src/parser/routing.rs
++++ b/crates/xray-config/src/parser/routing.rs
+@@ -589,6 +589,11 @@ impl Parser<'_> {
+         let attributes =
+             self.routing_attributes(rule.get("attrs"), &format!("{rule_path}.attrs"))?;
+ 
++        // Xray keeps `ruleTag` for observability; it never affects matching.
++        let rule_tag: Option<String> = match rule.get("ruleTag") {
++            Some(Value::String(tag)) if !tag.is_empty() => Some(tag.to_owned()),
++            _ => None,
++        };
+         let rule = RoutingRule {
+             inbound_tags,
+             networks,
+@@ -599,6 +604,7 @@ impl Parser<'_> {
+             origin,
+             protocols,
+             attributes,
++            rule_tag,
+             target,
+         };
+         if !rule.has_condition() {
+diff --git a/crates/xray-core-rs/src/connection.rs b/crates/xray-core-rs/src/connection.rs
+index a63d17e..0e0f139 100644
+--- a/crates/xray-core-rs/src/connection.rs
++++ b/crates/xray-core-rs/src/connection.rs
+@@ -38,6 +38,12 @@ pub struct ConnectionInfo {
+     pub outbound_tag: Option<String>,
+     pub network: Network,
+     pub target: Target,
++    /// The domain sniffing recognized for this flow, when a sniffer named one.
++    /// The address above stays the dial target, so this is the readable name.
++    pub sniffed_domain: Option<String>,
++    /// The `ruleTag` of the routing rule that picked the outbound, when the
++    /// config labels its rules. Observability only.
++    pub rule_tag: Option<String>,
+     pub started_unix_ms: u64,
+ }
+ 
+@@ -203,6 +209,19 @@ impl ConnectionRegistry {
+         inbound_tag: Option<String>,
+         outbound_tag: Option<String>,
+         target: Target,
++    ) -> ConnectionLease {
++        self.register_routed(inbound_tag, outbound_tag, None, None, target)
++    }
++
++    /// Registers a flow together with the observability labels of the routing
++    /// decision: the matched rule's `ruleTag` and the domain sniffing named.
++    pub(crate) fn register_routed(
++        self: &Arc<Self>,
++        inbound_tag: Option<String>,
++        outbound_tag: Option<String>,
++        rule_tag: Option<String>,
++        sniffed_domain: Option<String>,
++        target: Target,
+     ) -> ConnectionLease {
+         let id = loop {
+             let value = self.next_id.fetch_add(1, Ordering::Relaxed);
+@@ -219,6 +238,8 @@ impl ConnectionRegistry {
+             outbound_tag: outbound_tag.clone(),
+             network: target.network,
+             target,
++            sniffed_domain,
++            rule_tag,
+             started_unix_ms: unix_millis(),
+         };
+         let mut state = self
+@@ -376,9 +397,11 @@ mod tests {
+     #[test]
+     fn snapshot_close_and_accounting_share_one_revisioned_registry() {
+         let registry = Arc::new(ConnectionRegistry::new());
+-        let lease = registry.register(
++        let lease = registry.register_routed(
+             Some("http-in".to_owned()),
+             Some("proxy-a".to_owned()),
++            Some("ProxyLite".to_owned()),
++            Some("passport.twitch.tv".to_owned()),
+             target(),
+         );
+         let id = lease.id;
+diff --git a/crates/xray-core-rs/src/outbound.rs b/crates/xray-core-rs/src/outbound.rs
+index 7e9c3bc..03e1a29 100644
+--- a/crates/xray-core-rs/src/outbound.rs
++++ b/crates/xray-core-rs/src/outbound.rs
+@@ -47,7 +47,7 @@ pub(crate) use freedom_udp::FreedomUdpSocket;
+ 
+ use xhttp::*;
+ 
+-use routing::{select_routed_target, select_routed_target_with_resolver};
++use routing::{select_routed_rule, select_routed_target, select_routed_target_with_resolver};
+ 
+ use std::collections::{HashMap, HashSet};
+ use std::future::Future;
+@@ -3171,6 +3171,22 @@ impl OutboundRouter {
+         self.factory.cached_tcp_outbound(node)
+     }
+ 
++    /// The `ruleTag` of the rule a synchronous routing pass would match for this
++    /// target: observability for the connection snapshot, never a routing input.
++    pub(crate) fn matched_rule_tag(&self, route: &RouteContext<'_>,
++        target: &Target) -> Option<String> {
++        let policy = self.routing_policy_state();
++        select_routed_rule(
++            &policy.routing,
++            route,
++            target_domain(target),
++            target_ip(target),
++            Some(target_network(target)),
++            Some(target.port),
++        )
++        .and_then(|rule| rule.rule_tag.clone())
++    }
++
+     /// Selects a TCP outbound from the original session metadata and retains
+     /// its configured tag for runtime logging.
+     ///
+diff --git a/crates/xray-core-rs/src/outbound/routing.rs b/crates/xray-core-rs/src/outbound/routing.rs
+index e54d5f4..260cb72 100644
+--- a/crates/xray-core-rs/src/outbound/routing.rs
++++ b/crates/xray-core-rs/src/outbound/routing.rs
+@@ -121,13 +121,31 @@ async fn select_on_demand<'a>(
+     Ok(None)
+ }
+ 
+-pub(super) fn select_routed_target<'a>(
++/// The rule a synchronous routing pass would match, for observability only:
++/// the connection snapshot reports its `ruleTag`. Returns `None` when no rule
++/// matches (the default outbound takes the flow).
++pub(super) fn select_routed_rule<'a>(
+     routing: &'a RoutingConfig,
+     route: &RouteContext<'_>,
+     target_domain: Option<&str>,
+     target_ip: Option<&IpAddr>,
+     target_network: Option<Network>,
+     target_port: Option<u16>,
++) -> Option<&'a xray_config::RoutingRule> {
++    routing
++        .rules
++        .iter()
++        .find(|rule| {
++            rule.matches_route(route, target_domain, target_ip, target_network, target_port)
++        })
++}
++
++pub(super) fn select_routed_target<'a>(    routing: &'a RoutingConfig,
++    route: &RouteContext<'_>,
++    target_domain: Option<&str>,
++    target_ip: Option<&IpAddr>,
++    target_network: Option<Network>,
++    target_port: Option<u16>,
+ ) -> Option<&'a RoutingRuleTarget> {
+     routing
+         .rules
+diff --git a/crates/xray-core-rs/src/runtime_log.rs b/crates/xray-core-rs/src/runtime_log.rs
+index d6a1174..50b8a9b 100644
+--- a/crates/xray-core-rs/src/runtime_log.rs
++++ b/crates/xray-core-rs/src/runtime_log.rs
+@@ -376,12 +376,26 @@ fn open_log_file_unix(path: &Path) -> io::Result<File> {
+     use std::os::unix::ffi::OsStrExt;
+     use std::path::Component;
+ 
++    // O_PATH needs no read permission on the directory itself. The Android/OHOS
++    // app sandbox grants only execute on ancestors of the data directory
++    // (/data/app/...), where O_RDONLY fails with EACCES and aborts startup.
++    fn directory_flags() -> libc::c_int {
++        #[cfg(any(target_os = "linux", target_os = "android"))]
++        {
++            libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY
++        }
++        #[cfg(not(any(target_os = "linux", target_os = "android")))]
++        {
++            libc::O_RDONLY
++                | libc::O_CLOEXEC
++                | libc::O_NOFOLLOW
++                | libc::O_NONBLOCK
++                | libc::O_DIRECTORY
++        }
++    }
++
+     fn open_directory(path: &CString) -> io::Result<File> {
+-        let flags = libc::O_RDONLY
+-            | libc::O_CLOEXEC
+-            | libc::O_NOFOLLOW
+-            | libc::O_NONBLOCK
+-            | libc::O_DIRECTORY;
++        let flags = directory_flags();
+         // SAFETY: `path` is NUL-terminated and flags request a read-only
+         // directory descriptor. The returned fd is uniquely owned.
+         let fd = unsafe { libc::open(path.as_ptr(), flags) };
+@@ -419,11 +433,7 @@ fn open_log_file_unix(path: &Path) -> io::Result<File> {
+                 "runtime log directory component contains NUL",
+             )
+         })?;
+-        let flags = libc::O_RDONLY
+-            | libc::O_CLOEXEC
+-            | libc::O_NOFOLLOW
+-            | libc::O_NONBLOCK
+-            | libc::O_DIRECTORY;
++        let flags = directory_flags();
+         // SAFETY: the directory fd is live and `component` is one
+         // NUL-terminated path component. No writable access is requested.
+         let mut fd = unsafe { libc::openat(current_dir.as_raw_fd(), component.as_ptr(), flags) };
+@@ -721,3 +731,4 @@ mod tests {
+         dir
+     }
+ }
++
+diff --git a/crates/xray-core-rs/src/socks/tproxy/linux.rs b/crates/xray-core-rs/src/socks/tproxy/linux.rs
+index 80c1825..9566a2b 100644
+--- a/crates/xray-core-rs/src/socks/tproxy/linux.rs
++++ b/crates/xray-core-rs/src/socks/tproxy/linux.rs
+@@ -319,7 +319,9 @@ fn recv_original(
+     msg.msg_iov = &mut iov;
+     msg.msg_iovlen = 1;
+     msg.msg_control = control.as_mut_ptr().cast();
+-    msg.msg_controllen = mem::size_of_val(&control);
++    // `msg_controllen` is `size_t` on glibc but `socklen_t` in some musl targets
++    // (OHOS), so let the field type pick the width.
++    msg.msg_controllen = mem::size_of_val(&control) as _;
+     // SAFETY: every output pointer refers to the live writable allocation above.
+     let len = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut msg, libc::MSG_DONTWAIT) };
+     if len < 0 {
+@@ -343,7 +345,7 @@ fn recv_original(
+         while !cmsg.is_null() {
+             let header = &*cmsg;
+             let size = libc::CMSG_LEN(0) as usize;
+-            if header.cmsg_len < size {
++            if (header.cmsg_len as usize) < size {
+                 break;
+             }
+             if (header.cmsg_level == libc::IPPROTO_IP && header.cmsg_type == libc::IP_ORIGDSTADDR)
+@@ -352,7 +354,7 @@ fn recv_original(
+             {
+                 destination = Some(decode_address(
+                     libc::CMSG_DATA(cmsg).cast(),
+-                    header.cmsg_len - size,
++                    (header.cmsg_len as usize) - size,
+                 )?);
+             }
+             cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+diff --git a/crates/xray-core-rs/src/tun.rs b/crates/xray-core-rs/src/tun.rs
+index 26a2c64..42cd872 100644
+--- a/crates/xray-core-rs/src/tun.rs
++++ b/crates/xray-core-rs/src/tun.rs
+@@ -3184,6 +3184,7 @@ async fn bridge_tcp_flow(
+     let mut initial_upload = VecDeque::new();
+     let mut protocol = None;
+     let mut attributes = None;
++    let mut sniffed_domain: Option<String> = None;
+     if let TcpBridgeDestination::Standard(restored) = &destination {
+         let provenance = restored.provenance;
+         let sniffed_routing = context.outbound_router.sniffed_routing();
+@@ -3222,16 +3223,22 @@ async fn bridge_tcp_flow(
+             attributes = sniffed.attributes;
+             if let Some(sniffed) = sniffed.sniffed {
+                 protocol = Some(sniffed.protocol);
+-                // Only an unmapped fake IP takes its sniffed domain; other
+-                // flows are sniffed for their protocol alone.
+-                if let Some(target) = sniffed
+-                    .target
+-                    .filter(|_| provenance == FakeIpTargetProvenance::InPoolUnmapped)
+-                {
+-                    destination = TcpBridgeDestination::Standard(RestoredClientTarget {
+-                        target: target.route_target,
+-                        provenance: FakeIpTargetProvenance::InPoolUnmapped,
+-                    });
++                if let Some(target) = sniffed.target {
++                    // The name sniffing found is reported even when routing
++                    // keeps dialing the original address.
++                    if let RoutingTargetAddr::Domain(domain) =
++                        &target.route_target.addr
++                    {
++                        sniffed_domain = Some(domain.clone());
++                    }
++                    // Only an unmapped fake IP takes its sniffed domain as the
++                    // target; other flows are sniffed for their protocol alone.
++                    if provenance == FakeIpTargetProvenance::InPoolUnmapped {
++                        destination = TcpBridgeDestination::Standard(RestoredClientTarget {
++                            target: target.route_target,
++                            provenance: FakeIpTargetProvenance::InPoolUnmapped,
++                        });
++                    }
+                 }
+             }
+         }
+@@ -3334,6 +3341,7 @@ async fn bridge_tcp_flow(
+         client.map(InboundSource::tcp),
+         protocol,
+         attributes,
++        sniffed_domain,
+     )
+     .await;
+ }
+@@ -3345,8 +3353,12 @@ fn should_sniff_tun_tcp(
+     provenance: FakeIpTargetProvenance,
+     routes_by_sniffing: bool,
+ ) -> bool {
+-    (provenance == FakeIpTargetProvenance::InPoolUnmapped || routes_by_sniffing)
+-        && crate::sniffing::should_sniff_tcp(config, routes_by_sniffing)
++    // Xray-core sniffs a TUN flow whenever the inbound's destOverride names
++    // its protocol, which is also what puts a readable domain on the
++    // connection snapshot. Fake-IP flows need the name for routing alone.
++    crate::sniffing::should_sniff_tcp(config, routes_by_sniffing)
++        || (provenance == FakeIpTargetProvenance::InPoolUnmapped
++            && config.is_some_and(|config| config.enabled && !config.metadata_only))
+ }
+ 
+ async fn read_tun_tcp_sniff_payload(
+@@ -3458,6 +3470,7 @@ async fn bridge_preopened_dns_tcp_flow(
+         None,
+         None,
+         None,
++        None,
+     )
+     .await;
+ }
+@@ -3484,6 +3497,7 @@ async fn bridge_tcp_flow_inner(
+     source: Option<InboundSource>,
+     protocol: Option<crate::sniffing::SniffedProtocol>,
+     attributes: Option<xray_config::ContentAttributes>,
++    sniffed_domain: Option<String>,
+ ) {
+     let collect_tcp_timings = context.tun_runtime_options.collect_tcp_timings;
+     let tcp_timing_start = collect_tcp_timings.then(StdInstant::now);
+@@ -3611,9 +3625,13 @@ async fn bridge_tcp_flow_inner(
+                 continue;
+             }
+         };
+-        let connection = context.connection_registry.register(
++        let connection = context.connection_registry.register_routed(
+             context.inbound_tag.clone(),
+             outbound_tag.clone(),
++            context
++                .outbound_router
++                .matched_rule_tag(&route, &dial_target),
++            sniffed_domain.clone(),
+             client_target.clone(),
+         );
+         let mut connection_close = connection.close_receiver();
+@@ -4917,9 +4935,17 @@ async fn bridge_udp_flow(
+         );
+     }
+ 
+-    let connection = context.connection_registry.register(
++    let sniffed_domain: Option<String> = match &route_target.addr {
++        RoutingTargetAddr::Domain(domain) => Some(domain.clone()),
++        RoutingTargetAddr::Ip(_) => None,
++    };
++    let connection = context.connection_registry.register_routed(
+         context.inbound_tag.clone(),
+         selected.tag.clone(),
++        context
++            .outbound_router
++            .matched_rule_tag(&route, &route_target),
++        sniffed_domain,
+         dial_target.clone(),
+     );
+     let connection_close = connection.close_receiver();
+diff --git a/crates/xray-ffi/src/lib.rs b/crates/xray-ffi/src/lib.rs
+index 0c713c6..c945981 100644
+--- a/crates/xray-ffi/src/lib.rs
++++ b/crates/xray-ffi/src/lib.rs
+@@ -4354,6 +4354,8 @@ fn connection_snapshot_json(core: &Core) -> String {
+                 "addressType": address_type,
+                 "address": address,
+                 "port": connection.target.port,
++                "ruleTag": connection.rule_tag,
++                "sniffedDomain": connection.sniffed_domain,
+                 "startedUnixMs": connection.started_unix_ms,
+             })
+         })

@@ -1,0 +1,8 @@
+{
+  "name": "xray-harmony",
+  "version": "0.10.1",
+  "description": "Xray (xray-rust) client for HarmonyOS",
+  "modelVersion": "26.0.0",
+  "dependencies": {},
+  "devDependencies": {}
+}

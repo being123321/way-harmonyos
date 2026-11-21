@@ -1,0 +1,16 @@
+# build outputs
+app/**/build/
+app/entry/.cxx/
+app/entry/.preview/
+app/.hvigor/
+app/oh_modules/
+app/node_modules/
+app/local.properties
+app/entry/src/main/cpp/prebuilt/
+# artifacts
+dist/
+release/
+*.hap
+*.log
+tools/cache/
+tools/out/
