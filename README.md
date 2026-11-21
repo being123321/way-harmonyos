@@ -11,7 +11,7 @@ way 是一个运行在 HarmonyOS（ArkTS + NAPI）上的 xray 客户端：内核
 | 适配 | HarmonyOS API 26（真机 `VDE-AL10` 验证），仅 `arm64-v8a` |
 | 语言 | ArkTS / C++（NAPI）/ Rust（内核，见 `kernel/`） |
 | 许可证 | MPL-2.0（见 `LICENSE`、`NOTICE`） |
-| 最新构建 | `dist/way-0.10.1-unsigned.hap`（28,602,840 B，`CEE0AB02…627D8350`） |
+| 最新构建 | [Releases / v0.10.1](https://github.com/being123321/way-harmonyos/releases/tag/v0.10.1)（`way-0.10.1-unsigned.hap`，28,602,840 B，`CEE0AB02…627D8350`） |
 | 应用图标 | 深色底 + 盘成 W 的公路 + U 形弧光（w + u），见 `docs/app-icon.png` |
 
 ## 功能
@@ -75,4 +75,5 @@ docs-ARCHITECTURE.md  实现说明（分流、DNS、保活、已知限制等）
 - 协议实现与分流策略参考 Xray-core 与 v2rayNG 的行为。
 
 联系方式：请使用本仓库的 Issues。
+
 
