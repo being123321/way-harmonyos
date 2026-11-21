@@ -1,10 +1,12 @@
 # 发布记录
 
-已发布：**https://github.com/being123321/way-harmonyos**（Public，默认分支 `main`，许可证 MPL-2.0）
+已发布：**https://github.com/being123321/way-harmonyos**（Public，默认分支 main，许可证 MPL-2.0）
 
+- Release `v0.10.2`：https://github.com/being123321/way-harmonyos/releases/tag/v0.10.2
+  - 附件 `way-0.10.2-unsigned.hap`，28,651,532 B，SHA256 `EB0AF4D194510EE948DB9A6889DEB749E84D4B9E49DF99C39A1A5CAD4DF618CB`
+  - 启动不再串行解析节点域名；测速改纯 IP 目标 + UDP DNS 预解析、取消旧探针；手动清后台不重连
 - Release `v0.10.1`：https://github.com/being123321/way-harmonyos/releases/tag/v0.10.1
   - 附件 `way-0.10.1-unsigned.hap`，28,602,840 B，SHA256 `CEE0AB02FD9ED8CFF70435A3DF2AEB908032E268F40E265CAEEC48D2627D8350`
-  - 直链：https://github.com/being123321/way-harmonyos/releases/download/v0.10.1/way-0.10.1-unsigned.hap
 
 ## 仓库内容
 
@@ -30,3 +32,4 @@ $env:GH_CONFIG_DIR = 'D:\Backup\Documents\deepseek-harness\default-workspace\xra
 $env:Path = 'D:\Backup\Documents\deepseek-harness\default-workspace\tools\portablegit\cmd;' + $env:Path
 pwsh -File .\push.ps1
 ```
+
