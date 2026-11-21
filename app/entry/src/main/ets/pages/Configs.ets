@@ -1,7 +1,7 @@
 import { common } from '@kit.AbilityKit';
 import type { BusinessError } from '@kit.BasicServicesKit';
 import { promptAction, router } from '@kit.ArkUI';
-import { Insets, nodeTypeLabel, pageInsets, tunnelOutboundTags, tunnelUp } from '../common/Xray';
+import { Insets, cancelProbes, nodeTypeLabel, pageInsets, tunnelOutboundTags, tunnelUp } from '../common/Xray';
 import {
   ConfigEntry, ConfigStore, SubscriptionRecord, entriesOfSub, manualEntries, readStore, readSubs,
   removeEntry, removeSub, selectEntry, updateSub
@@ -57,6 +57,8 @@ struct Configs {
 
   aboutToDisappear(): void {
     this.disposed = true;
+    // Leaving the page: stop the probes still in flight for this list.
+    cancelProbes();
   }
 
   private refresh(): void {
@@ -275,6 +277,10 @@ struct Configs {
       return;
     }
     this.testing = true;
+    // Drop the previous round: a latency measured while disconnected is a TCP
+    // handshake, and mixing it with this round's through-proxy numbers (sorted
+    // together) showed rows like "19 ms" above "635 ms · HTTP".
+    this.latency = [];
     this.viaTunnel = tunnelUp(context);
     this.probeTags = this.viaTunnel ? tunnelOutboundTags(context) : [];
     this.testTotal = scope.length;
@@ -873,3 +879,4 @@ function formatTimeShort(ts: number): string {
   return pad(date.getMonth() + 1) + '-' + pad(date.getDate()) + ' ' +
     pad(date.getHours()) + ':' + pad(date.getMinutes());
 }
+

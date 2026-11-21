@@ -39,6 +39,10 @@ export const RELOAD_RESULT_EVENT: string = 'com.way.app.RELOAD_ROUTING_RESULT';
 export const CONN_REQUEST_EVENT: string = 'com.way.app.CONNECTIONS';
 export const CONN_RESULT_EVENT: string = 'com.way.app.CONNECTIONS_RESULT';
 export const PROBE_RESULT_EVENT: string = 'com.way.app.PROBE_RESULT';
+// Cancels the probes already in flight (ABI 1.15): the UI sends this when a new
+// run starts or the node page closes, so stale probes stop early instead of
+// occupying workers until their timeout.
+export const PROBE_CANCEL_EVENT: string = 'com.way.app.PROBE_CANCEL';
 
 export const BUNDLE_NAME: string = 'com.way.app';
 export const VPN_ABILITY: string = 'XrayVpnAbility';
@@ -402,6 +406,18 @@ function numberOf(value: Object | undefined, fallback: number): number {
     return Number.isFinite(parsed) ? parsed : fallback;
   }
   return fallback;
+}
+
+// Ask the extension to cancel the probes already running. Fire-and-forget: the
+// caller does not wait for an answer, a cancelled probe just resolves as a
+// failure in whichever worker still awaits it.
+export function cancelProbes(): void {
+  const data: commonEventManager.CommonEventPublishData = { parameters: {} };
+  try {
+    commonEventManager.publish(PROBE_CANCEL_EVENT, data, () => {
+    });
+  } catch (error) {
+  }
 }
 
 // HTTP(S) GET through one named outbound of the running core: the node's real

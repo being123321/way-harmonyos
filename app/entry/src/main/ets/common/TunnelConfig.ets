@@ -1,5 +1,5 @@
 import type { common } from '@kit.AbilityKit';
-import { SplitOptions, applyBuiltInRules } from './Rules';
+import { SplitOptions, applyBootstrapHosts, applyBuiltInRules } from './Rules';
 import { ConfigEntry, readStore } from './Store';
 import { isHelperOutbound, outboundEndpoint, outboundTag, saveConfig } from './Xray';
 
@@ -160,6 +160,11 @@ export function buildAndSaveTunnel(context: common.Context, entry: ConfigEntry,
     nodes.push(node);
   }
   const tunnel: TunnelConfigResult = buildTunnelConfig(entry.json, entry.id, nodes, options);
-  saveConfig(context, tunnel.text);
-  return tunnel;
+  const text: string = applyBootstrapHosts(tunnel.text, options.bootstrapHosts);
+  const single: string = applyBootstrapHosts(tunnel.single, options.bootstrapHosts);
+  const result: TunnelConfigResult = {
+    text: text, single: single, count: tunnel.count, multi: tunnel.multi
+  };
+  saveConfig(context, text);
+  return result;
 }

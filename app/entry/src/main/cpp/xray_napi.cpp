@@ -388,6 +388,22 @@ napi_value Probe(napi_env env, napi_callback_info info) {
   return result;
 }
 
+// Cancels the probes already in flight (ABI 1.15): the node list calls this as
+// soon as another run starts or the page closes, so a probe nobody waits for no
+// longer holds a worker (and the core's probe slot) for its full timeout.
+napi_value ProbeCancel(napi_env env, napi_callback_info info) {
+  std::shared_lock<std::shared_mutex> guard(g_mutex);
+  if (g_core == nullptr) {
+    return Throw(env, "cancelProbes: core is not running");
+  }
+  XrayError *err = nullptr;
+  const XrayStatus status = xray_core_cancel_inflight_outbound_probes(g_core, &err);
+  if (status != XRAY_STATUS_OK) {
+    return Throw(env, "cancelProbes failed: " + TakeError(&err, "cancel error"));
+  }
+  return nullptr;
+}
+
 // Result of one tagged probe, filled on a NAPI worker thread.
 struct OutboundProbeWork {
   napi_async_work work = nullptr;
@@ -642,6 +658,7 @@ static napi_value Init(napi_env env, napi_value exports) {
       {"rebind", nullptr, Rebind, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"probe", nullptr, Probe, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"probeOutbound", nullptr, ProbeOutbound, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"cancelProbes", nullptr, ProbeCancel, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"replaceRouting", nullptr, ReplaceRouting, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"connectionSnapshot", nullptr, ConnectionSnapshot, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"closeConnection", nullptr, CloseConnection, nullptr, nullptr, nullptr, napi_default, nullptr},

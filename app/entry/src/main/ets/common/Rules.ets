@@ -26,6 +26,40 @@ export interface SplitOptions {
   blockAds: boolean;
   // Domestic DoH (direct) + foreign DoH (through the node) instead of plain UDP.
   doh: boolean;
+  // Server addresses resolved by the app before connecting. The core's probe
+  // bootstrap resolver otherwise asks the configured DoH through the tunnel for
+  // every node's server name, which made each probe look 2-3 s slower.
+  bootstrapHosts: Record<string, string[]> | null;
+}
+
+// Merges pre-resolved node server addresses into `dns.hosts`, so the core (and
+// its outbound probe path) never has to resolve them again through the tunnel.
+export function applyBootstrapHosts(configJson: string,
+  hosts: Record<string, string[]> | null): string {
+  if (hosts === null) {
+    return configJson;
+  }
+  try {
+    const root: Record<string, Object> = JSON.parse(configJson) as Record<string, Object>;
+    const dnsValue: Object | undefined = root['dns'];
+    if (dnsValue === undefined || dnsValue === null) {
+      return configJson;
+    }
+    const dns: Record<string, Object> = dnsValue as Record<string, Object>;
+    const existing: Object | undefined = dns['hosts'];
+    const merged: Record<string, Object> = existing === undefined
+      ? {} as Record<string, Object>
+      : existing as Record<string, Object>;
+    const names: string[] = Object.keys(hosts);
+    for (const name of names) {
+      merged[name] = hosts[name];
+    }
+    dns['hosts'] = merged;
+    root['dns'] = dns;
+    return JSON.stringify(root);
+  } catch (error) {
+    return configJson;
+  }
 }
 
 export const MODE_GFW: string = 'gfw';

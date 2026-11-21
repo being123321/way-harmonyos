@@ -1,6 +1,6 @@
 import { socket } from '@kit.NetworkKit';
 import { ConfigEntry } from './Store';
-import { NodeEndpoint, nodeEndpoint, probeOutbound } from './Xray';
+import { NodeEndpoint, cancelProbes, nodeEndpoint, probeOutbound } from './Xray';
 import { udpQuicLatency } from './Latency';
 
 // Delay test, modelled on v2rayNG:
@@ -13,9 +13,17 @@ import { udpQuicLatency } from './Latency';
 //     such as Hysteria2) to the node itself, since there is no tunnel to use;
 //   * four probes at a time, four seconds each, results ordered by delay.
 export const TEST_CONCURRENCY: number = 4;
-export const TEST_TIMEOUT_MS: number = 4000;
+export const TEST_TIMEOUT_MS: number = 6000;
 
-const TEST_URL: string = 'https://www.gstatic.com/generate_204';
+// Plain HTTP on purpose (mihomo/FlClash's default url-test target): a 204
+// over TLS costs two extra round trips that have nothing to do with how the
+// node relays traffic, and it made every node look 300-600 ms slower than the
+// number users compare against in other clients.
+// Anycast IP, no DNS at all: resolving the probe host locally (UDP or DoH)
+// hands the node a China-optimised address, which an overseas node then has to
+// reach the slow way. A literal needs no resolver on either side.
+const TEST_URL: string = 'http://1.1.1.1/';
+export const TEST_HOST: string = '';
 
 export const VIA_HTTP: string = 'http';
 export const VIA_TCP: string = 'tcp';
@@ -100,7 +108,16 @@ export async function testOne(entry: ConfigEntry, viaTunnel: boolean,
   tag: string): Promise<LatencyResult> {
   const at: number = Date.now();
   try {
-    if (viaTunnel && tag.length > 0) {
+    if (viaTunnel) {
+      if (tag.length === 0) {
+        // Connected, but this node is not part of the running config (added or
+        // edited after connecting). A direct TCP probe here would resolve the
+        // server through the tunnel's fake-IP DNS and "connect" to a local
+        // address in a few ms — the row then claims 3 ms. Report "untested"
+        // instead; the next connect carries the node and the probe works.
+        const untested: LatencyResult = { id: entry.id, ms: -1, via: VIA_NONE, at: at };
+        return untested;
+      }
       const probe = await probeOutbound(TEST_URL, TEST_TIMEOUT_MS, tag);
       if (probe.status === 0) {
         // failureKind 0 with a delay is a 2xx/3xx answer; every other kind is
@@ -109,8 +126,8 @@ export async function testOne(entry: ConfigEntry, viaTunnel: boolean,
         const result: LatencyResult = { id: entry.id, ms: ok ? probe.delayMs : -1, via: VIA_HTTP, at: at };
         return result;
       }
-      // The tag is not part of the running config (older or fallback config):
-      // measure the server directly instead of inventing a tunnel number.
+      const failed: LatencyResult = { id: entry.id, ms: -1, via: VIA_HTTP, at: at };
+      return failed;
     }
     const endpoint: NodeEndpoint | null = nodeEndpoint(entry.json);
     if (endpoint === null) {
@@ -158,6 +175,7 @@ async function drain(entries: ConfigEntry[], cursor: TestCursor, viaTunnel: bool
 // probe finishes so the list can update while the rest are still in flight.
 export async function testAll(entries: ConfigEntry[], viaTunnel: boolean, probeTags: string[],
   onResult: (result: LatencyResult) => void): Promise<void> {
+  cancelProbes();
   const cursor: TestCursor = new TestCursor();
   const limit: number = entries.length < TEST_CONCURRENCY ? entries.length : TEST_CONCURRENCY;
   const workers: Promise<void>[] = [];
@@ -210,3 +228,9 @@ export function resultOf(results: LatencyResult[], id: string): LatencyResult | 
   }
   return null;
 }
+
+
+
+
+
+

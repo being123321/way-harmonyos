@@ -16,31 +16,34 @@ const DOMAIN: number = 0x0000;
 const TAG: string = 'way';
 
 export default class EntryAbility extends UIAbility {
-  private watchdogId: number = -1;
   private wifiTimer: number = -1;
-  private lastRestartAt: number = 0;
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(DOMAIN, TAG, 'onCreate');
-    this.startWatchdog();
     this.startWifiWatch();
   }
 
   onDestroy(): void {
     hilog.info(DOMAIN, TAG, 'onDestroy');
+    // 用户手动清后台：把隧道停掉并清「已连接」标记，之后不自动重连。
+    this.stopForManualKill().catch((): void => {
+    });
   }
 
-  // Runs for the whole session, foreground or background: the page stops
-  // polling when it hides, so the ability owns the "tunnel went stale" check.
-  private startWatchdog(): void {
-    if (this.watchdogId !== -1) {
-      return;
+  private async stopForManualKill(): Promise<void> {
+    try {
+      const store = await preferences.getPreferences(this.context, 'way');
+      store.putSync('vpnActive', false);
+      await store.flush();
+    } catch (error) {
     }
-    this.watchdogId = setInterval(() => {
-      this.checkTunnel().catch(() => {
-      });
-    }, 5000);
+    try {
+      await stopVpn(vpnWant(this.context, true, true));
+      appLog(this.context, 'lifecycle', 'task destroyed, tunnel stopped');
+    } catch (error) {
+    }
   }
+
 
   private startWifiWatch(): void {
     if (this.wifiTimer !== -1) {
@@ -136,7 +139,8 @@ export default class EntryAbility extends UIAbility {
       blockQuic: store.getSync('blockQuic', true) as boolean,
       ruleSet: activeRuleSet(this.context),
       blockAds: ruleSetAdsEnabled(this.context),
-      doh: dohEnabled(this.context)
+      doh: dohEnabled(this.context),
+      bootstrapHosts: null
     };
     buildAndSaveTunnel(this.context, entry, options);
     clearStatus(this.context);
@@ -145,55 +149,6 @@ export default class EntryAbility extends UIAbility {
       appLog(this.context, 'wifi', 'vpn restarted in ' + mode + ' mode');
     } catch (error) {
       appLog(this.context, 'wifi', 'mode switch failed');
-    }
-  }
-  private async checkTunnel(): Promise<void> {
-    const store = await preferences.getPreferences(this.context, 'way');
-    const active: boolean = store.getSync('vpnActive', false) as boolean;
-    if (!active || store.getSync('userOff', false) as boolean) {
-      return;
-    }
-    // A suspended SSID means the tunnel is intentionally down.
-    if (ssidSuspended(this.context)) {
-      return;
-    }
-    const now: number = Date.now();
-    if (now - this.lastRestartAt < 20000) {
-      return;
-    }
-    const status = readStatus(this.context);
-    if (status === null) {
-      return;
-    }
-    const staleSeconds: number = Math.floor((now - status.updatedAt) / 1000);
-    if (status.state === 'running' && staleSeconds < 8) {
-      return;
-    }
-    this.lastRestartAt = now;
-    appLog(this.context, 'watchdog',
-      'tunnel lost (state=' + status.state + ', stale=' + staleSeconds + 's), restarting vpn');
-    const entry = selectedEntry(this.context);
-    if (entry === null) {
-      appLog(this.context, 'watchdog', 'restart skipped: no node selected');
-      return;
-    }
-    try {
-      const options: SplitOptions = {
-        split: true,
-        geodata: geodataReady(this.context),
-        mode: store.getSync('mode', MODE_BYPASS) as string,
-        blockQuic: store.getSync('blockQuic', true) as boolean,
-        ruleSet: activeRuleSet(this.context),
-        blockAds: ruleSetAdsEnabled(this.context),
-        doh: dohEnabled(this.context)
-      };
-      buildAndSaveTunnel(this.context, entry, options);
-      clearStatus(this.context);
-      await startVpn(vpnWant(this.context, true, true));
-      appLog(this.context, 'watchdog', 'vpn restarted');
-    } catch (error) {
-      const err = error as BusinessError;
-      appLog(this.context, 'watchdog', 'restart failed: ' + (err.message ?? 'unknown'));
     }
   }
 

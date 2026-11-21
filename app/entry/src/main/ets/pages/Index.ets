@@ -7,19 +7,21 @@ import type { Want } from '@kit.AbilityKit';
 import type { BusinessError } from '@kit.BasicServicesKit';
 import { preferences } from '@kit.ArkData';
 import { promptAction, router } from '@kit.ArkUI';
-import { socket } from '@kit.NetworkKit';
+import { connection, socket } from '@kit.NetworkKit';
 import { commonEventManager } from '@kit.BasicServicesKit';
 import {
   Insets, ReloadResult, TunnelStatus, clearStatus, coreVersion, formatBytes, formatDuration, formatTime,
   reloadRouting, tunnelUp,
-  formatSpeed, measureLatency, nodeEndpoint, nodeTypeLabel, pageInsets, probeOutbound, readLogs,
+  NodeEndpoint, formatSpeed, measureLatency, nodeEndpoint, nodeTypeLabel, outboundEndpoint, pageInsets, probeOutbound, readLogs,
   readStatus, saveConfig, startVpn, stopVpn, vpnWant
 } from '../common/Xray';
 import { ConfigEntry, SubscriptionRecord, readStore, readSubs, selectEntry, selectedEntry } from '../common/Store';
 import { refreshSubscription } from '../common/Subscription';
+import { TEST_HOST } from '../common/Speedtest';
+import { resolveUdp } from '../common/UdpDns';
 import { appLog } from '../common/AppLog';
 import { MODE_BYPASS, MODE_GFW, MODE_GLOBAL, SplitOptions } from '../common/Rules';
-import { TunnelConfigResult, buildAndSaveTunnel } from '../common/TunnelConfig';
+import { TunnelConfigResult, buildAndSaveTunnel, proxyOutbound } from '../common/TunnelConfig';
 import { SSID_DIRECT, SSID_SUSPEND, SsidRule, clearSsidRules, currentSsid, onDemandEnabled, removeSsidRule, setFlag, setSsidRule, setSsidSuspended, ssidRules, ssidSuspended } from '../common/Ssid';
 import { GEODATA_PRESETS, GeodataMeta, geodataReady, geodataStale, readGeodataMeta, selectedPreset, selectPreset, updateGeodata } from '../common/Geodata';
 import {
@@ -82,13 +84,13 @@ struct Index {
   private prevDown: number = 0;
   private prevStamp: number = 0;
   private trafficSubscriber: commonEventManager.CommonEventSubscriber | null = null;
-  private lastRecoverAt: number = 0;
+  // 连接前解析好的节点服务器地址（写进 config 的 dns.hosts）。
+  private bootstrapHosts: Record<string, string[]> | null = null;
   private usedFallback: boolean = false;
   private keepAliveStarted: boolean = false;
   private taskId: number = -1;
   private taskNotificationId: number = -1;
   private taskWatchRegistered: boolean = false;
-  private wantConnected: boolean = false;
   @State geoText: string = '未下载';
   @State hasRuleSet: boolean = false;
   @State ruleSetText: string = '未导入（使用内置规则）';
@@ -508,9 +510,97 @@ struct Index {
       // apply right after a toggle would otherwise read the previous value.
       ruleSet: this.useRuleSet ? readRuleSet(context) : null,
       blockAds: this.blockAds,
-      doh: this.dohDns
+      doh: this.dohDns,
+      bootstrapHosts: this.bootstrapHosts
     };
     return options;
+  }
+
+  // Resolves every node's server name once, before the tunnel exists: the core
+  // otherwise asks the configured DoH through the tunnel for each name, which
+  // made the per-node probe (and the first dial) 2-3 s slower.
+  private async resolveNodeHosts(context: common.UIAbilityContext): Promise<Record<string, string[]> | null> {
+    const hosts: Record<string, string[]> = {};
+    const domains: string[] = [];
+    for (const item of readStore(context).items) {
+      const outbound: Record<string, Object> | null = proxyOutbound(item.json);
+      if (outbound === null) {
+        continue;
+      }
+      const endpoint: NodeEndpoint | null = outboundEndpoint(outbound);
+      if (endpoint === null || endpoint.host.length === 0 || this.isIpLiteral(endpoint.host)) {
+        continue;
+      }
+      if (domains.indexOf(endpoint.host) < 0) {
+        domains.push(endpoint.host);
+      }
+    }
+    // A probe target that is a literal needs no entry; a hostname would be
+    // resolved here so the core never asks DoH for it.
+    if (TEST_HOST.length > 0 && domains.indexOf(TEST_HOST) < 0) {
+      domains.push(TEST_HOST);
+    }
+    const lookups: Promise<void>[] = domains.map((domain: string): Promise<void> => {
+      return this.resolveOneHost(domain, hosts);
+    });
+    const all: Promise<void> = Promise.all(lookups).then((): void => {
+    });
+    // Never let a blocked resolver hold up the connect: 1.5 s budget, partial
+    // hosts are fine (the core falls back to its own DNS for the rest).
+    const budget: Promise<void> = new Promise<void>((resolve) => {
+      setTimeout((): void => {
+        resolve();
+      }, 1500);
+    });
+    await Promise.race([all, budget]);
+    return Object.keys(hosts).length > 0 ? hosts : null;
+  }
+
+  private isIpLiteral(host: string): boolean {
+    if (host.indexOf(':') >= 0) {
+      return true;
+    }
+    const parts: string[] = host.split('.');
+    if (parts.length !== 4) {
+      return false;
+    }
+    for (const part of parts) {
+      const value: number = parseInt(part, 10);
+      if (isNaN(value) || value < 0 || value > 255 || String(value) !== part) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private async resolveOneHost(domain: string, hosts: Record<string, string[]>): Promise<void> {
+    // Plain UDP first (what the user asked for: the speed test must not depend
+    // on DoH), then the platform resolver as a fallback.
+    const udp: string[] = await resolveUdp(domain, 700);
+    if (udp.length > 0) {
+      hosts[domain] = udp;
+      return;
+    }
+    const timeout: Promise<connection.NetAddress[]> = new Promise((resolve) => {
+      setTimeout((): void => {
+        resolve([]);
+      }, 700);
+    });
+    try {
+      const list: connection.NetAddress[] = await Promise.race([
+        connection.getAddressesByName(domain), timeout
+      ]);
+      const ips: string[] = [];
+      for (const entry of list) {
+        if (entry.address.length > 0 && ips.indexOf(entry.address) < 0) {
+          ips.push(entry.address);
+        }
+      }
+      if (ips.length > 0) {
+        hosts[domain] = ips;
+      }
+    } catch (error) {
+    }
   }
 
   // GFW / 绕过大陆 / 全局: rewrite config.json, then ask the extension to swap the
@@ -641,34 +731,20 @@ struct Index {
         this.prevStamp = now;
       }
       this.isOn = status.state === 'running' || status.state === 'starting';
-      if (this.isOn) {
-        this.wantConnected = true;
-      }
-      if (stale && this.wantConnected && Date.now() - this.lastRecoverAt > 20000) {
-        this.lastRecoverAt = Date.now();
-        this.recoverTunnel();
-      }
     } else {
-      // No status file: the system may have torn the extension down. If the user
-      // still wants the tunnel, show "reconnecting" instead of flipping the
-      // switch off, and let the watchdog bring it back.
-      const desired: boolean = this.desiredActive(context);
-      if (desired) {
+      // 没有状态文件：要么还在连接（busy），要么隧道已经没了（系统回收或用户
+      // 手动清后台）。前者保持“正在创建”，后者不自动重连，开关拨回未连接。
+      if (this.busy) {
         this.state = 'starting';
-        this.message = '重连中…';
+        this.message = '正在创建 VPN';
         this.isOn = true;
         this.statusAge = -1;
-        if (Date.now() - this.lastRecoverAt > 15000) {
-          this.lastRecoverAt = Date.now();
-          this.recoverTunnel();
-        }
-      } else if (this.state !== 'starting') {
+      } else {
         this.state = 'stopped';
         this.message = '断开';
         this.seconds = 0;
         this.statusAge = -1;
         this.isOn = false;
-        this.wantConnected = false;
       }
     }
     this.tickCount++;
@@ -677,32 +753,6 @@ struct Index {
     }
   }
 
-  // The system can tear the VPN extension down on network changes; bring the
-  // tunnel back as soon as the app is in the foreground again.
-  private async recoverTunnel(): Promise<void> {
-    const context = this.ctx;
-    if (context === null || this.busy) {
-      return;
-    }
-    appLog(context, 'ui', 'tunnel lost, reconnecting');
-    this.busy = true;
-    try {
-      clearStatus(context);
-      const entry: ConfigEntry | null = selectedEntry(context);
-      const nodeName: string = entry === null ? '' : entry.name;
-      const notifId: number = await this.startKeepAliveTask();
-      await startVpn(vpnWant(context, this.notifyMe, this.rebindOnNetChange, notifId, nodeName));
-      this.markActive(true);
-      if (this.notifyMe) {
-        this.ensureNotifyPermission();
-      }
-    } catch (error) {
-      const err = error as BusinessError;
-      appLog(context, 'ui', 'reconnect failed: ' + (err.message ?? 'unknown'));
-    } finally {
-      this.busy = false;
-    }
-  }
 
   private openConnections(): void {
     router.pushUrl({ url: 'pages/Connections' }).catch((error: BusinessError) => {
@@ -901,6 +951,7 @@ struct Index {
       // Every saved node goes into the tunnel config as a tagged outbound so the
       // node list can measure each node through the core (real delay) without
       // switching the tunnel. The selected node stays the default outbound.
+      this.bootstrapHosts = await this.resolveNodeHosts(context);
       const tunnel: TunnelConfigResult =
         buildAndSaveTunnel(context, entry, this.buildOptions(context));
       appLog(context, 'ui', 'tunnel config: ' + tunnel.count + ' outbounds' +
@@ -1028,20 +1079,6 @@ struct Index {
       });
   }
 
-  private desiredActive(context: common.UIAbilityContext): boolean {
-    try {
-      const store = preferences.getPreferencesSync(context, { name: 'way' });
-      if (store.getSync('userOff', false) as boolean) {
-        return false;
-      }
-      if (store.getSync('ssidSuspended', false) as boolean) {
-        return false;
-      }
-      return store.getSync('vpnActive', false) as boolean;
-    } catch (error) {
-      return false;
-    }
-  }
 
   // After a system-driven restart the old continuous-task notification is gone,
   // so re-request it and hand the new id to the extension.
@@ -1090,10 +1127,6 @@ struct Index {
         });
       } catch (error) {
       }
-    }
-    const status = readStatus(context);
-    if (status === null || status.state !== 'running') {
-      this.recoverTunnel();
     }
   }
 
@@ -1262,7 +1295,6 @@ struct Index {
     this.state = 'stopped';
     this.message = '断开';
     this.isOn = false;
-    this.wantConnected = false;
     this.seconds = 0;
     this.up = 0;
     this.down = 0;
@@ -1291,7 +1323,6 @@ struct Index {
         this.state = 'stopped';
         this.message = '断开';
         this.isOn = false;
-        this.wantConnected = false;
       }
     } else {
       this.refreshSsid();
@@ -1578,7 +1609,7 @@ struct Index {
     // No bar surface at all: the page shows through between the two capsules.
     Row() {
       Row() {
-        Text('way')
+          Text('way')
           .fontSize(24)
           .fontWeight(FontWeight.Bold)
           .fontColor('#E8F1FF')
@@ -2382,6 +2413,13 @@ struct Index {
     .borderRadius(16)
   }
 }
+
+
+
+
+
+
+
 
 
 

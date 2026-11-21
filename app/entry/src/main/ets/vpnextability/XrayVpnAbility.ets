@@ -67,6 +67,9 @@ const USE_PROTECT_PROCESS_NET: boolean = true;
 // Node-list delay test crosses processes: the UI cannot see the core handle (the
 // extension runs in its own process), so it asks this process over common events.
 const PROBE_REQUEST_EVENT: string = 'com.way.app.PROBE';
+// Cancels the probes already in flight (ABI 1.15), sent by the node list when a
+// new run starts or the page closes.
+const PROBE_CANCEL_EVENT: string = 'com.way.app.PROBE_CANCEL';
 // Live mode switch: the UI rewrites config.json and asks this process to swap
 // the routing table, so GFW / 绕过大陆 / 全局 apply without dropping the tunnel.
 const RELOAD_REQUEST_EVENT: string = 'com.way.app.RELOAD_ROUTING';
@@ -93,6 +96,7 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
   private taskNotificationId: number = -1;
   private taskIdSubscriber: commonEventManager.CommonEventSubscriber | null = null;
   private probeSubscriber: commonEventManager.CommonEventSubscriber | null = null;
+  private probeCancelSubscriber: commonEventManager.CommonEventSubscriber | null = null;
   private reloadSubscriber: commonEventManager.CommonEventSubscriber | null = null;
   private pssKb: number = 0;
   private cpuPercent: number = 0;
@@ -112,6 +116,7 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
   onCreate(want: Want): void {
     this.bindHandlers(want);
     this.watchProbeRequests();
+    this.watchProbeCancelRequests();
     this.watchReloadRequests();
     this.watchConnectionRequests();
     if (native.isRunning()) {
@@ -268,41 +273,43 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
   }
 
   // Outbound server addresses from the config, used for tunnel-exclusion routes.
+  // Only the default outbound's server is dialled by the tunnel itself. The
+  // other saved nodes are reached only by the probe API from this protected
+  // process, so excluding their hosts would cost one DNS lookup each (seconds
+  // when a name does not resolve) without protecting anything.
   private serverHosts(): string[] {
     const hosts: string[] = [];
     try {
       const root: Record<string, Object> = JSON.parse(this.configText) as Record<string, Object>;
-      const outbounds: Object[] | undefined = root['outbounds'] as Object[] | undefined;
-      if (outbounds === undefined) {
+      const outbounds: Object[] = (root['outbounds'] as Object[]) ?? [];
+      if (outbounds.length === 0) {
         return hosts;
       }
-      for (const item of outbounds) {
-        const outbound: Record<string, Object> = item as Record<string, Object>;
-        const settings: Object | undefined = outbound['settings'] as Object | undefined;
-        if (settings === undefined || settings === null) {
-          continue;
-        }
-        const s: Record<string, Object> = settings as Record<string, Object>;
-        const address: Object | undefined = s['address'];
-        if (typeof address === 'string' && (address as string).length > 0) {
-          hosts.push(address as string);
-        }
-        const vnext: Object[] | undefined = s['vnext'] as Object[] | undefined;
-        if (vnext !== undefined) {
-          for (const entry of vnext) {
-            const a: Object | undefined = (entry as Record<string, Object>)['address'];
-            if (typeof a === 'string' && (a as string).length > 0) {
-              hosts.push(a as string);
-            }
+      const outbound: Record<string, Object> = outbounds[0] as Record<string, Object>;
+      const settings: Object | undefined = outbound['settings'] as Object | undefined;
+      if (settings === undefined || settings === null) {
+        return hosts;
+      }
+      const s: Record<string, Object> = settings as Record<string, Object>;
+      const address: Object | undefined = s['address'];
+      if (typeof address === 'string' && (address as string).length > 0) {
+        hosts.push(address as string);
+      }
+      const vnext: Object[] | undefined = s['vnext'] as Object[] | undefined;
+      if (vnext !== undefined) {
+        for (const entry of vnext) {
+          const a: Object | undefined = (entry as Record<string, Object>)['address'];
+          if (typeof a === 'string' && (a as string).length > 0) {
+            hosts.push(a as string);
           }
         }
-        const peers: Object[] | undefined = s['peers'] as Object[] | undefined;
-        if (peers !== undefined) {
-          for (const entry of peers) {
-            const ep: Object | undefined = (entry as Record<string, Object>)['endpoint'];
-            if (typeof ep === 'string' && (ep as string).length > 0) {
-              hosts.push(stripPort(ep as string));
-            }
+      }
+      const peers: Object[] | undefined = s['peers'] as Object[] | undefined;
+      if (peers !== undefined) {
+        for (const entry of peers) {
+          const ep: Object | undefined = (entry as Record<string, Object>)['endpoint'];
+          if (typeof ep === 'string' && (ep as string).length > 0) {
+            hosts.push(stripPort(ep as string));
           }
         }
       }
@@ -311,24 +318,39 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
     return hosts;
   }
 
+  // Resolve the default server without letting a stuck DNS lookup delay the
+  // tunnel: 1.5 s per name, and only for the one server the tunnel dials.
+  private resolveHost(host: string, timeoutMs: number): Promise<string[]> {
+    if (isIpAddress(host)) {
+      return Promise.resolve([host]);
+    }
+    const lookup: Promise<string[]> = connection.getAddressesByName(host).then(
+      (list: connection.NetAddress[]): string[] => {
+        const out: string[] = [];
+        for (const entry of list) {
+          out.push(entry.address);
+        }
+        return out;
+      },
+      (error: BusinessError): string[] => {
+        this.appendLog('resolve ' + host + ' failed: ' + JSON.stringify(error));
+        return [];
+      });
+    const timeout: Promise<string[]> = new Promise<string[]>((resolve) => {
+      setTimeout((): void => {
+        resolve([]);
+      }, timeoutMs);
+    });
+    return Promise.race([lookup, timeout]);
+  }
+
   private async buildExcludedRoutes(): Promise<vpnExtension.RouteInfo[]> {
     const routes: vpnExtension.RouteInfo[] = [];
     const seen: Set<string> = new Set();
     const hosts: string[] = this.serverHosts();
-    for (const host of hosts) {
-      const ips: string[] = [];
-      if (isIpAddress(host)) {
-        ips.push(host);
-      } else {
-        try {
-          const resolved: connection.NetAddress[] = await connection.getAddressesByName(host);
-          for (const entry of resolved) {
-            ips.push(entry.address);
-          }
-        } catch (error) {
-          this.appendLog('resolve ' + host + ' failed: ' + JSON.stringify(error));
-        }
-      }
+    const resolved: string[][] = await Promise.all(hosts.map(
+      (host: string): Promise<string[]> => this.resolveHost(host, 1500)));
+    for (const ips of resolved) {
       for (const ip of ips) {
         if (ip.length === 0 || seen.has(ip)) {
           continue;
@@ -844,6 +866,41 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
       } catch (error) {
       }
     }
+    const cancelSub = this.probeCancelSubscriber;
+    this.probeCancelSubscriber = null;
+    if (cancelSub !== null) {
+      try {
+        commonEventManager.unsubscribe(cancelSub);
+      } catch (error) {
+      }
+    }
+  }
+
+  // The node list asks for this when another run starts or the page closes:
+  // cancel the probes already in flight so their workers free up immediately.
+  private async watchProbeCancelRequests(): Promise<void> {
+    if (this.probeCancelSubscriber !== null) {
+      return;
+    }
+    try {
+      const sub: commonEventManager.CommonEventSubscriber = await commonEventManager.createSubscriber({
+        events: [PROBE_CANCEL_EVENT]
+      });
+      commonEventManager.subscribe(sub, (error, data) => {
+        if (error !== undefined && error !== null && error.code !== 0) {
+          return;
+        }
+        try {
+          native.cancelProbes();
+          this.appendLog('probes cancelled by ui');
+        } catch (exception) {
+          this.appendLog('probe cancel failed: ' + JSON.stringify(exception));
+        }
+      });
+      this.probeCancelSubscriber = sub;
+    } catch (error) {
+      this.appendLog('probe cancel watch failed: ' + JSON.stringify(error));
+    }
   }
 
   // The UI rebuilt config.json after a mode switch and asks for a routing-only
@@ -1250,6 +1307,7 @@ function stripPort(endpoint: string): string {
   }
   return endpoint;
 }
+
 
 
 
