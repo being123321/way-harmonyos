@@ -63,7 +63,6 @@ hvigorw assembleHap -p product=default -p buildMode=debug
 app/                  ArkTS 工程（entry/ 模块、NAPI 桥、VPN 扩展、页面）
 kernel/               内核移植补丁（MPL-2.0 衍生，见 kernel/README.md）
 tools/                ACL4SSR 清单 → way 规则集的转换脚本
-verify/               真机验证截图
 docs-ARCHITECTURE.md  实现说明（分流、DNS、保活、已知限制等）
 ```
 
