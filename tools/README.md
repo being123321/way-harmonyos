@@ -5,7 +5,7 @@
 首次启动时复制到 `filesDir/xray/rules.json`）。
 
 清单与目标分组的映射、顺序都照抄
-`subscription-forge`（`C:\Users\Administrator\Documents\Codex\2026-10-17\https-github-com-acl4ssr-acl4ssr-https`
+`subscription-forge`（上游 ACL4SSR 仓库的本地检出
 里的 `app.py` / `converter.py`）：
 
 | 清单 | way 目标 |

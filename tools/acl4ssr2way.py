@@ -2,7 +2,7 @@
 """Convert the ACL4SSR Clash rule lists into a way rule set (JSON).
 
 Mirrors the `RULES` mapping of the subscription-forge project in
-``C:\\Users\\Administrator\\Documents\\Codex\\2026-10-17\\https-github-com-acl4ssr-acl4ssr-https``
+``acl4ssr-checkout``
 (its ``app.py`` downloads these lists, its ``converter.py`` turns them into
 sing-box rule_sets):
 
