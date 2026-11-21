@@ -26,13 +26,15 @@ way 是一个运行在 HarmonyOS（ArkTS + NAPI）上的 xray 客户端：内核
   历史最多 200 条、持久化到 `filesDir/xray/conn-history.json`。
 - **状态卡**：VPN 进程的内存 / CPU、实时速率、累计流量、连接数（点开连接页）、会话时长，状态灯随流量强弱变化。
 
-## 截图
+## 界面
 
-| 首页 | 节点 | 连接 |
-|---|---|---|
-| ![](verify/43-card-layout.jpg) | ![](verify/40-node-latency-inline.jpg) | ![](verify/46-connection-domains.jpg) |
+首页是状态卡（速率 / 连接数 / 时长 / 内存与 CPU）+ 可折叠的节点、规则、按需启动卡片；连接页分
+`活动 / 历史` 两个标签。
 
-更多截图见 `verify/`（含规则集、DoH、测速、历史记录等 50 张验证图）。
+![图标](docs-app-icon.png)
+
+真机截图（含规则集、DoH、测速、连接历史）不在仓库内：里面带作者自己的节点与浏览记录，
+需要的话在 Issues 里说，我单独贴几张脱敏的。
 
 ## 构建
 
@@ -74,3 +76,4 @@ docs-ARCHITECTURE.md  实现说明（分流、DNS、保活、已知限制等）
 - 协议实现与分流策略参考 Xray-core 与 v2rayNG 的行为。
 
 联系方式：请使用本仓库的 Issues。
+
