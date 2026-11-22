@@ -735,7 +735,7 @@ struct Index {
       this.up = status.up;
       this.down = status.down;
       this.flows = status.tcpFlows + status.udpFlows;
-      this.seconds = status.state === 'running' ? (Date.now() - status.startedAt) / 1000 : 0;
+      this.seconds = (status.state === 'running' && !stale) ? (Date.now() - status.startedAt) / 1000 : 0;
       this.statusAge = Math.floor((Date.now() - status.updatedAt) / 1000);
       this.probeMs = status.probeMs;
       this.pssKb = status.pssKb ?? 0;
@@ -764,7 +764,16 @@ struct Index {
         this.prevDown = status.down;
         this.prevStamp = now;
       }
-      this.setSwitch(status.state === 'running' || status.state === 'starting');
+      // The heartbeat is gone, so nothing is keeping the tunnel up: the switch
+      // must fall back to "off" together with the title. Reading the raw
+      // status.state here left the switch on while the title already said
+      // 未连接, and the session timer kept counting on a dead tunnel.
+      this.setSwitch(!stale && (status.state === 'running' || status.state === 'starting'));
+      // A stale running snapshot means the extension died: release the live-view
+      // task so the notification stops advertising a session that is not there.
+      if (stale && this.keepAliveStarted) {
+        this.stopKeepAliveTask();
+      }
     } else {
       // 没有状态文件：要么还在连接（busy），要么隧道已经没了（系统回收或用户
       // 手动清后台）。前者保持“正在创建”，后者不自动重连，开关拨回未连接。
