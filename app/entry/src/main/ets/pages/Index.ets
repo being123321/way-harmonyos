@@ -23,7 +23,7 @@ import { LatencyEntry, readLatencyCache, recordLatency } from '../common/Latency
 import { appLog } from '../common/AppLog';
 import { MODE_BYPASS, MODE_GFW, MODE_GLOBAL, SplitOptions } from '../common/Rules';
 import { TunnelConfigResult, buildAndSaveTunnel, proxyOutbound } from '../common/TunnelConfig';
-import { SSID_DIRECT, SSID_SUSPEND, SsidRule, clearSsidRules, currentSsid, onDemandEnabled, removeSsidRule, setFlag, setSsidRule, setSsidSuspended, ssidRules, ssidSuspended } from '../common/Ssid';
+import { SSID_DIRECT, SSID_SUSPEND, SsidRule, clearSsidRules, currentSsid, findRule, onDemandEnabled, removeSsidRule, setAppliedSsidAction, setFlag, setSsidRule, setSsidSuspended, setSuspendOverride, ssidRules, ssidSuspended, suspendOverride } from '../common/Ssid';
 import { GEODATA_PRESETS, GeodataMeta, geodataReady, geodataStale, readGeodataMeta, selectedPreset, selectPreset, updateGeodata } from '../common/Geodata';
 import {
   ORIGIN_UPDATE, TARGET_BLOCK, WayRuleSet, activeRuleSet, backupCurrent, hasBackup, originLabel,
@@ -64,6 +64,9 @@ struct Index {
   @State manualSsid: string = '';
   @State rules: SsidRule[] = [];
   @State isOn: boolean = false;
+  // Code-side isOn changes also fire Toggle.onChange; without this guard the
+  // suspension path ran disconnect() and froze the app in userOff=true.
+  private switchProgrammatic: boolean = false;
   @State coreInfo: string = coreVersion();
   @State entryName: string = '';
   @State entryType: string = '';
@@ -182,7 +185,7 @@ struct Index {
         }
         this.state = 'running';
         this.message = '已连接';
-        this.isOn = true;
+        this.setSwitch(true);
         this.lastEventAt = Date.now();
         this.statusAge = 0;
       });
@@ -699,10 +702,11 @@ struct Index {
       return;
     }
     if (ssidSuspended(context)) {
-      // Paused by an SSID rule: keep the switch on and say so.
+      // Paused by an SSID rule: the button still reads as "on" (the user asked
+      // for a connected-looking but yellow switch), while the tunnel is down.
       this.state = 'suspended';
-      this.message = '已挂起';
-      this.isOn = true;
+      this.message = '已挂起（当前 Wi-Fi）';
+      this.setSwitch(true);
       this.seconds = 0;
       this.upSpeed = 0;
       this.downSpeed = 0;
@@ -710,6 +714,21 @@ struct Index {
     }
     const status: TunnelStatus | null = readStatus(context);
     if (status !== null) {
+      if (status.state === 'suspended') {
+        // The extension paused the core for this Wi-Fi (it stays alive, so it
+        // can resume on its own). Release the task: a paused tunnel has nothing
+        // to keep alive and should not leave a stale card on the lock screen.
+        if (this.keepAliveStarted) {
+          this.stopKeepAliveTask();
+        }
+        this.state = 'suspended';
+        this.message = status.message.length > 0 ? status.message : '已挂起（当前 Wi-Fi）';
+        this.setSwitch(false);
+        this.seconds = 0;
+        this.upSpeed = 0;
+        this.downSpeed = 0;
+        return;
+      }
       const stale: boolean = status.state === 'running' && Date.now() - status.updatedAt > 6000;
       this.state = stale ? 'unknown' : status.state;
       this.message = stale ? '断开' : (status.state === 'stopped' ? '断开' : status.message);
@@ -723,7 +742,14 @@ struct Index {
       this.cpuPercent = status.cpuPercent ?? 0;
       if (status.state === 'running' && status.startedAt !== this.lastStartedAt) {
         this.lastStartedAt = status.startedAt;
-        this.refreshTaskNotification();
+      }
+      // An SSID suspension stops the task; a resumed tunnel needs its single
+      // live-view card back (the extension cannot request it on its own).
+      if (status.state === 'running' && !this.keepAliveStarted &&
+        Date.now() - this.lastNotifRefreshAt > 3000) {
+        this.lastNotifRefreshAt = Date.now();
+        this.reviveTask().catch(() => {
+        });
       }
       // Fallback speed when the push channel is unavailable: derive it from
       // consecutive polls instead of leaving the gauges at zero.
@@ -738,21 +764,21 @@ struct Index {
         this.prevDown = status.down;
         this.prevStamp = now;
       }
-      this.isOn = status.state === 'running' || status.state === 'starting';
+      this.setSwitch(status.state === 'running' || status.state === 'starting');
     } else {
       // 没有状态文件：要么还在连接（busy），要么隧道已经没了（系统回收或用户
       // 手动清后台）。前者保持“正在创建”，后者不自动重连，开关拨回未连接。
       if (this.busy) {
         this.state = 'starting';
         this.message = '正在创建 VPN';
-        this.isOn = true;
+        this.setSwitch(true);
         this.statusAge = -1;
       } else {
         this.state = 'stopped';
         this.message = '断开';
         this.seconds = 0;
         this.statusAge = -1;
-        this.isOn = false;
+        this.setSwitch(false);
       }
     }
     this.tickCount++;
@@ -957,6 +983,20 @@ struct Index {
     this.nodeExpanded = false;
   }
 
+  private setSwitch(value: boolean): void {
+    if (this.isOn === value) {
+      return;
+    }
+    this.switchProgrammatic = true;
+    this.isOn = value;
+    // If the platform does not emit onChange for a code-side change, the flag
+    // must not swallow the next real tap (that made the switch look dead and
+    // the UI report "断开" after a resume).
+    setTimeout((): void => {
+      this.switchProgrammatic = false;
+    }, 300);
+  }
+
   private async connect(): Promise<void> {
     const context = this.ctx;
     if (context === null || this.busy) {
@@ -967,6 +1007,22 @@ struct Index {
     if (entry === null) {
       promptAction.showToast({ message: '请先添加一个节点' });
       this.openNodes();
+      return;
+    }
+    // On a suspend-SSID Wi-Fi the switch only reflects the suspended state:
+    // starting the tunnel here would be stopped again by the watcher, so the
+    // user's intent ("turn on") has to surface as "suspended" instead.
+    const currentSsidName: string = await currentSsid();
+    const ssidRule: SsidRule | null = findRule(context, currentSsidName);
+    if (ssidRule !== null && ssidRule.action === SSID_SUSPEND) {
+      // Turning on is a deliberate intent, so clear a previous "user off".
+      await this.markActive(true);
+      setSsidSuspended(context, true);
+      setAppliedSsidAction(context, SSID_SUSPEND);
+      this.state = 'suspended';
+      this.message = '已挂起（当前 Wi-Fi）';
+      this.setSwitch(true);
+      promptAction.showToast({ message: '当前 Wi-Fi 已设置挂起' });
       return;
     }
     this.busy = true;
@@ -988,7 +1044,7 @@ struct Index {
       clearStatus(context);
       this.state = 'starting';
       this.message = '正在创建 VPN';
-      this.isOn = true;
+      this.setSwitch(true);
       // Fire-and-forget: awaiting the notification-permission dialog or the
       // TempAbility launch left the toggle stuck on "正在创建 VPN" whenever the
       // dialog was slow or suppressed.
@@ -1006,7 +1062,7 @@ struct Index {
       const err = error as BusinessError;
       this.state = 'error';
       this.message = '启动失败: ' + (err.message ?? JSON.stringify(error));
-      this.isOn = false;
+      this.setSwitch(false);
       appLog(context, 'ui', 'vpn start failed: ' + (err.message ?? JSON.stringify(error)));
       promptAction.showToast({ message: this.message });
     } finally {
@@ -1050,6 +1106,10 @@ struct Index {
   // windowless TempAbility used to swap the foreground window to its splash
   // screen, which looked like the UI freezing right after enabling the proxy.
   private async startKeepAliveTask(): Promise<number> {
+    // Per docs/keepalive-harmony.md: the main ability owns the DATA_TRANSFER
+    // task (a windowless UIAbility steals the foreground and shows its splash,
+    // which is the "two cards / stuck UI" bug). Request the task FIRST, then
+    // start the VPN with the returned notification id.
     const context = this.ctx;
     if (context === null || this.keepAliveStarted) {
       return this.taskNotificationId;
@@ -1086,9 +1146,19 @@ struct Index {
     }
   }
 
-  // Swiping the task notification cancels the continuous task; re-acquire it so
-  // the tunnel (and its card) come back on their own. Only an explicit
-  // disconnect or closing the app leaves it gone.
+  private stopKeepAliveTask(): void {
+    const context = this.ctx;
+    if (context === null || !this.keepAliveStarted) {
+      return;
+    }
+    this.keepAliveStarted = false;
+    this.taskNotificationId = -1;
+    backgroundTaskManager.stopBackgroundRunning(context).catch(() => {
+    });
+  }
+
+  // Swiping the task card cancels the continuous task; re-request it so the
+  // tunnel keeps its single live-view card (docs/keepalive-harmony.md).
   private registerTaskWatch(): void {
     if (this.taskWatchRegistered) {
       return;
@@ -1103,42 +1173,10 @@ struct Index {
         appLog(context, 'ui', 'continuous task canceled, reviving');
         this.keepAliveStarted = false;
         setTimeout(() => {
-          this.reviveTask();
+          this.reviveTask().catch(() => {
+          });
         }, 800);
       });
-  }
-
-
-  // After a system-driven restart the old continuous-task notification is gone,
-  // so re-request it and hand the new id to the extension.
-  private async refreshTaskNotification(): Promise<void> {
-    const context = this.ctx;
-    if (context === null || !this.notifyMe) {
-      return;
-    }
-    if (Date.now() - this.lastNotifRefreshAt < 5000) {
-      return;
-    }
-    this.lastNotifRefreshAt = Date.now();
-    // Reuse the running continuous task; only request a new one when the
-    // previous task was actually cancelled, otherwise every restart would add
-    // another notification and the lock screen card would change identity.
-    let id: number = this.taskNotificationId;
-    if (!this.keepAliveStarted || id < 0) {
-      this.keepAliveStarted = false;
-      id = await this.startKeepAliveTask();
-    }
-    if (id < 0) {
-      return;
-    }
-    const data: commonEventManager.CommonEventPublishData = {
-      parameters: { 'taskNotificationId': id }
-    };
-    try {
-      commonEventManager.publish('com.way.app.TASK_ID', data, () => {
-      });
-    } catch (error) {
-    }
   }
 
   private async reviveTask(): Promise<void> {
@@ -1147,27 +1185,19 @@ struct Index {
       return;
     }
     const id: number = await this.startKeepAliveTask();
-    if (id >= 0) {
+    if (id < 0) {
+      return;
+    }
+    try {
       const data: commonEventManager.CommonEventPublishData = {
         parameters: { 'taskNotificationId': id }
       };
-      try {
-        commonEventManager.publish('com.way.app.TASK_ID', data, () => {
-        });
-      } catch (error) {
-      }
+      commonEventManager.publish('com.way.app.TASK_ID', data, () => {
+      });
+    } catch (error) {
     }
   }
 
-  private stopKeepAliveTask(): void {
-    const context = this.ctx;
-    if (context === null || !this.keepAliveStarted) {
-      return;
-    }
-    this.keepAliveStarted = false;
-    backgroundTaskManager.stopBackgroundRunning(context).catch(() => {
-    });
-  }
 
   private async markActive(active: boolean): Promise<void> {
     const context = this.ctx;
@@ -1321,9 +1351,14 @@ struct Index {
     }
     this.stopKeepAliveTask();
     this.markActive(false);
+    // Turning the switch off on a suspended Wi-Fi means "off", not "suspend
+    // again": clear the policy markers so the watcher leaves it alone until the
+    // user turns it on again.
+    setSsidSuspended(context, false);
+    setAppliedSsidAction(context, '');
     this.state = 'stopped';
     this.message = '断开';
-    this.isOn = false;
+    this.setSwitch(false);
     this.seconds = 0;
     this.up = 0;
     this.down = 0;
@@ -1351,7 +1386,7 @@ struct Index {
       if (this.state === 'suspended') {
         this.state = 'stopped';
         this.message = '断开';
-        this.isOn = false;
+        this.setSwitch(false);
       }
     } else {
       this.refreshSsid();
@@ -1692,8 +1727,12 @@ struct Index {
           .margin({ left: 10 })
           .layoutWeight(1)
         Toggle({ type: ToggleType.Switch, isOn: this.isOn })
-          .selectedColor('#54C4FF')
+          .selectedColor(this.state === 'suspended' ? '#F2B33D' : '#54C4FF')
           .onChange((value: boolean) => {
+            if (this.switchProgrammatic) {
+              this.switchProgrammatic = false;
+              return;
+            }
             if (this.busy) {
               return;
             }
@@ -2466,6 +2505,11 @@ struct Index {
     .borderRadius(16)
   }
 }
+
+
+
+
+
 
 
 

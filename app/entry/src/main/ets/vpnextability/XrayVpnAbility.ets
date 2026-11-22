@@ -10,6 +10,9 @@ import { commonEventManager } from '@kit.BasicServicesKit';
 import { notificationManager } from '@kit.NotificationKit';
 import { util } from '@kit.ArkTS';
 import { hidebug } from '@kit.PerformanceAnalysisKit';
+import { preferences } from '@kit.ArkData';
+import { wifiManager } from '@kit.ConnectivityKit';
+import { SSID_SUSPEND, findRule } from '../common/Ssid';
 
 interface ProbeResult {
   delayMs: number;
@@ -115,6 +118,9 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
   private lastUp: number = 0;
   private lastDown: number = 0;
   private lastStamp: number = 0;
+  private ssidTimer: number = -1;
+  private ssidHandler: (() => void) | null = null;
+  private ssidSuspended: boolean = false;
 
   onCreate(want: Want): void {
     this.bindHandlers(want);
@@ -164,6 +170,95 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
         this.appendLog('read config failed: ' + JSON.stringify(error));
       }
     }
+  }
+
+  // SSID suspension lives in the extension, the way sing-box does it: the
+  // extension stays alive and pauses the core, so leaving the Wi-Fi can resume
+  // without needing the UI (whose timers freeze in the background).
+  private startSsidWatch(): void {
+    if (this.ssidTimer !== -1) {
+      return;
+    }
+    const handler = (): void => {
+      this.checkSsid().catch((): void => {
+      });
+    };
+    this.ssidHandler = handler;
+    try {
+      wifiManager.on('wifiConnectionChange', handler);
+    } catch (error) {
+    }
+    this.ssidTimer = setInterval(handler, 5000);
+  }
+
+  private stopSsidWatch(): void {
+    if (this.ssidHandler !== null) {
+      try {
+        wifiManager.off('wifiConnectionChange', this.ssidHandler);
+      } catch (error) {
+      }
+    }
+    this.ssidHandler = null;
+    if (this.ssidTimer !== -1) {
+      clearInterval(this.ssidTimer);
+      this.ssidTimer = -1;
+    }
+  }
+
+  private async checkSsid(): Promise<void> {
+    let ssid: string = '';
+    try {
+      if (wifiManager.isWifiActive()) {
+        const linked: wifiManager.WifiLinkedInfo = await wifiManager.getLinkedInfo();
+        if (linked.connState === wifiManager.ConnState.CONNECTED) {
+          ssid = (linked.ssid ?? '').replace(/^"|"$/g, '');
+        }
+      }
+    } catch (error) {
+      ssid = '';
+    }
+    const rule = findRule(this.context, ssid);
+    const wantSuspend: boolean = rule !== null && rule.action === SSID_SUSPEND;
+    if (wantSuspend && !this.ssidSuspended) {
+      this.suspendForSsid(ssid);
+    } else if (!wantSuspend && this.ssidSuspended) {
+      this.resumeFromSsid();
+    }
+  }
+
+  private suspendForSsid(ssid: string): void {
+    this.ssidSuspended = true;
+    try {
+      native.stop();
+    } catch (error) {
+      this.appendLog('ssid suspend: native.stop failed');
+    }
+    if (this.timerId !== -1) {
+      clearInterval(this.timerId);
+      this.timerId = -1;
+    }
+    // Keep the task id: the UI owns the continuous task and may still have it
+    // up. A paused core just stops refreshing the live view until it resumes;
+    // cancelling here would leave the system card behind anyway.
+    this.writeStatus('suspended', '已挂起（' + ssid + '）');
+    this.appendLog('ssid ' + ssid + ' suspended, core paused');
+  }
+
+  private resumeFromSsid(): void {
+    this.ssidSuspended = false;
+    try {
+      native.start(this.configText, this.tunFd, TUN_MTU, this.logDir, this.geodataDir);
+    } catch (error) {
+      this.appendLog('ssid resume failed: ' + ((error as BusinessError).message ?? ''));
+      this.writeStatus('error', '恢复失败');
+      return;
+    }
+    // A resumed core is a new session; the UI uses a fresh startedAt to
+    // re-acquire the continuous task (and with it the live-view card).
+    this.startedAt = Date.now();
+    this.writeStatus('running', '已连接');
+    this.startTickLoop();
+    this.appendLog('left suspended ssid, core resumed');
   }
 
   private startTickLoop(): void {
@@ -551,10 +646,15 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
         actionFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
       };
       const agent: WantAgent = await wantAgent.getWantAgent(info);
-      await backgroundTaskManager.startBackgroundRunning(this.context,
-        backgroundTaskManager.BackgroundMode.DATA_TRANSFER, agent);
+      const request = new backgroundTaskManager.ContinuousTaskRequest();
+      request.backgroundTaskModes = [backgroundTaskManager.BackgroundTaskMode.MODE_DATA_TRANSFER];
+      request.backgroundTaskSubmodes = [backgroundTaskManager.BackgroundTaskSubmode.SUBMODE_LIVE_VIEW_NOTIFICATION];
+      request.wantAgent = agent;
+      const taskInfo: backgroundTaskManager.ContinuousTaskNotification =
+        await backgroundTaskManager.startBackgroundRunning(this.context, request);
+      this.taskNotificationId = taskInfo.notificationId;
       this.backgroundRunning = true;
-      this.appendLog('continuous task started');
+      this.appendLog('continuous task started, notification=' + this.taskNotificationId);
     } catch (error) {
       const err = error as BusinessError;
       this.appendLog('continuous task failed: ' + (err.message ?? JSON.stringify(error)));
@@ -644,6 +744,7 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
   }
 
   private shutdown(reason: string): void {
+    this.stopSsidWatch();
     if (this.taskNotificationId >= 0) {
       notificationManager.cancel(this.taskNotificationId).catch(() => {
       });
@@ -718,32 +819,12 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
   // an app notification together are what keeps the process off the kill list,
   // so the numbers here are the visible proof that the tunnel is still alive.
   private publishNotification(stats: XrayStats, downSpeed: number, upSpeed: number): void {
+    // The task card is the single merged notification: the live view is drawn on
+    // the continuous-task id, which is what the system keeps alive. A separate
+    // plain notification would either be hidden or replace the card, so there is
+    // deliberately no fallback here (docs/keepalive-harmony.md).
     if (this.taskNotificationId >= 0) {
       this.publishLiveView(stats, downSpeed, upSpeed);
-      return;
-    }
-    try {
-      const request: notificationManager.NotificationRequest = {
-        id: NOTIFICATION_ID,
-        content: {
-          notificationContentType: notificationManager.ContentType.NOTIFICATION_CONTENT_BASIC_TEXT,
-          normal: {
-            title: 'way 已连接',
-            text: '↓ ' + formatBytes(downSpeed) + '/s · ↑ ' + formatBytes(upSpeed) + '/s · 累计 ' +
-              formatBytes(stats.up) + ' ↑ / ' + formatBytes(stats.down) + ' ↓'
-          }
-        },
-        wantAgent: undefined,
-        notificationSlotType: notificationManager.SlotType.OTHER_TYPES,
-        tapDismissed: false,
-        isOngoing: true
-      };
-      notificationManager.publish(request).catch((error: BusinessError) => {
-        if (this.tickCount % 60 === 0) {
-          this.appendLog('notification publish failed: ' + (error.message ?? 'unknown'));
-        }
-      });
-    } catch (error) {
     }
   }
 
@@ -1310,6 +1391,15 @@ function stripPort(endpoint: string): string {
   }
   return endpoint;
 }
+
+
+
+
+
+
+
+
+
 
 
 

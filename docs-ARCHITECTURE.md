@@ -348,6 +348,14 @@ GFW / 绕过大陆 / 全局、使用规则集、拦截广告、更换规则集�
 | 状态持久化 / 自动连接 | 记住上次连接状态与配置，打开应用自动恢复连接 |
 | 界面状态实时性 | 扩展每秒写 `status.json` 心跳；UI 侧 6 s 无心跳判定“连接已中断” |
 
+### 8.1 0.10.4 的保活与挂起
+
+- **单条通知**：连续任务由主 Ability 申请（`ContinuousTaskRequest` + `SUBMODE_LIVE_VIEW_NOTIFICATION`），扩展把 live view 画在同一个 notification id 上；不再另发普通通知，也不再启动无窗口 Ability（它会抢前台窗口，表现为启动图卡住或最近任务里出现两张卡片）。
+- **申请顺序**：先申请任务拿到 `notificationId`，再启动 VPN 并把它传进去；通知被划掉时由 `continuousTaskCancel` 监听后自动重申请，并通过 `com.way.app.TASK_ID` 把新 id 广播给扩展。
+- **SSID 挂起**：命中挂起规则的 Wi-Fi 时**全停**（`stopVpn` + `stopBackgroundRunning`，不留心跳/看门狗/通知）；在挂起 Wi-Fi 上点开关只显示“已挂起”（开关为开、琥珀色），不发起连接；挂起状态下点关闭则真正关闭，不会被规则再挂起。
+- **恢复**：离开挂起 Wi-Fi 时按“刚启动”走一遍——重建配置 → 申请连续任务 → 启动 VPN，使任务/通知/心跳与冷启动一致；并用 `wifiConnectionChange` 事件驱动，App 在后台（定时器被冻结）时也能恢复。
+- **关闭**：滑掉后台即完整退出——停监听、释放任务、停 VPN、清挂起标记，并记 `userOff` 不再自动重连。
+
 ## 9. 已知限制（务必读）
 
 1. 本机真机（`VDE-AL10`，API 26）已 `hdc install` 并逐项验证，截图存 `verify/`：

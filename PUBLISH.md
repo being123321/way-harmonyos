@@ -2,6 +2,9 @@
 
 已发布：**https://github.com/being123321/way-harmonyos**（Public，默认分支 main，许可证 MPL-2.0）
 
+- Release `v0.10.4`：https://github.com/being123321/way-harmonyos/releases/tag/v0.10.4
+  - 附件 `way-0.10.4-unsigned.hap`，28,662,716 B，SHA256 `2A6CAA556CFFAD38BF1F7A4333898074DDA87C3C8965428298B56C238E787C9C`
+  - 保活改为单条 live-view 通知（不再用无窗口 Ability 持有任务）；SSID 挂起全停、离开后按冷启动流程完整恢复（后台由 `wifiConnectionChange` 事件驱动）；挂起时开关为琥珀色，关闭即彻底退出
 - Release `v0.10.3`：https://github.com/being123321/way-harmonyos/releases/tag/v0.10.3
   - 附件 `way-0.10.3-unsigned.hap`，28,656,812 B，SHA256 `BAFA58B2881AFE61468D85150BB806A72F99749DD4B5D65FCB53D4019070AFA8`
   - 默认日志 info（诊断开关可切 debug）、节点测速结果持久化且不再自动探测、QUIC 默认放行、DNS 过期缓存

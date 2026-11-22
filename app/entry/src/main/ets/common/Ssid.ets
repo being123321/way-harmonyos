@@ -136,6 +136,18 @@ export function setSsidSuspended(context: common.Context, suspended: boolean): v
   }
 }
 
+export function suspendOverride(context: common.Context): boolean {
+  try {
+    return store(context).getSync('suspendOverride', false) as boolean;
+  } catch (error) {
+    return false;
+  }
+}
+
+export function setSuspendOverride(context: common.Context, value: boolean): void {
+  setFlag(context, 'suspendOverride', value);
+}
+
 export function setFlag(context: common.Context, key: string, value: boolean): void {
   try {
     const editor = store(context);
@@ -144,4 +156,5 @@ export function setFlag(context: common.Context, key: string, value: boolean): v
   } catch (error) {
   }
 }
+
 
