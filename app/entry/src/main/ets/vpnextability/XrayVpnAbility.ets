@@ -56,6 +56,9 @@ interface TunnelStatus {
 
 const XRAY_DIR: string = 'xray';
 const TUN_ADDRESS_V4: string = '172.19.0.1';
+// One MTU everywhere: the system VPN interface and the core's TUN ingress must
+// agree, or the core may hand the driver packets the interface cannot carry.
+const TUN_MTU: number = 1400;
 const TUN_ADDRESS_V6: string = 'fdfe:dcba:9876::1';
 const TUN_INTERFACE: string = 'vpn-tun';
 const DNS_ANCHOR: string = '198.18.0.1';
@@ -236,7 +239,7 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
     }
 
     try {
-      native.start(this.configText, fd, 1500, this.logDir, this.geodataDir);
+      native.start(this.configText, fd, TUN_MTU, this.logDir, this.geodataDir);
     } catch (error) {
       const err = error as BusinessError;
       this.writeStatus('error', 'Xray 启动失败: ' + err.message);
@@ -414,7 +417,7 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
       addresses: [localV4, localV6],
       routes: routes,
       dnsAddresses: dnsAddresses,
-      mtu: 1400,
+      mtu: TUN_MTU,
       isIPv4Accepted: true,
       isIPv6Accepted: true,
       isBlocking: false,
@@ -442,7 +445,7 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
           this.writeStatus('error', '连接对象已释放');
           return;
         }
-        native.restart(this.configText, this.tunFd, 1500, this.logDir, this.geodataDir);
+        native.restart(this.configText, this.tunFd, TUN_MTU, this.logDir, this.geodataDir);
         this.failedRestarts = 0;
       } catch (error) {
         this.failedRestarts++;
@@ -1307,6 +1310,9 @@ function stripPort(endpoint: string): string {
   }
   return endpoint;
 }
+
+
+
 
 
 

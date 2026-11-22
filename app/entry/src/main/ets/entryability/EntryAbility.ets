@@ -137,6 +137,7 @@ export default class EntryAbility extends UIAbility {
       geodata: geodataReady(this.context),
       mode: mode,
       blockQuic: store.getSync('blockQuic', true) as boolean,
+      debugLog: store.getSync('debugLog', false) as boolean,
       ruleSet: activeRuleSet(this.context),
       blockAds: ruleSetAdsEnabled(this.context),
       doh: dohEnabled(this.context),

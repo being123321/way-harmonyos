@@ -2,6 +2,7 @@ import { common } from '@kit.AbilityKit';
 import type { BusinessError } from '@kit.BasicServicesKit';
 import { promptAction, router } from '@kit.ArkUI';
 import { Insets, cancelProbes, nodeTypeLabel, pageInsets, tunnelOutboundTags, tunnelUp } from '../common/Xray';
+import { LatencyEntry, readLatencyCache, recordLatency } from '../common/LatencyStore';
 import {
   ConfigEntry, ConfigStore, SubscriptionRecord, entriesOfSub, manualEntries, readStore, readSubs,
   removeEntry, removeSub, selectEntry, updateSub
@@ -49,10 +50,12 @@ struct Configs {
       this.insets = value;
     });
     this.refresh();
+    this.loadLatency();
   }
 
   onPageShow(): void {
     this.refresh();
+    this.loadLatency();
   }
 
   aboutToDisappear(): void {
@@ -256,6 +259,10 @@ struct Configs {
     if (this.disposed) {
       return;
     }
+    const context = this.ctx;
+    if (context !== null) {
+      recordLatency(context, result.id, result.ms, result.via);
+    }
     const next: LatencyResult[] = [result];
     for (const item of this.latency) {
       if (item.id !== result.id) {
@@ -265,8 +272,23 @@ struct Configs {
     this.latency = next;
   }
 
-  // One shared engine for both the per-row probe and the whole-list run, so the
-  // connected/disconnected decision is made in exactly one place.
+  // Rows show the last delay measured anywhere (this page or the dashboard);
+  // the "· TCP / · HTTP" suffix keeps the metric visible, and no list probes on
+  // its own just because it was opened.
+  private loadLatency(): void {
+    const context = this.ctx;
+    if (context === null) {
+      return;
+    }
+    const cache: Map<string, LatencyEntry> = readLatencyCache(context);
+    const list: LatencyResult[] = [];
+    cache.forEach((value: LatencyEntry, key: string) => {
+      const entry: LatencyResult = { id: key, ms: value.ms, via: value.via, at: value.at };
+      list.push(entry);
+    });
+    this.latency = list;
+  }
+
   private async runTest(scope: ConfigEntry[]): Promise<void> {
     const context = this.ctx;
     if (context === null || this.testing) {
@@ -277,10 +299,7 @@ struct Configs {
       return;
     }
     this.testing = true;
-    // Drop the previous round: a latency measured while disconnected is a TCP
-    // handshake, and mixing it with this round's through-proxy numbers (sorted
-    // together) showed rows like "19 ms" above "635 ms · HTTP".
-    this.latency = [];
+    this.loadLatency();
     this.viaTunnel = tunnelUp(context);
     this.probeTags = this.viaTunnel ? tunnelOutboundTags(context) : [];
     this.testTotal = scope.length;
@@ -879,4 +898,6 @@ function formatTimeShort(ts: number): string {
   return pad(date.getMonth() + 1) + '-' + pad(date.getDate()) + ' ' +
     pad(date.getHours()) + ':' + pad(date.getMinutes());
 }
+
+
 

@@ -26,6 +26,9 @@ export interface SplitOptions {
   blockAds: boolean;
   // Domestic DoH (direct) + foreign DoH (through the node) instead of plain UDP.
   doh: boolean;
+  // Diagnostic logging: 'debug' writes every routing decision to the core log.
+  // Off by default; only for troubleshooting routes, DNS or protocol issues.
+  debugLog: boolean;
   // Server addresses resolved by the app before connecting. The core's probe
   // bootstrap resolver otherwise asks the configured DoH through the tunnel for
   // every node's server name, which made each probe look 2-3 s slower.
@@ -187,6 +190,11 @@ function applyDohDns(root: Record<string, Object>, geodata: boolean): void {
     servers.push(domestic);
   }
   dns['servers'] = servers;
+  // Cold or expired entries are what make a page wait on DNS; serve the stale
+  // answer immediately and refresh in the background instead (core cache stays
+  // on, so DoH results are still reused between requests).
+  dns['serveStale'] = true;
+  dns['serveExpiredTTL'] = 86400;
   root['dns'] = dns;
 }
 
@@ -229,6 +237,8 @@ function applySplitDns(root: Record<string, Object>): void {
     merged.push(item);
   }
   dns['servers'] = merged;
+  dns['serveStale'] = true;
+  dns['serveExpiredTTL'] = 86400;
   root['dns'] = dns;
 }
 
@@ -340,9 +350,10 @@ export function applyBuiltInRules(configJson: string, options: SplitOptions): st
   }
   try {
     const root: Record<string, Object> = JSON.parse(configJson) as Record<string, Object>;
-    // Debug routing decisions (sniffed domain + chosen outbound) so the app can
-    // mirror them; harmless at runtime and switched off outside diagnostics.
-    const logConfig: Record<string, Object> = { 'loglevel': 'debug' };
+    // Routing decisions (sniffed domain + chosen outbound) are mirrored into the
+    // UI log only when diagnostics are on: 'debug' makes the core write one line
+    // per connection, which costs CPU and floods the log in normal use.
+    const logConfig: Record<string, Object> = { 'loglevel': options.debugLog ? 'debug' : 'info' };
     root['log'] = logConfig;
     const inbounds: Object[] = asArray(root['inbounds'] as Object | undefined);
     for (const candidate of inbounds) {
@@ -420,3 +431,5 @@ export function applyBuiltInRules(configJson: string, options: SplitOptions): st
     return configJson;
   }
 }
+
+

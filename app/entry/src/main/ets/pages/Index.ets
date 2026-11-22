@@ -19,6 +19,7 @@ import { ConfigEntry, SubscriptionRecord, readStore, readSubs, selectEntry, sele
 import { refreshSubscription } from '../common/Subscription';
 import { TEST_HOST } from '../common/Speedtest';
 import { resolveUdp } from '../common/UdpDns';
+import { LatencyEntry, readLatencyCache, recordLatency } from '../common/LatencyStore';
 import { appLog } from '../common/AppLog';
 import { MODE_BYPASS, MODE_GFW, MODE_GLOBAL, SplitOptions } from '../common/Rules';
 import { TunnelConfigResult, buildAndSaveTunnel, proxyOutbound } from '../common/TunnelConfig';
@@ -74,7 +75,10 @@ struct Index {
   @State probeMs: number = 0;
   @State pssKb: number = 0;
   @State cpuPercent: number = 0;
-  @State blockQuic: boolean = true;
+  @State blockQuic: boolean = false;
+  // Diagnostic logging is off by default: the core otherwise writes one debug
+  // line per routed connection.
+  @State debugLog: boolean = false;
   private lastStartedAt: number = 0;
   private lastNotifRefreshAt: number = 0;
   @State upSpeed: number = 0;
@@ -137,6 +141,7 @@ struct Index {
   onPageShow(): void {
     this.refreshEntry();
     this.refreshRuleSetStatus();
+    this.loadLatencyCache();
     this.startPolling();
     this.subscribeTraffic();
     this.poll();
@@ -261,7 +266,8 @@ struct Index {
     this.splitOn = true;
     this.routeMode = store.getSync('mode', MODE_BYPASS) as string;
     this.geoSourceName = selectedPreset(context).name;
-    this.blockQuic = store.getSync('blockQuic', true) as boolean;
+    this.blockQuic = store.getSync('blockQuic', false) as boolean;
+    this.debugLog = store.getSync('debugLog', false) as boolean;
     this.onDemand = onDemandEnabled(context);
     this.rules = ssidRules(context);
     this.useRuleSet = store.getSync('useRuleSet', false) as boolean;
@@ -315,6 +321,7 @@ struct Index {
     store.putSync('split', true);
     store.putSync('mode', this.routeMode);
     store.putSync('blockQuic', this.blockQuic);
+    store.putSync('debugLog', this.debugLog);
     store.putSync('useRuleSet', this.useRuleSet);
     store.putSync('blockAds', this.blockAds);
     store.putSync('dohDns', this.dohDns);
@@ -506,6 +513,7 @@ struct Index {
       geodata: geodataReady(context),
       mode: this.routeMode,
       blockQuic: this.blockQuic,
+      debugLog: this.debugLog,
       // Gate on the in-memory switch: the pref write is asynchronous and a live
       // apply right after a toggle would otherwise read the previous value.
       ruleSet: this.useRuleSet ? readRuleSet(context) : null,
@@ -836,6 +844,21 @@ struct Index {
     });
   }
 
+  // Numbers measured anywhere (this list or the node page) are read back from
+  // the shared cache, so opening a list never probes on its own.
+  private loadLatencyCache(): void {
+    const context = this.ctx;
+    if (context === null) {
+      return;
+    }
+    const cache: Map<string, LatencyEntry> = readLatencyCache(context);
+    const values: Map<string, number> = new Map<string, number>();
+    cache.forEach((value: LatencyEntry, key: string) => {
+      values.set(key, value.ms);
+    });
+    this.nodeLatency = values;
+  }
+
   private async probeNodes(): Promise<void> {
     if (this.nodeProbing) {
       return;
@@ -853,13 +876,19 @@ struct Index {
           let rtt: number = endpoint === null
             ? -1
             : await measureLatency(endpoint.host, endpoint.port, 3000);
+          let via: string = 'tcp';
           if (rtt < 0 && this.isUdpNode(item.type)) {
             // UDP-only servers drop the TCP handshake; fall back to a real
             // request through the core so the row still shows something useful.
             const probe = await probeOutbound(NODE_TEST_URL, 8000, item.id);
             rtt = (probe.status === 0 && probe.delayMs > 0) ? probe.delayMs : -1;
+            via = 'http';
           }
           measured.set(item.id, rtt);
+          const context = this.ctx;
+          if (context !== null) {
+            recordLatency(context, item.id, rtt, via);
+          }
         } catch (error) {
           measured.set(item.id, -1);
         }
@@ -1846,7 +1875,8 @@ struct Index {
         }
         this.nodeExpanded = !this.nodeExpanded;
         if (this.nodeExpanded) {
-          this.probeNodes();
+          // Expanding shows the cached numbers; measuring stays a manual action.
+          this.loadLatencyCache();
         }
       })
 
@@ -2050,6 +2080,29 @@ struct Index {
           .selectedColor('#54C4FF')
           .onChange((value: boolean) => {
             this.blockQuic = value;
+            this.persist();
+          })
+      }
+      .width('100%')
+      .margin({ top: 10 })
+
+      Row() {
+        Column() {
+          Text('诊断日志')
+            .fontSize(13)
+            .fontColor('#D6E4F7')
+          Text('记录每条连接的路由决策，排查后再关（默认关闭）')
+            .fontSize(11)
+            .fontColor('#5C7192')
+            .margin({ top: 2 })
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+
+        Toggle({ type: ToggleType.Switch, isOn: this.debugLog })
+          .selectedColor('#54C4FF')
+          .onChange((value: boolean) => {
+            this.debugLog = value;
             this.persist();
           })
       }
@@ -2413,6 +2466,11 @@ struct Index {
     .borderRadius(16)
   }
 }
+
+
+
+
+
 
 
 
