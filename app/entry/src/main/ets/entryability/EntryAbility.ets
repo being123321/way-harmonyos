@@ -13,7 +13,6 @@ import { geodataReady } from '../common/Geodata';
 import { preferences } from '@kit.ArkData';
 import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { wifiManager } from '@kit.ConnectivityKit';
-import { PipManager } from '../common/PipManager';
 
 const DOMAIN: number = 0x0000;
 const TAG: string = 'way';
@@ -70,11 +69,10 @@ export default class EntryAbility extends UIAbility {
       }
       this.wifiHandler = null;
     }
-    // With the simulated-PiP keepalive the main task may be swiped away while
-    // the PiP window (and this ability) stays alive. That is not an explicit
-    // exit: keep the VPN intent so the tunnel/task survive.
-    if (this.pipKeepAliveActive()) {
-      appLog(this.context, 'lifecycle', 'onDestroy with PiP keepalive, tunnel left running');
+    // A TempAbility armed from the widget preview owns the task and keeps the
+    // VPN alive; swiping the main window is not an explicit exit in that case.
+    if (this.tempKeepAliveActive()) {
+      appLog(this.context, 'lifecycle', 'onDestroy with TempAbility keepalive, tunnel left running');
     } else {
       // 用户手动清后台：把隧道停掉并清「已连接」标记，之后不自动重连。
       this.stopForManualKill().catch((): void => {
@@ -82,18 +80,10 @@ export default class EntryAbility extends UIAbility {
     }
   }
 
-  private pipKeepAliveActive(): boolean {
+  private tempKeepAliveActive(): boolean {
     try {
       const way = preferences.getPreferencesSync(this.context, { name: 'way' });
-      const active: boolean = way.getSync('vpnActive', false) as boolean;
-      const userOff: boolean = way.getSync('userOff', false) as boolean;
-      const suspended: boolean = way.getSync('ssidSuspended', false) as boolean;
-      const tempKeepAlive: boolean = way.getSync('tempKeepAlive', false) as boolean;
-      const prefs = preferences.getPreferencesSync(this.context, { name: 'xray_prefs' });
-      const enabled: boolean = prefs.getSync('pipKeepAlive', true) as boolean;
-      // A TempAbility armed from the widget preview is an independent keepalive
-      // owner; swiping the main window must not stop its VPN either.
-      return tempKeepAlive || (enabled && active && !userOff && !suspended);
+      return way.getSync('tempKeepAlive', false) as boolean;
     } catch (error) {
       return false;
     }
@@ -320,9 +310,8 @@ export default class EntryAbility extends UIAbility {
     // and it used to share this try block, which skipped the transparent bars
     // and left the page inset by the status bar (header too low, first card
     // misaligned, background bloom clipped).
-    let win: window.Window | null = null;
     try {
-      win = windowStage.getMainWindowSync();
+      const win: window.Window = windowStage.getMainWindowSync();
       win.setWindowLayoutFullScreen(true).catch((error: BusinessError) => {
         hilog.warn(DOMAIN, TAG, 'fullscreen failed: %{public}s', JSON.stringify(error));
       });
@@ -341,44 +330,11 @@ export default class EntryAbility extends UIAbility {
     } catch (error) {
       hilog.warn(DOMAIN, TAG, 'window setup failed: %{public}s', JSON.stringify(error));
     }
-
-    // PiP is a separate, optional layer; a failure here must not affect the
-    // window/status-bar setup above.
-    try {
-      if (win !== null) {
-        PipManager.getInstance().makeTypeNode(win.getUIContext());
-        PipManager.getInstance().prepare(this.context);
-      }
-    } catch (error) {
-      hilog.warn(DOMAIN, TAG, 'pip setup failed: %{public}s', JSON.stringify(error));
-    }
   }
 
   onWindowStageDestroy(): void {
   }
 
-  onBackground(): void {
-    try {
-      if (!this.pipKeepAliveActive()) {
-        PipManager.getInstance().setAutoStart(this.context, false);
-        return;
-      }
-      // The system pops the small PiP window when the app goes to the
-      // background; it survives the main task being swiped away.
-      PipManager.getInstance().setAutoStart(this.context, true);
-      appLog(this.context, 'pip', 'PiP auto-start enabled on background');
-    } catch (error) {
-    }
-  }
-
-  onForeground(): void {
-    try {
-      PipManager.getInstance().setAutoStart(this.context, false);
-      PipManager.getInstance().stop();
-      appLog(this.context, 'pip', 'foreground, PiP stopped');
-    } catch (error) {
-    }
-  }
 }
 
 

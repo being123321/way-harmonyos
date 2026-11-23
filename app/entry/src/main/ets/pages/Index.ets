@@ -8,21 +8,20 @@ import type { Want } from '@kit.AbilityKit';
 import type { BusinessError } from '@kit.BasicServicesKit';
 import { preferences } from '@kit.ArkData';
 import { promptAction, router } from '@kit.ArkUI';
-import { connection, socket } from '@kit.NetworkKit';
+import { connection } from '@kit.NetworkKit';
 import { commonEventManager } from '@kit.BasicServicesKit';
 import {
   Insets, ReloadResult, TunnelStatus, clearStatus, coreVersion, formatBytes, formatDuration, formatTime,
   reloadRouting, tunnelUp,
-  NodeEndpoint, formatSpeed, measureLatency, nodeEndpoint, nodeTypeLabel, outboundEndpoint, pageInsets, probeOutbound, readLogs,
+  NodeEndpoint, formatSpeed, nodeEndpoint, nodeTypeLabel, outboundEndpoint, pageInsets, readLogs, tunnelOutboundTags,
   readStatus, saveConfig, startVpn, stopVpn, vpnWant, loadConfig
 } from '../common/Xray';
 import { ConfigEntry, SubscriptionRecord, readStore, readSubs, selectEntry, selectedEntry } from '../common/Store';
 import { refreshSubscription } from '../common/Subscription';
-import { TEST_HOST } from '../common/Speedtest';
+import { LatencyResult, TEST_HOST, testAll } from '../common/Speedtest';
 import { resolveUdp } from '../common/UdpDns';
 import { LatencyEntry, readLatencyCache, recordLatency } from '../common/LatencyStore';
 import { appLog } from '../common/AppLog';
-import { PipManager } from '../common/PipManager';
 import { MODE_BYPASS, MODE_GFW, MODE_GLOBAL, SplitOptions } from '../common/Rules';
 import { TunnelConfigResult, buildAndSaveTunnel, proxyOutbound } from '../common/TunnelConfig';
 import { SSID_DIRECT, SSID_SUSPEND, SsidRule, clearSsidRules, currentSsid, findRule, onDemandEnabled, removeSsidRule, setAppliedSsidAction, setFlag, setSsidRule, setSsidSuspended, setSuspendOverride, ssidRules, ssidSuspended, suspendOverride } from '../common/Ssid';
@@ -60,7 +59,6 @@ const ENABLE_CONTINUOUS_TASK: boolean = true;
 const HEADER_BLUR: number = 28;
 // Fallback probe target for nodes that speak UDP only: a TCP handshake to such a
 // server is usually dropped, so measure the real request instead.
-const NODE_TEST_URL: string = 'https://www.gstatic.com/generate_204';
 
 @Entry
 @Component
@@ -134,10 +132,6 @@ struct Index {
   private networkSwitchAt: number = 0;
   private sawNetEvent: boolean = false;
   private reviveFailures: number = 0;
-  // Simulated PiP keepalive: when enabled, EntryAbility enables PiP auto-start
-  // in onBackground, so the system keeps a small window (and the process)
-  // after the main task is swiped away.
-  @State pipKeepAlive: boolean = true;
   // Reconnect when the app is opened again after a manual swipe-away. This is
   // the FlClash "auto-connect on launch" behaviour: the manual swipe is still a
   // full stop (no background resurrection), but the next launch restores it.
@@ -192,7 +186,6 @@ struct Index {
   // once, so clearing it on hide used to leave the dashboard frozen at the
   // values captured when the app went background.
   onPageShow(): void {
-    this.preparePip();
     this.consumeCardOp();
     this.refreshIntent();
     this.refreshEntry();
@@ -201,20 +194,6 @@ struct Index {
     this.startPolling();
     this.subscribeTraffic();
     this.poll();
-  }
-
-  onPageHide(): void {
-    // Keep polling on purpose: with the PiP keepalive the process survives the
-    // main task, and the 5 s heartbeat supervisor is what relaunches a
-    // reclaimed VPN extension. Without PiP the system freezes this timer.
-    //
-    // Enabling auto-start here (before onBackground) is what makes the system
-    // pop the PiP window as the app leaves the foreground.
-    const context = this.ctx;
-    if (context !== null && this.pipKeepAlive && this.intentOn) {
-      PipManager.getInstance().setAutoStart(context, true);
-      appLog(context, 'pip', 'PiP auto-start enabled at page hide');
-    }
   }
 
   // FlClash-style keepalive entry: open the system widget picker for the way
@@ -239,22 +218,6 @@ struct Index {
       formProvider.openFormManager(want);
     } catch (error) {
       promptAction.showToast({ message: '打开卡片预览失败' });
-    }
-  }
-
-  private preparePip(): void {
-    const context = this.ctx;
-    if (context === null) {
-      return;
-    }
-    if (this.pipKeepAlive && this.intentOn) {
-      // Create the controller while the app is still in the foreground, enable
-      // auto-start for the next background, and close any PiP left from before.
-      PipManager.getInstance().setAutoStart(context, true);
-      PipManager.getInstance().stop();
-    } else {
-      PipManager.getInstance().setAutoStart(context, false);
-      PipManager.getInstance().stop();
     }
   }
 
@@ -531,7 +494,6 @@ struct Index {
     this.useRuleSet = store.getSync('useRuleSet', false) as boolean;
     this.blockAds = store.getSync('blockAds', true) as boolean;
     this.dohDns = store.getSync('dohDns', true) as boolean;
-    this.pipKeepAlive = store.getSync('pipKeepAlive', true) as boolean;
     this.autoConnect = store.getSync('autoConnect', true) as boolean;
     // The converted ACL4SSR set ships in the HAP: seed it on first launch so the
     // feature works before the tunnel (and therefore the download) can.
@@ -586,7 +548,6 @@ struct Index {
     store.putSync('useRuleSet', this.useRuleSet);
     store.putSync('blockAds', this.blockAds);
     store.putSync('dohDns', this.dohDns);
-    store.putSync('pipKeepAlive', this.pipKeepAlive);
     store.putSync('autoConnect', this.autoConnect);
     await store.flush();
   }
@@ -1109,8 +1070,6 @@ struct Index {
       this.message = '断开（恢复失败）';
       this.setSwitch(false);
       this.stopKeepAliveTask();
-      PipManager.getInstance().setAutoStart(context, false);
-      PipManager.getInstance().stop();
       return;
     }
     this.recoveryAttempts++;
@@ -1203,65 +1162,9 @@ struct Index {
     this.selectedId = store.selectedId;
   }
 
-  // Latency for every node in the expanded list: four probes in flight, 4 s
-  // timeout each, results appear as they come in so a node can be picked while
-  // the rest are still measuring.
-  // Real RTT to the node: a plain TCP connect from this (net-protected) process
-  // reaches the server directly, so the measured time is one network round trip -
-  // both a completed handshake and an immediate RST land at ~1 RTT. No TLS, no
-  // proxy handshake, no HTTP, which is why the numbers are far lower than the
-  // request-based probe.
-  private async tcpRtt(host: string, port: number, timeoutMs: number): Promise<number> {
-    if (host.length === 0 || port <= 0) {
-      return -1;
-    }
-    let tcp: socket.TCPSocket | null = null;
-    try {
-      tcp = socket.constructTCPSocketInstance();
-    } catch (error) {
-      return -1;
-    }
-    const handle: socket.TCPSocket = tcp;
-    const started: number = Date.now();
-    return new Promise<number>((resolve) => {
-      let settled: boolean = false;
-      let timer: number = -1;
-      const finish = (value: number): void => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        if (timer !== -1) {
-          clearTimeout(timer);
-        }
-        try {
-          handle.close();
-        } catch (error) {
-        }
-        resolve(value);
-      };
-      timer = setTimeout(() => {
-        finish(-1);
-      }, timeoutMs);
-      handle.on('connect', () => {
-        finish(Date.now() - started);
-      });
-      handle.on('error', () => {
-        // A refused connection also arrives after one round trip.
-        finish(Date.now() - started);
-      });
-      const options: socket.TCPConnectOptions = {
-        address: { address: host, port: port },
-        timeout: timeoutMs
-      };
-      handle.connect(options).then(() => {
-        finish(Date.now() - started);
-      }).catch(() => {
-        finish(Date.now() - started);
-      });
-    });
-  }
-
+  // Latency for every node in the expanded list: same path as the node page.
+  // When connected the core performs a real HTTP probe through each outbound;
+  // when not connected it falls back to a direct TCP/UDP handshake.
   // Numbers measured anywhere (this list or the node page) are read back from
   // the shared cache, so opening a list never probes on its own.
   private loadLatencyCache(): void {
@@ -1284,50 +1187,26 @@ struct Index {
     this.nodeProbing = true;
     const entries: ConfigEntry[] = this.nodeList.slice();
     const measured: Map<string, number> = new Map<string, number>();
-    let cursor: number = 0;
-    const worker = async (): Promise<void> => {
-      while (cursor < entries.length) {
-        const item: ConfigEntry = entries[cursor];
-        cursor++;
-        try {
-          const endpoint = nodeEndpoint(item.json);
-          let rtt: number = endpoint === null
-            ? -1
-            : await measureLatency(endpoint.host, endpoint.port, 3000);
-          let via: string = 'tcp';
-          if (rtt < 0 && this.isUdpNode(item.type)) {
-            // UDP-only servers drop the TCP handshake; fall back to a real
-            // request through the core so the row still shows something useful.
-            const probe = await probeOutbound(NODE_TEST_URL, 8000, item.id);
-            rtt = (probe.status === 0 && probe.delayMs > 0) ? probe.delayMs : -1;
-            via = 'http';
-          }
-          measured.set(item.id, rtt);
-          const context = this.ctx;
-          if (context !== null) {
-            recordLatency(context, item.id, rtt, via);
-          }
-        } catch (error) {
-          measured.set(item.id, -1);
-        }
-        this.nodeLatency = new Map<string, number>(measured);
-      }
-    };
-    const workers: Promise<void>[] = [];
-    for (let i = 0; i < 4; i++) {
-      workers.push(worker());
+    const context = this.ctx;
+    if (context === null) {
+      this.nodeProbing = false;
+      return;
     }
-    await Promise.all(workers);
+    // Same path as the node page: when the tunnel is up the core performs a
+    // real HTTP probe through each node's outbound; only when it is down do we
+    // fall back to a direct TCP/UDP handshake (a network RTT, not proxy delay).
+    const viaTunnel: boolean = tunnelUp(context);
+    const tags: string[] = viaTunnel ? tunnelOutboundTags(context) : [];
+    try {
+      await testAll(entries, viaTunnel, tags, (result: LatencyResult) => {
+        measured.set(result.id, result.ms);
+        recordLatency(context, result.id, result.ms, result.via);
+        this.nodeLatency = new Map<string, number>(measured);
+      });
+    } catch (error) {
+    }
     this.nodeLatency = new Map<string, number>(measured);
     this.nodeProbing = false;
-  }
-
-  // Hysteria / TUIC / QUIC nodes listen on UDP only, so a TCP handshake is not a
-  // latency sample for them.
-  private isUdpNode(type: string): boolean {
-    const value: string = type.toLowerCase();
-    return value.indexOf('hysteria') >= 0 || value.indexOf('tuic') >= 0 ||
-      value.indexOf('quic') >= 0 || value.indexOf('h3') >= 0 || value.indexOf('wireguard') >= 0;
   }
 
   private latencyText(id: string): string {
@@ -1553,12 +1432,6 @@ struct Index {
       this.recoveryAttempts = 0;
       this.nextRecoveryAt = 0;
       this.lastBeatAt = Date.now();
-      // Create the PiP controller while still foreground, so the next
-      // background reliably auto-starts the small keepalive window.
-      if (this.pipKeepAlive) {
-        PipManager.getInstance().setAutoStart(context, true);
-        PipManager.getInstance().stop();
-      }
       if (tunnel.multi) {
         this.watchMultiNodeStart(tunnel.single, entry.name, notifId, 0);
       }
@@ -1569,8 +1442,6 @@ struct Index {
       this.setSwitch(false);
       // The switch is off, so the supervisor must not fight the user's view.
       this.intentOn = false;
-      PipManager.getInstance().setAutoStart(context, false);
-      PipManager.getInstance().stop();
       appLog(context, 'ui', 'vpn start failed: ' + (err.message ?? JSON.stringify(error)));
       // Leave no half-created VPN or dangling task notification behind: the
       // next tap must start from the same clean slot as a cold launch.
@@ -1937,8 +1808,6 @@ struct Index {
     this.markActive(false);
     this.stopTempAbility();
     this.keepAliveOwnedByTemp = false;
-    PipManager.getInstance().setAutoStart(context, false);
-    PipManager.getInstance().stop();
     // Turning the switch off on a suspended Wi-Fi means "off", not "suspend
     // again": clear the policy markers so the watcher leaves it alone until the
     // user turns it on again.
@@ -3033,29 +2902,6 @@ struct Index {
 
       Row() {
         Column() {
-          Text('模拟画中画保活')
-            .fontSize(13)
-            .fontColor('#D6E4F7')
-          Text(this.pipKeepAlive ? '离开 App 弹小浮窗，划掉主应用后 VPN 继续' : '关闭后后台可能被系统回收')
-            .fontSize(11)
-            .fontColor(this.pipKeepAlive ? '#5C7192' : '#FFC857')
-            .margin({ top: 2 })
-        }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
-
-        Toggle({ type: ToggleType.Switch, isOn: this.pipKeepAlive })
-          .selectedColor('#54C4FF')
-          .onChange((value: boolean) => {
-            this.pipKeepAlive = value;
-            this.persist();
-          })
-      }
-      .width('100%')
-      .margin({ top: 12 })
-
-      Row() {
-        Column() {
           Text('打开应用自动连接')
             .fontSize(13)
             .fontColor('#D6E4F7')
@@ -3103,7 +2949,7 @@ struct Index {
       .width('100%')
       .margin({ top: 12 })
 
-      Text('连接后内核运行在 VPN 扩展进程。点「保活入口」打开系统卡片预览，进入后直接退出即可拉起后台保活，不需要把卡片加到桌面。开启「模拟画中画」时，离开 App 会自动弹出小浮窗，划掉主应用后浮窗和进程保留；关闭则后台可能被回收。开启「打开应用自动连接」时，手动划掉后台会完整停止 VPN（不会在后台偷偷重启），下次打开 App 自动重连；关闭则下次启动保持断开。系统重启后需手动打开应用恢复。')
+      Text('连接后内核运行在 VPN 扩展进程。点「保活入口」打开系统卡片预览，进入后直接退出即可拉起后台保活，不需要把卡片加到桌面。开启「打开应用自动连接」时，手动划掉后台会完整停止 VPN（不会在后台偷偷重启），下次打开 App 自动重连；关闭则下次启动保持断开。系统重启后需手动打开应用恢复。')
         .fontSize(11)
         .fontColor('#4C5D77')
         .margin({ top: 12 })

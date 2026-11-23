@@ -26,12 +26,32 @@ export default class TempAbility extends UIAbility {
   private taskAgent: WantAgent | null = null;
 
   onCreate(): void {
+    appLog(this.context, 'keepalive', 'TempAbility onCreate');
     this.watchStop();
     this.arm().catch((): void => {
     });
   }
 
+  // The blank keepalive ability has no page, but the system still reports
+  // foreground/background; these two lines tell us whether the card preview
+  // actually brought it up and whether it ever became visible in recents.
+  onForeground(): void {
+    appLog(this.context, 'keepalive', 'TempAbility onForeground (visible)');
+  }
+
+  onBackground(): void {
+    appLog(this.context, 'keepalive', 'TempAbility onBackground');
+  }
+
   onDestroy(): void {
+    let temp: boolean = false;
+    try {
+      const way = preferences.getPreferencesSync(this.context, { name: 'way' });
+      temp = way.getSync('tempKeepAlive', false) as boolean;
+    } catch (error) {
+    }
+    appLog(this.context, 'keepalive',
+      'TempAbility onDestroy, tempKeepAlive=' + temp + ', running=' + this.running);
     this.stopSupervisor();
     this.release();
     this.clearKeepAliveFlag();
@@ -59,6 +79,8 @@ export default class TempAbility extends UIAbility {
       const last: boolean = way.getSync('lastConnected', false) as boolean;
       const userOff: boolean = way.getSync('userOff', false) as boolean;
       const suspended: boolean = way.getSync('ssidSuspended', false) as boolean;
+      appLog(this.context, 'keepalive',
+        'arm: active=' + active + ' last=' + last + ' userOff=' + userOff + ' suspended=' + suspended);
       if (userOff || suspended || (!active && !last)) {
         appLog(this.context, 'keepalive', 'widget trigger ignored: intent off');
         this.context.terminateSelf().catch((): void => {
@@ -78,6 +100,8 @@ export default class TempAbility extends UIAbility {
       // its own task; stopping first left the VPN task-less when the picker
       // preview failed to call this ability, and the system reclaimed it.
       const notifId: number = await this.acquire();
+      appLog(this.context, 'keepalive',
+        'arm: task running=' + this.running + ' notification=' + notifId);
       if (!this.running) {
         appLog(this.context, 'keepalive', 'widget trigger: no continuous task, leaving UI task in place');
         this.context.terminateSelf().catch((): void => {
@@ -150,6 +174,7 @@ export default class TempAbility extends UIAbility {
         events: ['com.way.app.STOP_KEEPALIVE']
       });
       commonEventManager.subscribe(sub, () => {
+        appLog(this.context, 'keepalive', 'STOP_KEEPALIVE received');
         this.stopSupervisor();
         this.release();
         this.clearKeepAliveFlag();

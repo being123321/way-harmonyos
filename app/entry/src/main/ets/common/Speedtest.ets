@@ -15,14 +15,11 @@ import { udpQuicLatency } from './Latency';
 export const TEST_CONCURRENCY: number = 4;
 export const TEST_TIMEOUT_MS: number = 6000;
 
-// Plain HTTP on purpose (mihomo/FlClash's default url-test target): a 204
-// over TLS costs two extra round trips that have nothing to do with how the
-// node relays traffic, and it made every node look 300-600 ms slower than the
-// number users compare against in other clients.
-// Anycast IP, no DNS at all: resolving the probe host locally (UDP or DoH)
-// hands the node a China-optimised address, which an overseas node then has to
-// reach the slow way. A literal needs no resolver on either side.
-const TEST_URL: string = 'http://1.1.1.1/';
+// Plain HTTP 204 (the same target the status/liveness probe uses): TLS would
+// add two round trips unrelated to how the node relays traffic, and
+// 1.1.1.1 is blocked by some nodes/ISPs. gstatic is the common url-test
+// target in mihomo/FlClash and answers with an empty 204.
+const TEST_URL: string = 'http://www.gstatic.com/generate_204';
 export const TEST_HOST: string = '';
 
 export const VIA_HTTP: string = 'http';

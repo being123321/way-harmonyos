@@ -367,6 +367,8 @@ GFW / 绕过大陆 / 全局、使用规则集、拦截广告、更换规则集�
 
 ### 8.3 模拟画中画保活（0.10.4+）
 
+> 0.10.4-ui4 起已移除模拟画中画（PiP）：普通应用拿不到稳定的悬浮窗，实际没有保活效果。保活只保留连续任务 + TempAbility 卡片预览 + 心跳看门狗。
+
 - **桌面组件方案已移除**：`FormExtensionAbility` 进程不常驻（生命周期回调后约 10 s 回收），系统刷新最快 5 分钟一次，而且第三方应用不能自动把卡片加到桌面，不能当 5 s 看门狗。`form_config.json` 只保留 2*2 的可见快捷开关卡。
 - **改用 `PiPWindow`（模拟画中画）**：`PipManager` 在主窗口 UIContext 上创建 typeNode XComponent + 自定义 UI；连接后在 `onPageHide`/`onBackground` 调 `setAutoStartEnabled(true)`，系统在 App 退到后台时弹出 160×90 的小浮窗。划掉主应用后浮窗由系统保留，UIAbility、连续任务和 5 s 心跳看门狗继续存活；`onForeground`/`onPageShow` 关闭浮窗。
 - 「保活」卡片新增「模拟画中画保活」开关（`pipKeepAlive`，默认开）。关闭后后台仍可能被系统回收；浮窗内容只有 `way / 保活中`，不显示敏感信息。
