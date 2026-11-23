@@ -372,6 +372,7 @@ GFW / 绕过大陆 / 全局、使用规则集、拦截广告、更换规则集�
 - 「保活」卡片新增「模拟画中画保活」开关（`pipKeepAlive`，默认开）。关闭后后台仍可能被系统回收；浮窗内容只有 `way / 保活中`，不显示敏感信息。
 - `EntryAbility.onDestroy` 在 `pipKeepAliveActive()` 为真时不再执行 `stopForManualKill`，避免划掉主任务时把 VPN 停掉；用户主动关开关仍走 `disconnect()` 完整停止。
 - **打开应用自动连接**：`lastConnected` 记住最后一次显式连接状态。手动划掉后台时 `stopForManualKill` 完整停止 VPN（`userOff=true`，后台不会再被拉起），但保留 `lastConnected=true`；下次启动 `maybeAutoConnect()` 会自动 `connect()`。显式关开关（`disconnect`）会清 `lastConnected`，下次不自动连。可在「保活」卡单独关闭此行为。
+- **卡片预览触发（FlClash 同款）**：`WidgetCard` 的 `onAppear` 用 `postCardAction({action:'call', abilityName:'TempAbility'})` 拉起 `TempAbility`；`TempAbility` 读 `vpnActive/lastConnected`，用已保存的 `config.json` 启动 VPN 并持有连续任务，同时写 `tempKeepAlive=true`。系统卡片预览页也会触发 `onAppear`，所以「保活」卡里的「保活入口」只要用 `formProvider.openFormManager` 打开预览、进入后直接退出即可，不需要把卡片加到桌面。主 App 的 `onDestroy` 看到 `tempKeepAlive` 为真时不再 `stopForManualKill`；显式关开关会清掉它并广播 `STOP_KEEPALIVE`。
 - **平台边界**：PiP 由系统窗口管理，普通应用不能保证 100% 常驻；设备不支持时 `isPiPEnabled()` 为假，只写 `[pip] PiP is not enabled` 并回退到连续任务 + 5 s 看门狗。
 
 ## 9. 已知限制（务必读）

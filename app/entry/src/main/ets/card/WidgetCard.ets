@@ -33,5 +33,17 @@ struct WidgetCard {
     .height('100%')
     .justifyContent(FlexAlign.Center)
     .backgroundColor('#101A2E')
+    // FlClash-style trigger: the launcher previews this card in the widget
+    // picker before it is added. onAppear fires there too, so merely opening
+    // the picker and exiting arms the keepalive ability; the card itself does
+    // not need to stay on the desktop.
+    .onAppear(() => {
+      postCardAction(this, {
+        action: 'call',
+        bundleName: 'com.way.app',
+        abilityName: 'TempAbility',
+        params: { method: 'keepalive' }
+      });
+    })
   }
 }

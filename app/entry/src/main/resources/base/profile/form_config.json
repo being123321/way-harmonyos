@@ -3,7 +3,7 @@
     {
       "name": "way_widget",
       "displayName": "way 快捷开关",
-      "description": "一键连接或断开 way",
+      "description": "不需要添加至桌面或负一屏。\n进入此页面直接退出即可。",
       "src": "./ets/card/WidgetCard.ets",
       "uiSyntax": "arkts",
       "window": { "designWidth": 720, "autoDesignWidth": true },

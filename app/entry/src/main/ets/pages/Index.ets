@@ -1,6 +1,7 @@
 import { common } from '@kit.AbilityKit';
 import { abilityAccessCtrl } from '@kit.AbilityKit';
 import { notificationManager } from '@kit.NotificationKit';
+import { formInfo, formProvider } from '@kit.FormKit';
 import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { wantAgent, WantAgent } from '@kit.AbilityKit';
 import type { Want } from '@kit.AbilityKit';
@@ -211,8 +212,28 @@ struct Index {
     }
   }
 
-  private preparePip(): void {
-    const context = this.ctx;
+  // FlClash-style keepalive entry: open the system widget picker for the way
+  // card. The picker previews the card, its onAppear calls TempAbility, and
+  // TempAbility starts the VPN + continuous task. The user just exits the
+  // picker; the card does not need to be added to the desktop.
+  private openKeepAliveForm(): void {
+    const want: Want = {
+      bundleName: 'com.way.app',
+      abilityName: 'WayFormAbility',
+      parameters: {
+        'ohos.extra.param.key.form_name': 'way_widget',
+        'ohos.extra.param.key.module_name': 'entry',
+        'ohos.extra.param.key.form_dimension': formInfo.FormDimension.Dimension_2_2
+      }
+    };
+    try {
+      formProvider.openFormManager(want);
+    } catch (error) {
+      promptAction.showToast({ message: '打开卡片预览失败' });
+    }
+  }
+
+  private preparePip(): void {    const context = this.ctx;
     if (context === null) {
       return;
     }
@@ -1724,6 +1745,10 @@ struct Index {
       // Remember an explicit user choice so the on-demand watcher cannot
       // reconnect against it.
       store.putSync('userOff', !active);
+      if (!active) {
+        // Explicit switch-off ends the widget-preview keepalive owner too.
+        store.putSync('tempKeepAlive', false);
+      }
       await store.flush();
     } catch (error) {
     }
@@ -1847,6 +1872,7 @@ struct Index {
     }
     this.stopKeepAliveTask();
     this.markActive(false);
+    this.stopTempAbility();
     PipManager.getInstance().setAutoStart(context, false);
     PipManager.getInstance().stop();
     // Turning the switch off on a suspended Wi-Fi means "off", not "suspend
@@ -3007,7 +3033,33 @@ struct Index {
       .width('100%')
       .margin({ top: 12 })
 
-      Text('连接后内核运行在 VPN 扩展进程。开启「模拟画中画」时，离开 App 会自动弹出小浮窗，划掉主应用后浮窗和进程保留，VPN 不容易被系统回收；关闭则后台可能被回收。开启「打开应用自动连接」时，手动划掉后台会完整停止 VPN（不会在后台偷偷重启），下次打开 App 自动重连；关闭则下次启动保持断开。系统重启后需手动打开应用恢复。')
+      Row() {
+        Column() {
+          Text('保活入口（卡片预览）')
+            .fontSize(13)
+            .fontColor('#D6E4F7')
+          Text('打开系统卡片预览后直接退出，无需添加卡片')
+            .fontSize(11)
+            .fontColor('#5C7192')
+            .margin({ top: 2 })
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+
+        Button('打开')
+          .fontSize(12)
+          .height(30)
+          .padding({ left: 14, right: 14 })
+          .backgroundColor('#1E2C46')
+          .fontColor('#8FC7FF')
+          .onClick(() => {
+            this.openKeepAliveForm();
+          })
+      }
+      .width('100%')
+      .margin({ top: 12 })
+
+      Text('连接后内核运行在 VPN 扩展进程。点「保活入口」打开系统卡片预览，进入后直接退出即可拉起后台保活，不需要把卡片加到桌面。开启「模拟画中画」时，离开 App 会自动弹出小浮窗，划掉主应用后浮窗和进程保留；关闭则后台可能被回收。开启「打开应用自动连接」时，手动划掉后台会完整停止 VPN（不会在后台偷偷重启），下次打开 App 自动重连；关闭则下次启动保持断开。系统重启后需手动打开应用恢复。')
         .fontSize(11)
         .fontColor('#4C5D77')
         .margin({ top: 12 })

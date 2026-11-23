@@ -88,9 +88,12 @@ export default class EntryAbility extends UIAbility {
       const active: boolean = way.getSync('vpnActive', false) as boolean;
       const userOff: boolean = way.getSync('userOff', false) as boolean;
       const suspended: boolean = way.getSync('ssidSuspended', false) as boolean;
+      const tempKeepAlive: boolean = way.getSync('tempKeepAlive', false) as boolean;
       const prefs = preferences.getPreferencesSync(this.context, { name: 'xray_prefs' });
       const enabled: boolean = prefs.getSync('pipKeepAlive', true) as boolean;
-      return enabled && active && !userOff && !suspended;
+      // A TempAbility armed from the widget preview is an independent keepalive
+      // owner; swiping the main window must not stop its VPN either.
+      return tempKeepAlive || (enabled && active && !userOff && !suspended);
     } catch (error) {
       return false;
     }
