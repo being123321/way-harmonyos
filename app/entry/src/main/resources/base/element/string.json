@@ -1,8 +1,28 @@
 {
   "string": [
-    { "name": "app_name", "value": "way" },
-    { "name": "module_desc", "value": "way 代理客户端" },
-    { "name": "vpn_desc", "value": "way VPN 服务" },
-    { "name": "location_reason", "value": "读取当前 Wi-Fi 名称，用于按需启动的 SSID 规则" }
+    {
+      "name": "app_name",
+      "value": "way"
+    },
+    {
+      "name": "module_desc",
+      "value": "way 代理客户端"
+    },
+    {
+      "name": "vpn_desc",
+      "value": "way VPN 服务"
+    },
+    {
+      "name": "location_reason",
+      "value": "读取当前 Wi-Fi 名称，用于按需启动的 SSID 规则"
+    },
+    {
+      "name": "widget_name",
+      "value": "way 快捷开关"
+    },
+    {
+      "name": "widget_desc",
+      "value": "一键连接或断开 way"
+    }
   ]
 }

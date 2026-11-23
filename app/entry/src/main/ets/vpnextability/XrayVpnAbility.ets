@@ -567,7 +567,10 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
     if (this.notifyEnabled && this.tickCount % 2 === 0) {
       this.publishNotification(stats, downSpeed, upSpeed);
     }
-    if (this.tickCount % 30 === 0 && this.tickCount > 0) {
+    // 15 s, not 30 s: every probe writes one line to ability.log whether it
+    // succeeds or fails, so the log itself is a liveness signal for the UI
+    // supervisor even when there is no user traffic.
+    if (this.tickCount % 15 === 0 && this.tickCount > 0) {
       this.probeLiveness();
     }
     if (this.tickCount % 5 === 0) {
@@ -833,7 +836,13 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
   // the system hides the app's own notification while the task card is up.
   private publishLiveView(stats: XrayStats, downSpeed: number, upSpeed: number): void {
     try {
-      const liveLine: string = '↓' + formatBytes(downSpeed) + '/s ↑' + formatBytes(upSpeed) + '/s';
+      // The live view is republished every two ticks. When the tunnel is idle
+      // the speeds stay at 0 B/s, so a timestamp is what makes the content
+      // change and stops the system from treating the update as a no-op.
+      const clock: string = this.clockStamp();
+      const elapsed: string = this.formatDuration(this.startedAt);
+      const liveLine: string = '↓' + formatBytes(downSpeed) + '/s ↑' + formatBytes(upSpeed) +
+        '/s · ' + elapsed + ' · ' + clock;
       const title: string = this.nodeName.length > 0 ? this.nodeName : 'way';
       const data: Record<string, Object> = {};
       data['title'] = title;
@@ -862,6 +871,12 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
     } catch (error) {
       this.appendLog('live view error: ' + JSON.stringify(error));
     }
+  }
+
+  private clockStamp(): string {
+    const date = new Date();
+    const pad = (value: number): string => value < 10 ? '0' + value : '' + value;
+    return pad(date.getHours()) + ':' + pad(date.getMinutes()) + ':' + pad(date.getSeconds());
   }
 
   private formatDuration(startedAt: number): string {

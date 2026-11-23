@@ -4,7 +4,7 @@
     "vendor": "xray-rust",
     "versionCode": 1000003,
     "versionName": "0.10.4",
-    "icon": "$media:app_icon",
+    "icon": "$media:layered_image",
     "label": "$string:app_name"
   }
 }

@@ -13,7 +13,7 @@ import {
   Insets, ReloadResult, TunnelStatus, clearStatus, coreVersion, formatBytes, formatDuration, formatTime,
   reloadRouting, tunnelUp,
   NodeEndpoint, formatSpeed, measureLatency, nodeEndpoint, nodeTypeLabel, outboundEndpoint, pageInsets, probeOutbound, readLogs,
-  readStatus, saveConfig, startVpn, stopVpn, vpnWant
+  readStatus, saveConfig, startVpn, stopVpn, vpnWant, loadConfig
 } from '../common/Xray';
 import { ConfigEntry, SubscriptionRecord, readStore, readSubs, selectEntry, selectedEntry } from '../common/Store';
 import { refreshSubscription } from '../common/Subscription';
@@ -33,6 +33,18 @@ import { RuleBuildProgress, buildRuleSet } from '../common/RuleSource';
 
 const PREF_NAME: string = 'xray_prefs';
 const POLL_MS: number = 1000;
+// The extension writes status.json once per second. Five missed beats means
+// the extension process is gone (or its JS thread is wedged), so the UI
+// supervisor relaunches it instead of leaving the user with a dead switch.
+const HEARTBEAT_STALE_MS: number = 5000;
+// Bounded relaunch budget: attempts are spaced 1s, 2s, 4s, 8s (the next wait
+// would be 15s, but the budget stops at five). It uses the saved config, so
+// this is a relaunch, not a rebuild/restart of the tunnel.
+const RECOVERY_MAX_ATTEMPTS: number = 5;
+// connect(): notification/task first, then up to three start requests, each
+// verified against status.json (the "third tap finally works" failure).
+const CONNECT_ATTEMPTS: number = 3;
+const CONNECT_WATCHDOG_MS: number = 45000;
 // The continuous task is suspected to make the system tear down the VPN
 // extension a few seconds after it starts, so it is off until proven safe.
 const ENABLE_CONTINUOUS_TASK: boolean = true;
@@ -94,7 +106,17 @@ struct Index {
   // 连接前解析好的节点服务器地址（写进 config 的 dns.hosts）。
   private bootstrapHosts: Record<string, string[]> | null = null;
   private usedFallback: boolean = false;
-  private keepAliveStarted: boolean = false;
+  private keepAliveStarted: boolean = false
+  // Watchdog for the extension heartbeat: lastBeatAt is the extension's own
+  // status.updatedAt, lastStartRequestAt is when this UI last asked the system
+  // to launch it. Recovery is bounded (RECOVERY_MAX_ATTEMPTS) with backoff.
+  private lastBeatAt: number = 0;
+  private lastStartRequestAt: number = 0;
+  private recoveryAttempts: number = 0;
+  private nextRecoveryAt: number = 0;
+  private recovering: boolean = false;
+  private intentOn: boolean = false;
+  private connectWatchdog: number = -1;
   private taskId: number = -1;
   private taskNotificationId: number = -1;
   private taskWatchRegistered: boolean = false;
@@ -142,6 +164,8 @@ struct Index {
   // once, so clearing it on hide used to leave the dashboard frozen at the
   // values captured when the app went background.
   onPageShow(): void {
+    this.consumeCardOp();
+    this.refreshIntent();
     this.refreshEntry();
     this.refreshRuleSetStatus();
     this.loadLatencyCache();
@@ -225,6 +249,22 @@ struct Index {
     }
   }
 
+  // The on-demand watcher can bring the tunnel up while the page is in the
+  // background; re-read the intent each time the page shows so a later
+  // heartbeat loss is supervised against the current state.
+  private async refreshIntent(): Promise<void> {
+    const context = this.ctx;
+    if (context === null) {
+      return;
+    }
+    try {
+      const store = await preferences.getPreferences(context, 'way');
+      this.intentOn = (store.getSync('vpnActive', false) as boolean) &&
+        !(store.getSync('userOff', false) as boolean);
+    } catch (error) {
+    }
+  }
+
   private refreshEntry(): void {
     const context = this.ctx;
     if (context === null) {
@@ -264,6 +304,13 @@ struct Index {
     const store = await preferences.getPreferences(context, PREF_NAME);
     this.notifyMe = store.getSync('notify', true) as boolean;
     this.rebindOnNetChange = store.getSync('rebind', true) as boolean;
+    // "The user wants the tunnel up" lives in the 'way' store (markActive and
+    // EntryAbility write it there), not in xray_prefs. It is separate from the
+    // switch: the switch may flip off when a heartbeat goes stale, but intent
+    // must survive so the supervisor can relaunch the extension.
+    const wayStore = await preferences.getPreferences(context, 'way');
+    this.intentOn = (wayStore.getSync('vpnActive', false) as boolean) &&
+      !(wayStore.getSync('userOff', false) as boolean);
     // Routing is controlled by the mode buttons alone: a stale false here used
     // to disable every rule silently, which sent domestic apps through the node.
     this.splitOn = true;
@@ -713,6 +760,7 @@ struct Index {
       return;
     }
     const status: TunnelStatus | null = readStatus(context);
+    const now: number = Date.now();
     if (status !== null) {
       if (status.state === 'suspended') {
         // The extension paused the core for this Wi-Fi (it stays alive, so it
@@ -729,14 +777,28 @@ struct Index {
         this.downSpeed = 0;
         return;
       }
-      const stale: boolean = status.state === 'running' && Date.now() - status.updatedAt > 6000;
-      this.state = stale ? 'unknown' : status.state;
-      this.message = stale ? '断开' : (status.state === 'stopped' ? '断开' : status.message);
+      this.lastBeatAt = Math.max(this.lastBeatAt, status.updatedAt);
+      const stale: boolean = now - status.updatedAt > HEARTBEAT_STALE_MS;
+      if (!stale) {
+        // A fresh beat means the extension is alive: reset the relaunch budget.
+        this.recoveryAttempts = 0;
+        this.nextRecoveryAt = 0;
+        // A running tunnel with no stored intent (e.g. the app died between
+        // startVpn and the markActive flush) must still be supervised.
+        if (!this.busy && !this.intentOn && status.state === 'running') {
+          this.intentOn = true;
+          appLog(context, 'ui', 'intent inferred from a running tunnel');
+        }
+      }
+      const recovering: boolean = stale && this.intentOn;
+      this.state = recovering ? 'recovering' : (stale ? 'unknown' : status.state);
+      this.message = recovering ? '心跳中断，正在恢复' :
+        (stale ? '断开' : (status.state === 'stopped' ? '断开' : status.message));
       this.up = status.up;
       this.down = status.down;
       this.flows = status.tcpFlows + status.udpFlows;
-      this.seconds = (status.state === 'running' && !stale) ? (Date.now() - status.startedAt) / 1000 : 0;
-      this.statusAge = Math.floor((Date.now() - status.updatedAt) / 1000);
+      this.seconds = (status.state === 'running' && !stale) ? (now - status.startedAt) / 1000 : 0;
+      this.statusAge = Math.floor((now - status.updatedAt) / 1000);
       this.probeMs = status.probeMs;
       this.pssKb = status.pssKb ?? 0;
       this.cpuPercent = status.cpuPercent ?? 0;
@@ -745,16 +807,15 @@ struct Index {
       }
       // An SSID suspension stops the task; a resumed tunnel needs its single
       // live-view card back (the extension cannot request it on its own).
-      if (status.state === 'running' && !this.keepAliveStarted &&
-        Date.now() - this.lastNotifRefreshAt > 3000) {
-        this.lastNotifRefreshAt = Date.now();
+      if (status.state === 'running' && !stale && !this.keepAliveStarted &&
+        now - this.lastNotifRefreshAt > 3000) {
+        this.lastNotifRefreshAt = now;
         this.reviveTask().catch(() => {
         });
       }
       // Fallback speed when the push channel is unavailable: derive it from
       // consecutive polls instead of leaving the gauges at zero.
-      if (Date.now() - this.lastEventAt > 2500) {
-        const now: number = Date.now();
+      if (!stale && now - this.lastEventAt > 2500) {
         if (this.prevStamp > 0 && now > this.prevStamp) {
           const delta: number = (now - this.prevStamp) / 1000;
           this.upSpeed = Math.max(0, (status.up - this.prevUp) / delta);
@@ -764,24 +825,32 @@ struct Index {
         this.prevDown = status.down;
         this.prevStamp = now;
       }
-      // The heartbeat is gone, so nothing is keeping the tunnel up: the switch
-      // must fall back to "off" together with the title. Reading the raw
-      // status.state here left the switch on while the title already said
-      // 未连接, and the session timer kept counting on a dead tunnel.
-      this.setSwitch(!stale && (status.state === 'running' || status.state === 'starting'));
-      // A stale running snapshot means the extension died: release the live-view
-      // task so the notification stops advertising a session that is not there.
-      if (stale && this.keepAliveStarted) {
-        this.stopKeepAliveTask();
+      // While recovering, the switch stays on (the user still wants the tunnel)
+      // and the supervisor relaunches the extension below. A hard "off" here
+      // made the old self-heal unreachable: it tested this.isOn after clearing it.
+      if (recovering) {
+        this.setSwitch(true);
+      } else {
+        this.setSwitch(!stale && (status.state === 'running' || status.state === 'starting'));
       }
+      // Keep the continuous task during recovery: the relaunched extension
+      // publishes its live view on the same notification id. It is released
+      // only when the user turns the tunnel off or the budget is exhausted.
+      this.supervise(context);
     } else {
-      // 没有状态文件：要么还在连接（busy），要么隧道已经没了（系统回收或用户
-      // 手动清后台）。前者保持“正在创建”，后者不自动重连，开关拨回未连接。
+      // 没有状态文件：要么还在连接（busy），要么扩展进程已经没了。后者按
+      // 「保活优先」拉起扩展（用已保存的 config，不重建、不先 stop）。
       if (this.busy) {
         this.state = 'starting';
         this.message = '正在创建 VPN';
         this.setSwitch(true);
         this.statusAge = -1;
+      } else if (this.intentOn) {
+        this.state = 'recovering';
+        this.message = '扩展未运行，正在拉起';
+        this.setSwitch(true);
+        this.statusAge = -1;
+        this.supervise(context);
       } else {
         this.state = 'stopped';
         this.message = '断开';
@@ -796,6 +865,88 @@ struct Index {
     }
   }
 
+
+  // 心跳监督（双进程互看的第一半）：UI 每 5 s 看一次 status.json，超过
+  // HEARTBEAT_STALE_MS 没有新心跳就认为扩展进程没了。此时用已保存的
+  // config.json 直接再次 startVpn —— 不重建配置、不先 stop，属于「拉起」
+  // 而不是「重启」。1/2/4/8 s 退避，最多 5 次；有心跳就清零预算。
+  private supervise(context: common.UIAbilityContext): void {
+    if (!this.intentOn || this.busy || this.recovering) {
+      return;
+    }
+    const now: number = Date.now();
+    const since: number = Math.max(this.lastBeatAt, this.lastStartRequestAt);
+    if (now - since < HEARTBEAT_STALE_MS || now < this.nextRecoveryAt) {
+      return;
+    }
+    if (this.recoveryAttempts >= RECOVERY_MAX_ATTEMPTS) {
+      appLog(context, 'ui', 'extension recovery budget exhausted after ' + this.recoveryAttempts);
+      this.intentOn = false;
+      this.state = 'stopped';
+      this.message = '断开（恢复失败）';
+      this.setSwitch(false);
+      this.stopKeepAliveTask();
+      return;
+    }
+    this.recoveryAttempts++;
+    const backoff: number = Math.min(15000, 1000 * Math.pow(2, this.recoveryAttempts - 1));
+    this.nextRecoveryAt = now + backoff;
+    this.state = 'recovering';
+    this.message = '心跳中断 ' + Math.floor((now - since) / 1000) + 's，正在拉起扩展';
+    this.setSwitch(true);
+    appLog(context, 'ui', 'heartbeat missing for ' + Math.floor((now - since) / 1000) +
+      's, relaunch attempt ' + this.recoveryAttempts + ', next in ' + backoff + 'ms');
+    this.reviveExtension().catch((): void => {
+    });
+  }
+
+  private async reviveExtension(): Promise<void> {
+    const context = this.ctx;
+    if (context === null || this.recovering) {
+      return;
+    }
+    this.recovering = true;
+    try {
+      const entry: ConfigEntry | null = selectedEntry(context);
+      const saved: string = loadConfig(context);
+      if (entry === null || saved.length === 0) {
+        // No usable saved config: the only correct move is a full connect,
+        // which rebuilds it. Still bounded by the same recovery budget.
+        appLog(context, 'ui', 'no saved config for relaunch, rebuilding');
+        this.recovering = false;
+        await this.connect();
+        return;
+      }
+      if (!this.keepAliveStarted) {
+        await this.startKeepAliveTask();
+      }
+      this.lastStartRequestAt = Date.now();
+      try {
+        await startVpn(vpnWant(context, this.notifyMe, this.rebindOnNetChange,
+          this.taskNotificationId, entry.name));
+        appLog(context, 'ui', 'extension relaunch requested with saved config (no rebuild)');
+      } catch (error) {
+        const err = error as BusinessError;
+        appLog(context, 'ui', 'extension relaunch failed: ' + (err.message ?? 'unknown'));
+        // A half-dead VPN entry can reject the next start; clear it so the
+        // next backoff round starts from a clean system slot.
+        try {
+          await stopVpn(vpnWant(context, this.notifyMe, this.rebindOnNetChange));
+        } catch (stopError) {
+        }
+      }
+    } finally {
+      this.recovering = false;
+    }
+  }
+
+  private delay(ms: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      setTimeout(() => {
+        resolve();
+      }, ms);
+    });
+  }
 
   private openConnections(): void {
     router.pushUrl({ url: 'pages/Connections' }).catch((error: BusinessError) => {
@@ -1006,6 +1157,58 @@ struct Index {
     }, 300);
   }
 
+
+  // 桌面卡片会用 want.parameters.op 把「连接 / 断开」交给我们；页面一显示就消费掉。
+  private consumeCardOp(): void {
+    const context = this.ctx;
+    if (context === null) {
+      return;
+    }
+    // Fast path: EntryAbility writes AppStorage synchronously in onCreate /
+    // onNewWant, so the page sees the op even before the async prefs flush.
+    const quick: string | undefined = AppStorage.get<string>('wayCardOp');
+    if (quick !== undefined && quick.length > 0) {
+      AppStorage.set<string>('wayCardOp', '');
+      this.clearPersistedCardOp(context);
+      appLog(context, 'card', 'consuming card op: ' + quick);
+      this.runCardOp(quick);
+      return;
+    }
+    preferences.getPreferences(context, 'way').then((store) => {
+      const op: string = store.getSync('cardOp', '') as string;
+      if (op.length === 0) {
+        return;
+      }
+      store.putSync('cardOp', '');
+      store.flush();
+      appLog(context, 'card', 'consuming card op: ' + op);
+      this.runCardOp(op);
+    }).catch((): void => {
+    });
+  }
+
+  // The AppStorage fast path already consumed the op; drop the persisted copy
+  // so a later onPageShow cannot execute the same card tap a second time.
+  private clearPersistedCardOp(context: common.UIAbilityContext): void {
+    preferences.getPreferences(context, 'way').then((store) => {
+      if ((store.getSync('cardOp', '') as string).length > 0) {
+        store.putSync('cardOp', '');
+        store.flush();
+      }
+    }).catch((): void => {
+    });
+  }
+
+  private runCardOp(op: string): void {
+    if (op === 'connect') {
+      this.connect().catch((): void => {
+      });
+    } else if (op === 'disconnect') {
+      this.disconnect().catch((): void => {
+      });
+    }
+  }
+
   private async connect(): Promise<void> {
     const context = this.ctx;
     if (context === null || this.busy) {
@@ -1036,11 +1239,23 @@ struct Index {
     }
     this.busy = true;
     this.usedFallback = false;
-    // Never leave the switch busy forever if a platform call stalls.
-    setTimeout(() => {
+    // A deliberate connect resets the recovery budget and registers intent.
+    this.intentOn = true;
+    this.recoveryAttempts = 0;
+    this.nextRecoveryAt = 0;
+    if (this.connectWatchdog !== -1) {
+      clearTimeout(this.connectWatchdog);
+    }
+    // Never leave the switch busy forever if a platform call stalls. The
+    // watchdog is longer than the whole retry window below.
+    this.connectWatchdog = setTimeout(() => {
       this.busy = false;
-    }, 8000);
+      this.connectWatchdog = -1;
+    }, CONNECT_WATCHDOG_MS);
     this.message = '正在准备配置';
+    let notifId: number = -1;
+    let started: boolean = false;
+    let lastError: string = '';
     try {
       // Every saved node goes into the tunnel config as a tagged outbound so the
       // node list can measure each node through the core (real delay) without
@@ -1054,16 +1269,58 @@ struct Index {
       this.state = 'starting';
       this.message = '正在创建 VPN';
       this.setSwitch(true);
-      // Fire-and-forget: awaiting the notification-permission dialog or the
-      // TempAbility launch left the toggle stuck on "正在创建 VPN" whenever the
-      // dialog was slow or suppressed.
-      const notifId: number = await this.startKeepAliveTask();
-      await startVpn(vpnWant(context, this.notifyMe, this.rebindOnNetChange, notifId, entry.name));
+      // 1) Notification/task first. The extension draws its live view on the
+      // notification id returned by startBackgroundRunning; starting the VPN
+      // before that id exists (or before the permission dialog settles) is what
+      // made the first taps fail. Wait for readiness, then register the task.
       if (this.notifyMe) {
-        this.ensureNotifyPermission();
+        await this.ensureNotifyReady(2500);
+      }
+      notifId = await this.startKeepAliveTask();
+      for (let attempt: number = 0; notifId < 0 && attempt < 2; attempt++) {
+        appLog(context, 'ui', 'continuous task not ready, retrying ' + (attempt + 1));
+        await this.delay(400 * (attempt + 1));
+        this.keepAliveStarted = false;
+        notifId = await this.startKeepAliveTask();
+      }
+      if (notifId >= 0) {
+        // Give the system a beat to publish the task notification before the
+        // extension publishes the first live view on that id.
+        await this.delay(300);
+      }
+      // 2) Start the VPN, then verify status.json. This is the "connects only
+      // on the third tap" fix: each attempt waits for a fresh heartbeat, and a
+      // failed attempt clears the half-created VPN before the next one.
+      for (let attempt: number = 0; attempt < CONNECT_ATTEMPTS && !started; attempt++) {
+        this.lastStartRequestAt = Date.now();
+        try {
+          await startVpn(vpnWant(context, this.notifyMe, this.rebindOnNetChange, notifId, entry.name));
+          appLog(context, 'ui', 'vpn start requested (attempt ' + (attempt + 1) + ')');
+        } catch (error) {
+          const err = error as BusinessError;
+          lastError = err.message ?? JSON.stringify(error);
+          appLog(context, 'ui', 'vpn start attempt ' + (attempt + 1) + ' failed: ' + lastError);
+        }
+        started = await this.waitTunnelReady(context, 3200);
+        if (!started && attempt < CONNECT_ATTEMPTS - 1) {
+          const backoff: number = 500 * Math.pow(2, attempt);
+          appLog(context, 'ui', 'tunnel not ready, retry in ' + backoff + 'ms');
+          await this.delay(backoff);
+          try {
+            await stopVpn(vpnWant(context, this.notifyMe, this.rebindOnNetChange));
+          } catch (stopError) {
+          }
+          clearStatus(context);
+        }
+      }
+      if (!started) {
+        throw new Error(lastError.length > 0 ? lastError : '扩展未在限定时间内就绪');
       }
       this.markActive(true);
-      appLog(context, 'ui', 'vpn start requested');
+      this.intentOn = true;
+      this.recoveryAttempts = 0;
+      this.nextRecoveryAt = 0;
+      this.lastBeatAt = Date.now();
       if (tunnel.multi) {
         this.watchMultiNodeStart(tunnel.single, entry.name, notifId, 0);
       }
@@ -1072,10 +1329,79 @@ struct Index {
       this.state = 'error';
       this.message = '启动失败: ' + (err.message ?? JSON.stringify(error));
       this.setSwitch(false);
+      // The switch is off, so the supervisor must not fight the user's view.
+      this.intentOn = false;
       appLog(context, 'ui', 'vpn start failed: ' + (err.message ?? JSON.stringify(error)));
+      // Leave no half-created VPN or dangling task notification behind: the
+      // next tap must start from the same clean slot as a cold launch.
+      try {
+        await stopVpn(vpnWant(context, this.notifyMe, this.rebindOnNetChange));
+      } catch (stopError) {
+      }
+      this.stopKeepAliveTask();
+      clearStatus(context);
       promptAction.showToast({ message: this.message });
     } finally {
+      if (this.connectWatchdog !== -1) {
+        clearTimeout(this.connectWatchdog);
+        this.connectWatchdog = -1;
+      }
       this.busy = false;
+    }
+  }
+
+  // Wait until the extension has written a fresh status.json. A tunnel that is
+  // still booting (fresh "starting" heartbeat) is accepted rather than stopped:
+  // killing a healthy boot is exactly the failure this retry loop must avoid.
+  private async waitTunnelReady(context: common.UIAbilityContext,
+    timeoutMs: number): Promise<boolean> {
+    const deadline: number = Date.now() + timeoutMs;
+    let sawStarting: boolean = false;
+    while (Date.now() < deadline) {
+      const status: TunnelStatus | null = readStatus(context);
+      if (status !== null) {
+        const fresh: boolean = Date.now() - status.updatedAt < 4000;
+        if (status.state === 'running' && fresh) {
+          return true;
+        }
+        if (status.state === 'error') {
+          return false;
+        }
+        if (status.state === 'starting' && fresh) {
+          sawStarting = true;
+        }
+      }
+      await this.delay(250);
+    }
+    return sawStarting;
+  }
+
+  // Ask for notification permission and wait a bounded time for it. The old
+  // fire-and-forget call left the first connect racing the permission dialog;
+  // the user needed several taps before the task notification existed.
+  private async ensureNotifyReady(timeoutMs: number): Promise<void> {
+    const context = this.ctx;
+    if (context === null) {
+      return;
+    }
+    try {
+      if (await notificationManager.isNotificationEnabled()) {
+        return;
+      }
+      notificationManager.requestEnableNotification(context).catch((error: BusinessError) => {
+        appLog(context, 'ui', 'notification permission: ' + (error.message ?? 'denied'));
+      });
+      const deadline: number = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        await this.delay(250);
+        if (await notificationManager.isNotificationEnabled()) {
+          return;
+        }
+      }
+      appLog(context, 'ui', 'notification permission still off, starting anyway');
+    } catch (error) {
+      const err = error as BusinessError;
+      appLog(context, 'ui', 'notification readiness failed: ' + (err.message ?? 'unknown'));
     }
   }
 
@@ -1120,9 +1446,15 @@ struct Index {
     // which is the "two cards / stuck UI" bug). Request the task FIRST, then
     // start the VPN with the returned notification id.
     const context = this.ctx;
-    if (context === null || this.keepAliveStarted) {
+    if (context === null) {
+      return -1;
+    }
+    if (this.keepAliveStarted && this.taskNotificationId >= 0) {
       return this.taskNotificationId;
     }
+    // A previous request may have set the flag without a usable id; force a
+    // fresh request instead of returning -1 forever.
+    this.keepAliveStarted = false;
     try {
       const info: wantAgent.WantAgentInfo = {
         wants: [
@@ -1209,6 +1541,9 @@ struct Index {
 
 
   private async markActive(active: boolean): Promise<void> {
+    // Keep the in-memory intent in sync before the (possibly slow) flush: the
+    // heartbeat supervisor reads it every poll.
+    this.intentOn = active;
     const context = this.ctx;
     if (context === null) {
       return;
@@ -1221,24 +1556,6 @@ struct Index {
       store.putSync('userOff', !active);
       await store.flush();
     } catch (error) {
-    }
-  }
-
-  private async ensureNotifyPermission(): Promise<void> {
-    const context = this.ctx;
-    if (context === null) {
-      return;
-    }
-    try {
-      const enabled: boolean = await notificationManager.isNotificationEnabled();
-      appLog(context, 'ui', 'notification enabled=' + enabled);
-      if (enabled) {
-        return;
-      }
-      await notificationManager.requestEnableNotification(context);
-    } catch (error) {
-      const err = error as BusinessError;
-      appLog(context, 'ui', 'notification permission: ' + (err.message ?? 'denied'));
     }
   }
 
@@ -1525,7 +1842,7 @@ struct Index {
     if (this.state === 'running') {
       return '#3DDC97';
     }
-    if (this.state === 'starting' || this.state === 'suspended') {
+    if (this.state === 'starting' || this.state === 'suspended' || this.state === 'recovering') {
       return '#FFC857';
     }
     return '#FF5C7A';
@@ -1553,7 +1870,8 @@ struct Index {
 
   // Card headline: same words as the pill, but real error text still wins.
   private stateTitle(): string {
-    if (this.state === 'running' || this.state === 'suspended' || this.state === 'starting') {
+    if (this.state === 'running' || this.state === 'suspended' ||
+      this.state === 'starting' || this.state === 'recovering') {
       return this.statusLabel();
     }
     if (this.message.length === 0 || this.message === '断开') {
@@ -1586,6 +1904,9 @@ struct Index {
     }
     if (this.state === 'starting') {
       return '连接中';
+    }
+    if (this.state === 'recovering') {
+      return '恢复中';
     }
     return '未连接';
   }
@@ -1732,11 +2053,11 @@ struct Index {
           .fill(this.statusColor())
         Text(this.stateTitle())
           .fontSize(15)
-          .fontColor(this.state === 'suspended' ? '#FFC857' : '#C7D6EC')
+          .fontColor((this.state === 'suspended' || this.state === 'recovering') ? '#FFC857' : '#C7D6EC')
           .margin({ left: 10 })
           .layoutWeight(1)
         Toggle({ type: ToggleType.Switch, isOn: this.isOn })
-          .selectedColor(this.state === 'suspended' ? '#F2B33D' : '#54C4FF')
+          .selectedColor((this.state === 'suspended' || this.state === 'recovering') ? '#F2B33D' : '#54C4FF')
           .onChange((value: boolean) => {
             if (this.switchProgrammatic) {
               this.switchProgrammatic = false;

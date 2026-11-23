@@ -346,7 +346,7 @@ GFW / 绕过大陆 / 全局、使用规则集、拦截广告、更换规则集�
 | 内核崩溃自动重启 | 1 s 看门狗：`native.isRunning()` 为假即重建 core（复用同一 tun fd），连续 3 次失败才放弃并写错误状态 |
 | 网络切换重连 | `NetConnection` 的 `netAvailable` / `netLost` → `native.rebind()`（Hysteria2/QUIC 载体 + WireGuard 重新发 socket，保留会话） |
 | 状态持久化 / 自动连接 | 记住上次连接状态与配置，打开应用自动恢复连接 |
-| 界面状态实时性 | 扩展每秒写 `status.json` 心跳；UI 侧 6 s 无心跳判定“连接已中断” |
+| 界面状态实时性 | 扩展每秒写 `status.json` 心跳；UI 每 5 s 检查，无心跳就用已保存配置拉起扩展（1/2/4/8 s 退避，最多 5 次），不是只翻开关 |
 
 ### 8.1 0.10.4 的保活与挂起
 
@@ -355,6 +355,15 @@ GFW / 绕过大陆 / 全局、使用规则集、拦截广告、更换规则集�
 - **SSID 挂起**：命中挂起规则的 Wi-Fi 时**全停**（`stopVpn` + `stopBackgroundRunning`，不留心跳/看门狗/通知）；在挂起 Wi-Fi 上点开关只显示“已挂起”（开关为开、琥珀色），不发起连接；挂起状态下点关闭则真正关闭，不会被规则再挂起。
 - **恢复**：离开挂起 Wi-Fi 时按“刚启动”走一遍——重建配置 → 申请连续任务 → 启动 VPN，使任务/通知/心跳与冷启动一致；并用 `wifiConnectionChange` 事件驱动，App 在后台（定时器被冻结）时也能恢复。
 - **关闭**：滑掉后台即完整退出——停监听、释放任务、停 VPN、清挂起标记，并记 `userOff` 不再自动重连。
+
+### 8.2 0.10.4 的心跳看门狗与连接加固
+
+- **双进程心跳**：扩展每个 tick 重写 `status.json`（`updatedAt` 就是心跳）。UI 每秒读一次，5 s 没有新心跳即判定扩展进程丢失；随后用**已保存的 config** 再次 `startVpn`——不 `buildAndSaveTunnel`、不先 `stopVpn`，属于“拉起”而不是“重启”。连续失败按 1/2/4/8 s 退避，5 次仍失败才翻开关并释放连续任务；一旦收到心跳立即清零预算。这样不会再出现“开关先被关掉，用户再点一次”的重启路径。
+- **探针 15 s**：`probeLiveness()` 从每 30 个 tick 改为每 15 个 tick，成功/失败都写 `ability.log`（`probe ok …ms` / `probe failed kind=…`），日志增长本身就是扩展的活动信号，空载时也能看出它没死。
+- **live view 时间戳**：通知文本追加会话时长和 `HH:mm:ss`。空载时 `↓0 B/s ↑0 B/s` 不再是一段永远相同的内容，系统不会把“内容未变”的 publish 当成 no-op。
+- **连接重试**：`connect()` 先等通知权限（有界 2.5 s）并申请连续任务（最多 3 次），再把 notification id 交给扩展；随后最多 3 次 `startVpn`，每次用 `status.json` 验证（`running`，或仍在启动且有新鲜心跳的 `starting` 都算成功），失败则 `stopVpn` + 清状态后 0.5/1 s 退避重试。这修掉了“点三次才连上”。
+- **桌面卡片**：`EntryFormAbility` 不再 import `AppLog`/`Xray`，避免卡片进程为了写一行日志加载 26 MB 的 `libentry.so`；`form_config.json` 的 `displayName`/`description` 改用普通字符串，避免 `$string:` 在 profile 里被转成数字 id 后解析失败。卡片仍不出现时先看应用沙箱 `files/xray/app.log` 里的 `[card]` 行：有 `form added` 说明 form 进程和配置都正常，问题在渲染；一行都没有则是系统没有绑定 form（签名/安装问题）。
+- **启动器图标**：`AppScope/resources/base/media/layered_image.json` 指向 1024×1024 的 `icon_background`/`icon_foreground`；`app.json5` 和 `module.json5` 里所有 Ability 的 `icon` 都改成 `$media:layered_image`（module 的 icon 会覆盖 app 的，必须两处一起改）。`startWindowIcon` 仍用 512 的 `app_icon`。
 
 ## 9. 已知限制（务必读）
 

@@ -25,6 +25,39 @@ export default class EntryAbility extends UIAbility {
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(DOMAIN, TAG, 'onCreate');
     this.startWifiWatch();
+    this.stashCardOp(want).catch((): void => {
+    });
+  }
+
+  onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    this.stashCardOp(want).catch((): void => {
+    });
+  }
+
+  // 桌面卡片通过 want.parameters.op 传「connect / disconnect」，页面加载后消费。
+  // AppStorage 是同步的，先写它，避免页面 onPageShow 早于下面的异步落盘。
+  private stashCardOp(want: Want): Promise<void> {
+    const params: Record<string, Object> = want.parameters ?? {};
+    const raw: Object | undefined = params['op'];
+    if (typeof raw !== 'string' || (raw as string).length === 0) {
+      return Promise.resolve();
+    }
+    const op: string = raw as string;
+    try {
+      AppStorage.setOrCreate<string>('wayCardOp', op);
+    } catch (error) {
+    }
+    return this.persistCardOp(op);
+  }
+
+  private async persistCardOp(op: string): Promise<void> {
+    try {
+      const store = await preferences.getPreferences(this.context, 'way');
+      store.putSync('cardOp', op);
+      await store.flush();
+      appLog(this.context, 'card', 'card op queued: ' + op);
+    } catch (error) {
+    }
   }
 
   onDestroy(): void {
