@@ -1007,7 +1007,7 @@ struct Index {
       const recovering: boolean = stale && this.intentOn;
       const switching: boolean = stale && this.intentOn &&
         now - this.networkSwitchAt < NETWORK_GRACE_MS;
-      this.state = recovering ? 'recovering' : (stale ? 'unknown' : status.state);
+      this.state = recovering ? 'starting' : (stale ? 'unknown' : status.state);
       this.message = switching ? '网络切换，正在重绑' :
         (recovering ? '心跳中断，正在恢复' :
           (stale ? '断开' : (status.state === 'stopped' ? '断开' : status.message)));
@@ -1063,7 +1063,7 @@ struct Index {
         this.setSwitch(true);
         this.statusAge = -1;
       } else if (this.intentOn) {
-        this.state = 'recovering';
+        this.state = 'starting';
         this.message = '扩展未运行，正在拉起';
         this.setSwitch(true);
         this.statusAge = -1;
@@ -1116,7 +1116,7 @@ struct Index {
     this.recoveryAttempts++;
     const backoff: number = Math.min(15000, 1000 * Math.pow(2, this.recoveryAttempts - 1));
     this.nextRecoveryAt = now + backoff;
-    this.state = 'recovering';
+    this.state = 'starting';
     this.message = '心跳中断 ' + Math.floor((now - since) / 1000) + 's，正在拉起扩展';
     this.setSwitch(true);
     appLog(context, 'ui', 'heartbeat missing for ' + Math.floor((now - since) / 1000) +
@@ -2104,7 +2104,7 @@ struct Index {
     if (this.state === 'running') {
       return '#3DDC97';
     }
-    if (this.state === 'starting' || this.state === 'suspended' || this.state === 'recovering') {
+    if (this.state === 'starting' || this.state === 'suspended') {
       return '#FFC857';
     }
     return '#FF5C7A';
@@ -2133,7 +2133,7 @@ struct Index {
   // Card headline: same words as the pill, but real error text still wins.
   private stateTitle(): string {
     if (this.state === 'running' || this.state === 'suspended' ||
-      this.state === 'starting' || this.state === 'recovering') {
+      this.state === 'starting') {
       return this.statusLabel();
     }
     if (this.message.length === 0 || this.message === '断开') {
@@ -2166,9 +2166,6 @@ struct Index {
     }
     if (this.state === 'starting') {
       return '连接中';
-    }
-    if (this.state === 'recovering') {
-      return '恢复中';
     }
     return '未连接';
   }
@@ -2212,7 +2209,6 @@ struct Index {
             this.nodeCard()
             this.rulesCard()
             this.ssidCard()
-            this.keepAliveCard()
             this.logCard()
             Column({ space: 2 }) {
               Text('HarmonyOS 代理客户端')
@@ -2316,11 +2312,11 @@ struct Index {
           .fill(this.statusColor())
         Text(this.stateTitle())
           .fontSize(15)
-          .fontColor((this.state === 'suspended' || this.state === 'recovering') ? '#FFC857' : '#C7D6EC')
+          .fontColor(this.state === 'suspended' ? '#FFC857' : '#C7D6EC')
           .margin({ left: 10 })
           .layoutWeight(1)
         Toggle({ type: ToggleType.Switch, isOn: this.isOn })
-          .selectedColor((this.state === 'suspended' || this.state === 'recovering') ? '#F2B33D' : '#54C4FF')
+          .selectedColor(this.state === 'suspended' ? '#F2B33D' : '#54C4FF')
           .onChange((value: boolean) => {
             if (this.switchProgrammatic) {
               this.switchProgrammatic = false;
