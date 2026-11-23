@@ -1735,11 +1735,11 @@ struct Index {
     }
     if (value) {
       appLog(context, 'lifecycle', 'background-vpn ON: VPN kept after task removal');
-      // FlClash-style entry: open the system card preview directly. No start
-      // button and no "去添加/稍后" dialog; the card shows the way logo, and
-      // leaving the preview is enough.
-      promptAction.showToast({ message: '直接取消不影响开启功能', duration: 4000 });
-      this.openKeepAliveForm();
+      // The switch itself enables background VPN. Adding the widget card is
+      // optional; do not depend on the preview page or any dialog.
+      promptAction.showToast({ message: '后台运行 VPN 已开启（无需添加卡片）', duration: 4000 });
+      this.startTempAbility().catch((): void => {
+      });
     } else {
       appLog(context, 'lifecycle', 'remove-from-recents OFF: stopping TempAbility');
       this.stopTempAbility();
@@ -1749,6 +1749,28 @@ struct Index {
       this.reviveTask().catch((): void => {
       });
       promptAction.showToast({ message: '已关闭：后台运行 VPN 将停止' });
+    }
+  }
+
+  // Start the hidden keepalive owner directly. The "后台运行 VPN" switch must
+  // work without adding the widget/card; the card preview is only an optional
+  // second trigger.
+  private async startTempAbility(): Promise<void> {
+    const context = this.ctx;
+    if (context === null) {
+      return;
+    }
+    try {
+      const want: Want = {
+        bundleName: 'com.way.app',
+        abilityName: 'TempAbility'
+      };
+      await context.startAbility(want);
+      appLog(context, 'keepalive', 'temp ability started (no card needed)');
+    } catch (error) {
+      const err = error as BusinessError;
+      appLog(context, 'keepalive', 'temp ability start failed: ' + (err.message ?? 'unknown'));
+      promptAction.showToast({ message: '后台保活启动失败，请看日志' });
     }
   }
 
@@ -2808,7 +2830,7 @@ struct Index {
           Text('后台运行 VPN')
             .fontSize(13)
             .fontColor('#D6E4F7')
-          Text('直接取消不影响开启功能')
+          Text('无需添加卡片，开启后立即生效')
             .fontSize(11)
             .fontColor('#5C7192')
             .margin({ top: 2 })
