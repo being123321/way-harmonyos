@@ -179,6 +179,10 @@ struct Index {
     this.ctx = getContext(this) as common.UIAbilityContext;
     pageInsets(this.ctx).then((value: Insets) => {
       this.insets = value;
+      // The floating header's reserved height is the status-bar inset plus the
+      // capsule row. Measuring it with onAreaChange counted the expanded safe
+      // area twice and left a large empty band above the first card.
+      this.headerHeight = value.top + 64;
     });
     this.restore().catch((error: BusinessError) => {
       promptAction.showToast({ message: '读取设置失败' });
@@ -2241,15 +2245,14 @@ struct Index {
       .height('100%')
       .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
 
-      // Very soft wash behind the title bar: no bar edge and no solid colour, it
-      // only keeps the status-bar icons and the capsules readable when cards
-      // scroll underneath. Touches pass through to the list.
+      // Frosted title bar: almost opaque at the top so cards scrolling under it
+      // are not readable through the header, fading out only at its bottom edge.
       Column()
         .width('100%')
         .height(this.headerHeight + 10)
         .linearGradient({
           angle: 180,
-          colors: [['#A60B1020', 0.0], ['#660B1020', 0.62], ['#000B1020', 1.0]]
+          colors: [['#F20B1020', 0.0], ['#E60B1020', 0.72], ['#000B1020', 1.0]]
         })
         .hitTestBehavior(HitTestMode.Transparent)
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP])
@@ -2297,12 +2300,6 @@ struct Index {
     }
     .width('100%')
     .padding({ left: 18, right: 18, top: this.insets.top + 10, bottom: 10 })
-    .onAreaChange((oldArea: Area, newArea: Area) => {
-      const measured: number = Number(newArea.height);
-      if (measured > 0 && measured !== this.headerHeight) {
-        this.headerHeight = measured;
-      }
-    })
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP])
   }
 
