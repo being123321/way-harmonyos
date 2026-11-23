@@ -373,7 +373,9 @@ GFW / 绕过大陆 / 全局、使用规则集、拦截广告、更换规则集�
 - `EntryAbility.onDestroy` 在 `pipKeepAliveActive()` 为真时不再执行 `stopForManualKill`，避免划掉主任务时把 VPN 停掉；用户主动关开关仍走 `disconnect()` 完整停止。
 - **打开应用自动连接**：`lastConnected` 记住最后一次显式连接状态。手动划掉后台时 `stopForManualKill` 完整停止 VPN（`userOff=true`，后台不会再被拉起），但保留 `lastConnected=true`；下次启动 `maybeAutoConnect()` 会自动 `connect()`。显式关开关（`disconnect`）会清 `lastConnected`，下次不自动连。可在「保活」卡单独关闭此行为。
 - **卡片预览触发（FlClash 同款）**：`WidgetCard` 的 `onAppear` 用 `postCardAction({action:'call', abilityName:'TempAbility'})` 拉起 `TempAbility`；`TempAbility` 读 `vpnActive/lastConnected`，用已保存的 `config.json` 启动 VPN 并持有连续任务，同时写 `tempKeepAlive=true`。系统卡片预览页也会触发 `onAppear`，所以「保活」卡里的「保活入口」只要用 `formProvider.openFormManager` 打开预览、进入后直接退出即可，不需要把卡片加到桌面。主 App 的 `onDestroy` 看到 `tempKeepAlive` 为真时不再 `stopForManualKill`；显式关开关会清掉它并广播 `STOP_KEEPALIVE`。
-- **单通知**：TempAbility 启动前广播 `com.way.app.KEEPALIVE_TAKEOVER`，UI 收到后先 `stopBackgroundRunning` 释放自己的连续任务，TempAbility 再申请任务；扩展的 live view 发布在同一个 notification id 上，系统任务卡和实时流量卡不再并存（系统任务通知本身不能删，删除会停止任务）。
+- **单通知**：TempAbility **先**申请自己的连续任务并拿到 notification id，再把该 id 通过 `com.way.app.TASK_ID` 推给扩展；任务就绪后才广播 `KEEPALIVE_TAKEOVER`，UI 收到再释放自己的任务。顺序反过来会在卡片预览失败时留下“没有任何任务”的 VPN，系统随后就会回收。合并后系统任务卡被 live view 替换，只剩一张流量卡（系统任务通知本身不能删，删掉会停止任务；`isOngoing/isUnremovable` 在 API 26 仍标注 Not supported，不能设成不可删）。
+- **TempAbility 也看心跳**：armed 后每 5 s 读 `status.json`（12 s 阈值，给 `native.rebind` 留时间）；心跳丢失/stopped/error 时用同一份 config 重启 VPN。UI 被划掉、页面定时器冻结时，这是最后一道。
+- **最近任务里的空白 way 卡**就是 TempAbility：manifest 加了 `excludeFromMissions` / `unclearableMission`（系统字段，普通应用可能被忽略）。如果它仍出现在最近任务里，**不要划掉它**，划掉等于结束保活；显式关 VPN 开关会广播 `STOP_KEEPALIVE` 正常退出。
 - **平台边界**：PiP 由系统窗口管理，普通应用不能保证 100% 常驻；设备不支持时 `isPiPEnabled()` 为假，只写 `[pip] PiP is not enabled` 并回退到连续任务 + 5 s 看门狗。
 
 ## 9. 已知限制（务必读）

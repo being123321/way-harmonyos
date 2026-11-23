@@ -231,21 +231,10 @@ struct Index {
         'ohos.extra.param.key.form_dimension': formInfo.FormDimension.Dimension_2_2
       }
     };
-    // Release the UI's task BEFORE the picker previews the card. Otherwise the
-    // UI task (generic system card) and the TempAbility task (live view) both
-    // stay alive and the shade shows two notifications. The takeover event is
-    // still the fallback for the long-press picker path.
-    const context = this.ctx;
-    if (context !== null) {
-      this.keepAliveOwnedByTemp = true;
-      if (this.keepAliveStarted) {
-        this.keepAliveStarted = false;
-        this.taskNotificationId = -1;
-        backgroundTaskManager.stopBackgroundRunning(context).catch((): void => {
-        });
-        appLog(context, 'keepalive', 'released UI task before opening widget manager');
-      }
-    }
+    // Do NOT release the UI task here. TempAbility acquires its own task first
+    // and then broadcasts KEEPALIVE_TAKEOVER; the UI stops its task only after
+    // that. Stopping first left the VPN without any task if the picker preview
+    // failed to call TempAbility, and the system then reclaimed the VPN.
     try {
       formProvider.openFormManager(want);
     } catch (error) {

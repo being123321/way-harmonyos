@@ -5,7 +5,7 @@ import { commonEventManager } from '@kit.BasicServicesKit';
 import type { BusinessError } from '@kit.BasicServicesKit';
 import { preferences } from '@kit.ArkData';
 import { appLog } from '../common/AppLog';
-import { loadConfig, startVpn, vpnWant } from '../common/Xray';
+import { loadConfig, readStatus, startVpn, vpnWant } from '../common/Xray';
 import { selectedEntry } from '../common/Store';
 
 // FlClash-ohos style keepalive ability.
@@ -18,6 +18,7 @@ import { selectedEntry } from '../common/Store';
 // need to be added to the home screen.
 export default class TempAbility extends UIAbility {
   private running: boolean = false;
+  private supervisorTimer: number = -1;
   private arming: boolean = false;
   private subscriber: commonEventManager.CommonEventSubscriber | null = null;
   private taskId: number = -1;
@@ -31,6 +32,7 @@ export default class TempAbility extends UIAbility {
   }
 
   onDestroy(): void {
+    this.stopSupervisor();
     this.release();
     this.clearKeepAliveFlag();
     const sub = this.subscriber;
@@ -71,25 +73,22 @@ export default class TempAbility extends UIAbility {
       }
       way.putSync('vpnActive', true);
       way.putSync('userOff', false);
-      // EntryAbility.onDestroy checks this: a manual swipe of the main window
-      // must not stop a VPN that this keepalive ability owns.
-      way.putSync('tempKeepAlive', true);
       await way.flush();
-      // Ask the UI to release its continuous task first. Two tasks would show
-      // two notifications (system task card + live view).
-      try {
-        const data: commonEventManager.CommonEventPublishData = { parameters: {} };
-        commonEventManager.publish('com.way.app.KEEPALIVE_TAKEOVER', data, () => {
-        });
-      } catch (error) {
-      }
-      await this.delay(600);
+      // Acquire OUR task first. Only after it is up do we ask the UI to stop
+      // its own task; stopping first left the VPN task-less when the picker
+      // preview failed to call this ability, and the system reclaimed it.
       const notifId: number = await this.acquire();
+      if (!this.running) {
+        appLog(this.context, 'keepalive', 'widget trigger: no continuous task, leaving UI task in place');
+        this.context.terminateSelf().catch((): void => {
+        });
+        return;
+      }
       if (notifId >= 0) {
         // If the VPN extension was already running under the UI's old task id,
         // startVpn is a duplicate start and does not re-bind handlers. Push the
         // new notification id so the live view replaces this task card instead
-        // of publishing to the stopped id (which left only the generic card).
+        // of publishing to the old id.
         try {
           const data: commonEventManager.CommonEventPublishData = {
             parameters: { 'taskNotificationId': notifId }
@@ -101,8 +100,26 @@ export default class TempAbility extends UIAbility {
       }
       const entry = selectedEntry(this.context);
       const name: string = entry === null ? '' : entry.name;
-      await startVpn(vpnWant(this.context, true, true, notifId, name));
-      appLog(this.context, 'keepalive', 'widget trigger: VPN started, notification=' + notifId);
+      try {
+        await startVpn(vpnWant(this.context, true, true, notifId, name));
+        appLog(this.context, 'keepalive', 'widget trigger: VPN started, notification=' + notifId);
+      } catch (error) {
+        // The extension is usually already running (duplicate start); the task
+        // and the TASK_ID handoff above are what matter. The supervisor below
+        // retries if the heartbeat is actually gone.
+        const err = error as BusinessError;
+        appLog(this.context, 'keepalive', 'widget trigger startVpn: ' + (err.message ?? 'unknown'));
+      }
+      // From here the TempAbility owns the keepalive.
+      way.putSync('tempKeepAlive', true);
+      await way.flush();
+      try {
+        const data: commonEventManager.CommonEventPublishData = { parameters: {} };
+        commonEventManager.publish('com.way.app.KEEPALIVE_TAKEOVER', data, () => {
+        });
+      } catch (error) {
+      }
+      this.startSupervisor();
     } catch (error) {
       const err = error as BusinessError;
       appLog(this.context, 'keepalive', 'widget trigger failed: ' + (err.message ?? 'unknown'));
@@ -133,6 +150,7 @@ export default class TempAbility extends UIAbility {
         events: ['com.way.app.STOP_KEEPALIVE']
       });
       commonEventManager.subscribe(sub, () => {
+        this.stopSupervisor();
         this.release();
         this.clearKeepAliveFlag();
         this.context.terminateSelf();
@@ -158,20 +176,25 @@ export default class TempAbility extends UIAbility {
             }, 1000);
           }
         });
+      // Prefer the DATA_TRANSFER + live-view form: it returns a notification id
+      // the extension can publish on, and it survives backgrounding on phones.
+      await this.acquireDataTransfer(agent);
+      if (this.running) {
+        return this.taskNotificationId;
+      }
       try {
         await backgroundTaskManager.startBackgroundRunning(this.context,
           backgroundTaskManager.BackgroundMode.TASK_KEEPING, agent);
-        appLog(this.context, 'keepalive', 'continuous task: taskKeeping');
+        appLog(this.context, 'keepalive', 'continuous task: taskKeeping (no notification id)');
         this.running = true;
         this.taskNotificationId = -1;
         return -1;
       } catch (keepError) {
         const keepErr = keepError as BusinessError;
         appLog(this.context, 'keepalive',
-          'taskKeeping refused: ' + (keepErr.message ?? '?') + ', trying dataTransfer request');
+          'taskKeeping refused: ' + (keepErr.message ?? '?'));
       }
-      await this.acquireDataTransfer(agent);
-      return this.taskNotificationId;
+      return -1;
     } catch (error) {
       const err = error as BusinessError;
       appLog(this.context, 'keepalive', 'continuous task failed: ' + (err.message ?? 'unknown'));
@@ -225,6 +248,68 @@ export default class TempAbility extends UIAbility {
       requestCode: 0
     };
     return wantAgent.getWantAgent(info);
+  }
+
+  // The widget-preview keepalive also supervises the heartbeat: when the UI is
+  // swiped away its page timer may freeze, so this ability is the last owner
+  // that can restart a reclaimed VPN extension.
+  private startSupervisor(): void {
+    if (this.supervisorTimer !== -1) {
+      return;
+    }
+    this.supervisorTimer = setInterval(() => {
+      this.supervise().catch((): void => {
+      });
+    }, 5000);
+  }
+
+  private stopSupervisor(): void {
+    if (this.supervisorTimer !== -1) {
+      clearInterval(this.supervisorTimer);
+      this.supervisorTimer = -1;
+    }
+  }
+
+  private async supervise(): Promise<void> {
+    if (this.arming) {
+      return;
+    }
+    try {
+      const way = preferences.getPreferencesSync(this.context, { name: 'way' });
+      if (!(way.getSync('tempKeepAlive', false) as boolean)) {
+        return;
+      }
+      if (way.getSync('userOff', false) as boolean) {
+        return;
+      }
+      if (way.getSync('ssidSuspended', false) as boolean) {
+        return;
+      }
+      const status = readStatus(this.context);
+      const now: number = Date.now();
+      // 12 s, not the UI's 5 s: a network switch can block native.rebind() and
+      // stall the heartbeat for several seconds without the extension dying.
+      const stale: boolean = status === null ||
+        ((status.state === 'running' || status.state === 'starting') &&
+          now - status.updatedAt > 12000) ||
+        status.state === 'stopped' || status.state === 'error';
+      if (!stale) {
+        return;
+      }
+      const last: number = way.getSync('watchdogLastStart', 0) as number;
+      if (now - last < 10000) {
+        return;
+      }
+      way.putSync('watchdogLastStart', now);
+      await way.flush();
+      const entry = selectedEntry(this.context);
+      const name: string = entry === null ? '' : entry.name;
+      await startVpn(vpnWant(this.context, true, true, this.taskNotificationId, name));
+      appLog(this.context, 'keepalive', 'supervisor restarted vpn');
+    } catch (error) {
+      const err = error as BusinessError;
+      appLog(this.context, 'keepalive', 'supervisor failed: ' + (err.message ?? 'unknown'));
+    }
   }
 
   private release(): void {
