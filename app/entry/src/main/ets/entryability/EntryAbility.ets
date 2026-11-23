@@ -13,6 +13,7 @@ import { geodataReady } from '../common/Geodata';
 import { preferences } from '@kit.ArkData';
 import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { wifiManager } from '@kit.ConnectivityKit';
+import { PipManager } from '../common/PipManager';
 
 const DOMAIN: number = 0x0000;
 const TAG: string = 'way';
@@ -69,9 +70,30 @@ export default class EntryAbility extends UIAbility {
       }
       this.wifiHandler = null;
     }
-    // 用户手动清后台：把隧道停掉并清「已连接」标记，之后不自动重连。
-    this.stopForManualKill().catch((): void => {
-    });
+    // With the simulated-PiP keepalive the main task may be swiped away while
+    // the PiP window (and this ability) stays alive. That is not an explicit
+    // exit: keep the VPN intent so the tunnel/task survive.
+    if (this.pipKeepAliveActive()) {
+      appLog(this.context, 'lifecycle', 'onDestroy with PiP keepalive, tunnel left running');
+    } else {
+      // 用户手动清后台：把隧道停掉并清「已连接」标记，之后不自动重连。
+      this.stopForManualKill().catch((): void => {
+      });
+    }
+  }
+
+  private pipKeepAliveActive(): boolean {
+    try {
+      const way = preferences.getPreferencesSync(this.context, { name: 'way' });
+      const active: boolean = way.getSync('vpnActive', false) as boolean;
+      const userOff: boolean = way.getSync('userOff', false) as boolean;
+      const suspended: boolean = way.getSync('ssidSuspended', false) as boolean;
+      const prefs = preferences.getPreferencesSync(this.context, { name: 'xray_prefs' });
+      const enabled: boolean = prefs.getSync('pipKeepAlive', true) as boolean;
+      return enabled && active && !userOff && !suspended;
+    } catch (error) {
+      return false;
+    }
   }
 
   private async stopForManualKill(): Promise<void> {
@@ -288,6 +310,9 @@ export default class EntryAbility extends UIAbility {
     // themselves transparent with light icons.
     try {
       const win: window.Window = windowStage.getMainWindowSync();
+      // PiP needs a typeNode created from the main window's UIContext.
+      PipManager.getInstance().makeTypeNode(win.getUIContext());
+      PipManager.getInstance().prepare(this.context);
       win.setWindowLayoutFullScreen(true).catch((error: BusinessError) => {
         hilog.warn(DOMAIN, TAG, 'fullscreen failed: %{public}s', JSON.stringify(error));
       });
@@ -311,10 +336,27 @@ export default class EntryAbility extends UIAbility {
   onWindowStageDestroy(): void {
   }
 
-  onForeground(): void {
+  onBackground(): void {
+    try {
+      if (!this.pipKeepAliveActive()) {
+        PipManager.getInstance().setAutoStart(this.context, false);
+        return;
+      }
+      // The system pops the small PiP window when the app goes to the
+      // background; it survives the main task being swiped away.
+      PipManager.getInstance().setAutoStart(this.context, true);
+      appLog(this.context, 'pip', 'PiP auto-start enabled on background');
+    } catch (error) {
+    }
   }
 
-  onBackground(): void {
+  onForeground(): void {
+    try {
+      PipManager.getInstance().setAutoStart(this.context, false);
+      PipManager.getInstance().stop();
+      appLog(this.context, 'pip', 'foreground, PiP stopped');
+    } catch (error) {
+    }
   }
 }
 

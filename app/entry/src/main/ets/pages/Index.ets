@@ -1,7 +1,6 @@
 import { common } from '@kit.AbilityKit';
 import { abilityAccessCtrl } from '@kit.AbilityKit';
 import { notificationManager } from '@kit.NotificationKit';
-import { formInfo, formProvider } from '@kit.FormKit';
 import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { wantAgent, WantAgent } from '@kit.AbilityKit';
 import type { Want } from '@kit.AbilityKit';
@@ -22,6 +21,7 @@ import { TEST_HOST } from '../common/Speedtest';
 import { resolveUdp } from '../common/UdpDns';
 import { LatencyEntry, readLatencyCache, recordLatency } from '../common/LatencyStore';
 import { appLog } from '../common/AppLog';
+import { PipManager } from '../common/PipManager';
 import { MODE_BYPASS, MODE_GFW, MODE_GLOBAL, SplitOptions } from '../common/Rules';
 import { TunnelConfigResult, buildAndSaveTunnel, proxyOutbound } from '../common/TunnelConfig';
 import { SSID_DIRECT, SSID_SUSPEND, SsidRule, clearSsidRules, currentSsid, findRule, onDemandEnabled, removeSsidRule, setAppliedSsidAction, setFlag, setSsidRule, setSsidSuspended, setSuspendOverride, ssidRules, ssidSuspended, suspendOverride } from '../common/Ssid';
@@ -129,12 +129,10 @@ struct Index {
   private networkSwitchAt: number = 0;
   private sawNetEvent: boolean = false;
   private reviveFailures: number = 0;
-  // Invisible desktop watchdog widget (way_watchdog): installed state, and a
-  // one-time prompt so the user can add it from the system widget manager.
-  @State watchdogInstalled: boolean = false;
-  private watchdogChecked: boolean = false;
-  private watchdogPrompted: boolean = false;
-  private settingsLoaded: boolean = false;
+  // Simulated PiP keepalive: when enabled, EntryAbility enables PiP auto-start
+  // in onBackground, so the system keeps a small window (and the process)
+  // after the main task is swiped away.
+  @State pipKeepAlive: boolean = true;
   private taskId: number = -1;
   private taskNotificationId: number = -1;
   private taskWatchRegistered: boolean = false;
@@ -183,9 +181,9 @@ struct Index {
   // once, so clearing it on hide used to leave the dashboard frozen at the
   // values captured when the app went background.
   onPageShow(): void {
+    this.preparePip();
     this.consumeCardOp();
     this.refreshIntent();
-    this.refreshWatchdogState();
     this.refreshEntry();
     this.refreshRuleSetStatus();
     this.loadLatencyCache();
@@ -195,12 +193,38 @@ struct Index {
   }
 
   onPageHide(): void {
-    this.stopPolling();
-    this.unsubscribeTraffic();
+    // Keep polling on purpose: with the PiP keepalive the process survives the
+    // main task, and the 5 s heartbeat supervisor is what relaunches a
+    // reclaimed VPN extension. Without PiP the system freezes this timer.
+    //
+    // Enabling auto-start here (before onBackground) is what makes the system
+    // pop the PiP window as the app leaves the foreground.
+    const context = this.ctx;
+    if (context !== null && this.pipKeepAlive && this.intentOn) {
+      PipManager.getInstance().setAutoStart(context, true);
+      appLog(context, 'pip', 'PiP auto-start enabled at page hide');
+    }
+  }
+
+  private preparePip(): void {
+    const context = this.ctx;
+    if (context === null) {
+      return;
+    }
+    if (this.pipKeepAlive && this.intentOn) {
+      // Create the controller while the app is still in the foreground, enable
+      // auto-start for the next background, and close any PiP left from before.
+      PipManager.getInstance().setAutoStart(context, true);
+      PipManager.getInstance().stop();
+    } else {
+      PipManager.getInstance().setAutoStart(context, false);
+      PipManager.getInstance().stop();
+    }
   }
 
   aboutToDisappear(): void {
     this.stopPolling();
+    this.unsubscribeTraffic();
     this.unwatchNetworkChanges();
   }
 
@@ -331,82 +355,6 @@ struct Index {
     }
   }
 
-  // --- invisible desktop watchdog widget (way_watchdog) -------------------
-  // The platform does not let a third-party app add a widget to the home
-  // screen itself. This checks whether the user already added the invisible
-  // watchdog and, if not, offers the system widget manager once.
-  private refreshWatchdogState(): void {
-    try {
-      formProvider.getPublishedRunningFormInfos().then((forms: formInfo.RunningFormInfo[]) => {
-        let installed: boolean = false;
-        for (const form of forms) {
-          if (form.formName === 'way_watchdog') {
-            installed = true;
-            break;
-          }
-        }
-        this.watchdogInstalled = installed;
-        this.watchdogChecked = true;
-      }).catch((error: BusinessError) => {
-        this.watchdogChecked = true;
-        const context = this.ctx;
-        if (context !== null) {
-          appLog(context, 'card', 'watchdog lookup failed: ' + (error.message ?? 'unknown'));
-        }
-      });
-    } catch (error) {
-      this.watchdogChecked = true;
-    }
-  }
-
-  private persistWatchdogPrompted(): void {
-    const context = this.ctx;
-    if (context === null) {
-      return;
-    }
-    preferences.getPreferences(context, PREF_NAME).then((store) => {
-      store.putSync('watchdogPrompted', true);
-      store.flush();
-    }).catch((): void => {
-    });
-  }
-
-  private promptWatchdog(): void {
-    if (this.watchdogInstalled) {
-      return;
-    }
-    promptAction.showDialog({
-      title: '添加桌面保活组件',
-      message: 'HarmonyOS 不允许应用自己把卡片放到桌面。添加一次不可见的「way 保活组件」，系统回收 VPN 后可由它尝试自动重建；不会占据可见画面。',
-      buttons: [
-        { text: '去添加', color: '#2B6CB0' },
-        { text: '以后', color: '#5C7192' }
-      ]
-    }).then((result: promptAction.ShowDialogSuccessResponse) => {
-      if (result.index === 0) {
-        this.openWatchdogManager();
-      }
-    }).catch((error: BusinessError) => {
-    });
-  }
-
-  private openWatchdogManager(): void {
-    const want: Want = {
-      bundleName: 'com.way.app',
-      abilityName: 'WayFormAbility',
-      parameters: {
-        'ohos.extra.param.key.form_name': 'way_watchdog',
-        'ohos.extra.param.key.module_name': 'entry',
-        'ohos.extra.param.key.form_dimension': formInfo.FormDimension.DIMENSION_1_1
-      }
-    };
-    try {
-      formProvider.openFormManager(want);
-    } catch (error) {
-      promptAction.showToast({ message: '打开卡片管理失败' });
-    }
-  }
-
   private refreshEntry(): void {
     const context = this.ctx;
     if (context === null) {
@@ -465,7 +413,7 @@ struct Index {
     this.useRuleSet = store.getSync('useRuleSet', false) as boolean;
     this.blockAds = store.getSync('blockAds', true) as boolean;
     this.dohDns = store.getSync('dohDns', true) as boolean;
-    this.watchdogPrompted = store.getSync('watchdogPrompted', false) as boolean;
+    this.pipKeepAlive = store.getSync('pipKeepAlive', true) as boolean;
     // The converted ACL4SSR set ships in the HAP: seed it on first launch so the
     // feature works before the tunnel (and therefore the download) can.
     if (seedRuleSet(context)) {
@@ -474,8 +422,6 @@ struct Index {
     this.refreshRuleSetStatus();
     this.refreshSsid();
     this.refreshEntry();
-    this.settingsLoaded = true;
-    this.refreshWatchdogState();
     this.poll();
     if (this.splitOn && (geodataStale(context) || !geodataReady(context))) {
       this.runGeodataUpdate(true);
@@ -520,6 +466,7 @@ struct Index {
     store.putSync('useRuleSet', this.useRuleSet);
     store.putSync('blockAds', this.blockAds);
     store.putSync('dohDns', this.dohDns);
+    store.putSync('pipKeepAlive', this.pipKeepAlive);
     await store.flush();
   }
 
@@ -986,16 +933,6 @@ struct Index {
       // publishes its live view on the same notification id. It is released
       // only when the user turns the tunnel off or the budget is exhausted.
       this.supervise(context);
-      // One-time nudge: the platform will not let a third-party app add a
-      // desktop widget itself, so offer the system widget manager instead.
-      if (status.state === 'running' && !stale && this.settingsLoaded &&
-        this.watchdogChecked && !this.watchdogInstalled && !this.watchdogPrompted) {
-        this.watchdogPrompted = true;
-        this.persistWatchdogPrompted();
-        setTimeout(() => {
-          this.promptWatchdog();
-        }, 1500);
-      }
     } else {
       // 没有状态文件：要么还在连接（busy），要么扩展进程已经没了。后者按
       // 「保活优先」拉起扩展（用已保存的 config，不重建、不先 stop）。
@@ -1051,6 +988,8 @@ struct Index {
       this.message = '断开（恢复失败）';
       this.setSwitch(false);
       this.stopKeepAliveTask();
+      PipManager.getInstance().setAutoStart(context, false);
+      PipManager.getInstance().stop();
       return;
     }
     this.recoveryAttempts++;
@@ -1493,6 +1432,12 @@ struct Index {
       this.recoveryAttempts = 0;
       this.nextRecoveryAt = 0;
       this.lastBeatAt = Date.now();
+      // Create the PiP controller while still foreground, so the next
+      // background reliably auto-starts the small keepalive window.
+      if (this.pipKeepAlive) {
+        PipManager.getInstance().setAutoStart(context, true);
+        PipManager.getInstance().stop();
+      }
       if (tunnel.multi) {
         this.watchMultiNodeStart(tunnel.single, entry.name, notifId, 0);
       }
@@ -1503,6 +1448,8 @@ struct Index {
       this.setSwitch(false);
       // The switch is off, so the supervisor must not fight the user's view.
       this.intentOn = false;
+      PipManager.getInstance().setAutoStart(context, false);
+      PipManager.getInstance().stop();
       appLog(context, 'ui', 'vpn start failed: ' + (err.message ?? JSON.stringify(error)));
       // Leave no half-created VPN or dangling task notification behind: the
       // next tap must start from the same clean slot as a cold launch.
@@ -1849,6 +1796,8 @@ struct Index {
     }
     this.stopKeepAliveTask();
     this.markActive(false);
+    PipManager.getInstance().setAutoStart(context, false);
+    PipManager.getInstance().stop();
     // Turning the switch off on a suspended Wi-Fi means "off", not "suspend
     // again": clear the policy markers so the watcher leaves it alone until the
     // user turns it on again.
@@ -2963,31 +2912,28 @@ struct Index {
 
       Row() {
         Column() {
-          Text('桌面保活组件')
+          Text('模拟画中画保活')
             .fontSize(13)
             .fontColor('#D6E4F7')
-          Text(this.watchdogInstalled ? '已添加 · 不可见，系统回收 VPN 后尝试重建' : '未添加 · 不可见，建议添加一次')
+          Text(this.pipKeepAlive ? '离开 App 弹小浮窗，划掉主应用后 VPN 继续' : '关闭后后台可能被系统回收')
             .fontSize(11)
-            .fontColor(this.watchdogInstalled ? '#5C7192' : '#FFC857')
+            .fontColor(this.pipKeepAlive ? '#5C7192' : '#FFC857')
             .margin({ top: 2 })
         }
         .alignItems(HorizontalAlign.Start)
         .layoutWeight(1)
 
-        Button(this.watchdogInstalled ? '管理' : '添加')
-          .fontSize(12)
-          .height(30)
-          .padding({ left: 14, right: 14 })
-          .backgroundColor('#1E2C46')
-          .fontColor('#8FC7FF')
-          .onClick(() => {
-            this.openWatchdogManager();
+        Toggle({ type: ToggleType.Switch, isOn: this.pipKeepAlive })
+          .selectedColor('#54C4FF')
+          .onChange((value: boolean) => {
+            this.pipKeepAlive = value;
+            this.persist();
           })
       }
       .width('100%')
       .margin({ top: 12 })
 
-      Text('连接后内核运行在 VPN 扩展进程，退出应用仍保持；核心异常退出时会自动重启。系统回收扩展后，UI 的 5 秒看门狗先尝试拉起；UI 也不在时，桌面保活组件在下一次系统刷新时再尝试。系统重启后需手动打开应用恢复。')
+      Text('连接后内核运行在 VPN 扩展进程。开启「模拟画中画」时，离开 App 会自动弹出小浮窗，划掉主应用后浮窗和进程保留，VPN 不容易被系统回收；关闭则后台可能被回收。返回 App 会关闭浮窗。系统重启后需手动打开应用恢复。')
         .fontSize(11)
         .fontColor('#4C5D77')
         .margin({ top: 12 })
