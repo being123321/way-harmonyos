@@ -106,8 +106,12 @@ export default class EntryAbility extends UIAbility {
     }
     try {
       const store = await preferences.getPreferences(this.context, 'way');
+      const active: boolean = store.getSync('vpnActive', false) as boolean;
       store.putSync('vpnActive', false);
-      // Manual close must not auto-reconnect later.
+      // Manual swipe is a full stop: userOff blocks any background restart.
+      // lastConnected remembers that the user had it on, so reopening the app
+      // can auto-connect (the FlClash-style "auto-connect on launch").
+      store.putSync('lastConnected', active);
       store.putSync('userOff', true);
       store.putSync('ssidSuspended', false);
       store.putSync('appliedSsidAction', '');
@@ -237,6 +241,7 @@ export default class EntryAbility extends UIAbility {
     }
     store.putSync('mode', mode);
     store.putSync('vpnActive', true);
+    store.putSync('lastConnected', true);
     await store.flush();
     try {
       await stopVpn(vpnWant(this.context, true, true));

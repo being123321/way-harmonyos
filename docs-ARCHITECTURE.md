@@ -371,6 +371,7 @@ GFW / 绕过大陆 / 全局、使用规则集、拦截广告、更换规则集�
 - **改用 `PiPWindow`（模拟画中画）**：`PipManager` 在主窗口 UIContext 上创建 typeNode XComponent + 自定义 UI；连接后在 `onPageHide`/`onBackground` 调 `setAutoStartEnabled(true)`，系统在 App 退到后台时弹出 160×90 的小浮窗。划掉主应用后浮窗由系统保留，UIAbility、连续任务和 5 s 心跳看门狗继续存活；`onForeground`/`onPageShow` 关闭浮窗。
 - 「保活」卡片新增「模拟画中画保活」开关（`pipKeepAlive`，默认开）。关闭后后台仍可能被系统回收；浮窗内容只有 `way / 保活中`，不显示敏感信息。
 - `EntryAbility.onDestroy` 在 `pipKeepAliveActive()` 为真时不再执行 `stopForManualKill`，避免划掉主任务时把 VPN 停掉；用户主动关开关仍走 `disconnect()` 完整停止。
+- **打开应用自动连接**：`lastConnected` 记住最后一次显式连接状态。手动划掉后台时 `stopForManualKill` 完整停止 VPN（`userOff=true`，后台不会再被拉起），但保留 `lastConnected=true`；下次启动 `maybeAutoConnect()` 会自动 `connect()`。显式关开关（`disconnect`）会清 `lastConnected`，下次不自动连。可在「保活」卡单独关闭此行为。
 - **平台边界**：PiP 由系统窗口管理，普通应用不能保证 100% 常驻；设备不支持时 `isPiPEnabled()` 为假，只写 `[pip] PiP is not enabled` 并回退到连续任务 + 5 s 看门狗。
 
 ## 9. 已知限制（务必读）

@@ -133,6 +133,11 @@ struct Index {
   // in onBackground, so the system keeps a small window (and the process)
   // after the main task is swiped away.
   @State pipKeepAlive: boolean = true;
+  // Reconnect when the app is opened again after a manual swipe-away. This is
+  // the FlClash "auto-connect on launch" behaviour: the manual swipe is still a
+  // full stop (no background resurrection), but the next launch restores it.
+  @State autoConnect: boolean = true;
+  private autoConnectTried: boolean = false;
   private taskId: number = -1;
   private taskNotificationId: number = -1;
   private taskWatchRegistered: boolean = false;
@@ -355,6 +360,45 @@ struct Index {
     }
   }
 
+  // FlClash-style "open app auto-connect": a manual swipe is a full stop (the
+  // VPN is stopped and nothing resurrects it in the background), but the last
+  // explicit state is remembered. On the next launch, if the app was connected
+  // when it exited, reconnect. An explicit switch-off clears lastConnected.
+  private maybeAutoConnect(context: common.UIAbilityContext): void {
+    if (this.autoConnectTried) {
+      return;
+    }
+    this.autoConnectTried = true;
+    if (!this.autoConnect) {
+      return;
+    }
+    setTimeout(() => {
+      this.runAutoConnect(context).catch((): void => {
+      });
+    }, 500);
+  }
+
+  private async runAutoConnect(context: common.UIAbilityContext): Promise<void> {
+    if (ssidSuspended(context)) {
+      return;
+    }
+    if (selectedEntry(context) === null) {
+      return;
+    }
+    const status: TunnelStatus | null = readStatus(context);
+    if (status !== null && (status.state === 'running' || status.state === 'starting' ||
+      status.state === 'suspended')) {
+      return;
+    }
+    const wayStore = await preferences.getPreferences(context, 'way');
+    const last: boolean = wayStore.getSync('lastConnected', false) as boolean;
+    if (!last) {
+      return;
+    }
+    appLog(context, 'lifecycle', 'auto-connect on launch (lastConnected=true)');
+    await this.connect();
+  }
+
   private refreshEntry(): void {
     const context = this.ctx;
     if (context === null) {
@@ -414,6 +458,7 @@ struct Index {
     this.blockAds = store.getSync('blockAds', true) as boolean;
     this.dohDns = store.getSync('dohDns', true) as boolean;
     this.pipKeepAlive = store.getSync('pipKeepAlive', true) as boolean;
+    this.autoConnect = store.getSync('autoConnect', true) as boolean;
     // The converted ACL4SSR set ships in the HAP: seed it on first launch so the
     // feature works before the tunnel (and therefore the download) can.
     if (seedRuleSet(context)) {
@@ -423,6 +468,7 @@ struct Index {
     this.refreshSsid();
     this.refreshEntry();
     this.poll();
+    this.maybeAutoConnect(context);
     if (this.splitOn && (geodataStale(context) || !geodataReady(context))) {
       this.runGeodataUpdate(true);
     }
@@ -467,6 +513,7 @@ struct Index {
     store.putSync('blockAds', this.blockAds);
     store.putSync('dohDns', this.dohDns);
     store.putSync('pipKeepAlive', this.pipKeepAlive);
+    store.putSync('autoConnect', this.autoConnect);
     await store.flush();
   }
 
@@ -1670,6 +1717,10 @@ struct Index {
     try {
       const store = await preferences.getPreferences(context, 'way');
       store.putSync('vpnActive', active);
+      // Remember the last explicit state separately from the live intent: after
+      // a manual swipe the intent is cleared (no background resurrection) but
+      // the next launch can still auto-connect, like FlClash.
+      store.putSync('lastConnected', active);
       // Remember an explicit user choice so the on-demand watcher cannot
       // reconnect against it.
       store.putSync('userOff', !active);
@@ -2933,7 +2984,30 @@ struct Index {
       .width('100%')
       .margin({ top: 12 })
 
-      Text('连接后内核运行在 VPN 扩展进程。开启「模拟画中画」时，离开 App 会自动弹出小浮窗，划掉主应用后浮窗和进程保留，VPN 不容易被系统回收；关闭则后台可能被回收。返回 App 会关闭浮窗。系统重启后需手动打开应用恢复。')
+      Row() {
+        Column() {
+          Text('打开应用自动连接')
+            .fontSize(13)
+            .fontColor('#D6E4F7')
+          Text(this.autoConnect ? '上次退出时是连接状态，启动 App 自动连上' : '启动 App 不自动连接')
+            .fontSize(11)
+            .fontColor('#5C7192')
+            .margin({ top: 2 })
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+
+        Toggle({ type: ToggleType.Switch, isOn: this.autoConnect })
+          .selectedColor('#54C4FF')
+          .onChange((value: boolean) => {
+            this.autoConnect = value;
+            this.persist();
+          })
+      }
+      .width('100%')
+      .margin({ top: 12 })
+
+      Text('连接后内核运行在 VPN 扩展进程。开启「模拟画中画」时，离开 App 会自动弹出小浮窗，划掉主应用后浮窗和进程保留，VPN 不容易被系统回收；关闭则后台可能被回收。开启「打开应用自动连接」时，手动划掉后台会完整停止 VPN（不会在后台偷偷重启），下次打开 App 自动重连；关闭则下次启动保持断开。系统重启后需手动打开应用恢复。')
         .fontSize(11)
         .fontColor('#4C5D77')
         .margin({ top: 12 })
