@@ -38,6 +38,11 @@ const POLL_MS: number = 1000;
 // the extension process is gone (or its JS thread is wedged), so the UI
 // supervisor relaunches it instead of leaving the user with a dead switch.
 const HEARTBEAT_STALE_MS: number = 5000;
+// A Wi-Fi/cellular switch makes the extension call native.rebind(), which can
+// block its JS thread for several seconds (DNS + socket setup). During that
+// window the heartbeat looks stale even though the extension is alive, and
+// relaunching/stopping it was what turned a switch into a full VPN drop.
+const NETWORK_GRACE_MS: number = 20000;
 // Bounded relaunch budget: attempts are spaced 1s, 2s, 4s, 8s (the next wait
 // would be 15s, but the budget stops at five). It uses the saved config, so
 // this is a relaunch, not a rebuild/restart of the tunnel.
@@ -118,6 +123,12 @@ struct Index {
   private recovering: boolean = false;
   private intentOn: boolean = false;
   private connectWatchdog: number = -1;
+  // Network-change suppression: after netLost/netAvailable the extension gets
+  // NETWORK_GRACE_MS to rebind before the heartbeat supervisor may relaunch it.
+  private netConn: connection.NetConnection | null = null;
+  private networkSwitchAt: number = 0;
+  private sawNetEvent: boolean = false;
+  private reviveFailures: number = 0;
   // Invisible desktop watchdog widget (way_watchdog): installed state, and a
   // one-time prompt so the user can add it from the system widget manager.
   @State watchdogInstalled: boolean = false;
@@ -164,6 +175,7 @@ struct Index {
     this.restore().catch((error: BusinessError) => {
       promptAction.showToast({ message: '读取设置失败' });
     });
+    this.watchNetworkChanges();
     this.startPolling();
   }
 
@@ -189,6 +201,52 @@ struct Index {
 
   aboutToDisappear(): void {
     this.stopPolling();
+    this.unwatchNetworkChanges();
+  }
+
+  // Observe network changes so a switch (Wi-Fi <-> cellular) pauses the
+  // heartbeat supervisor for a while. The extension itself only calls
+  // native.rebind() on netAvailable; it does not restart the tunnel.
+  private watchNetworkChanges(): void {
+    if (this.netConn !== null) {
+      return;
+    }
+    try {
+      const conn: connection.NetConnection = connection.createNetConnection();
+      const mark = (): void => {
+        // The first event is just the current default network at registration;
+        // only later events indicate a real switch.
+        if (this.sawNetEvent) {
+          this.networkSwitchAt = Date.now();
+        }
+        this.sawNetEvent = true;
+      };
+      conn.on('netAvailable', () => {
+        mark();
+      });
+      conn.on('netLost', () => {
+        mark();
+      });
+      conn.register((error: BusinessError) => {
+        if (error && this.ctx !== null) {
+          appLog(this.ctx, 'ui', 'network watch failed: ' + (error.message ?? 'unknown'));
+        }
+      });
+      this.netConn = conn;
+    } catch (error) {
+    }
+  }
+
+  private unwatchNetworkChanges(): void {
+    const conn = this.netConn;
+    this.netConn = null;
+    if (conn !== null) {
+      try {
+        conn.unregister(() => {
+        });
+      } catch (error) {
+      }
+    }
   }
 
   // Subscription channel: the VPN extension publishes counters once per second
@@ -870,6 +928,7 @@ struct Index {
         // A fresh beat means the extension is alive: reset the relaunch budget.
         this.recoveryAttempts = 0;
         this.nextRecoveryAt = 0;
+        this.reviveFailures = 0;
         // A running tunnel with no stored intent (e.g. the app died between
         // startVpn and the markActive flush) must still be supervised.
         if (!this.busy && !this.intentOn && status.state === 'running') {
@@ -878,9 +937,12 @@ struct Index {
         }
       }
       const recovering: boolean = stale && this.intentOn;
+      const switching: boolean = stale && this.intentOn &&
+        now - this.networkSwitchAt < NETWORK_GRACE_MS;
       this.state = recovering ? 'recovering' : (stale ? 'unknown' : status.state);
-      this.message = recovering ? '心跳中断，正在恢复' :
-        (stale ? '断开' : (status.state === 'stopped' ? '断开' : status.message));
+      this.message = switching ? '网络切换，正在重绑' :
+        (recovering ? '心跳中断，正在恢复' :
+          (stale ? '断开' : (status.state === 'stopped' ? '断开' : status.message)));
       this.up = status.up;
       this.down = status.down;
       this.flows = status.tcpFlows + status.udpFlows;
@@ -972,6 +1034,12 @@ struct Index {
       return;
     }
     const now: number = Date.now();
+    // Wi-Fi/cellular switch: native.rebind() can hold the extension's JS thread
+    // for seconds. Give it the same grace the network event started; never
+    // relaunch (or stop) a possibly-live extension during that window.
+    if (now - this.networkSwitchAt < NETWORK_GRACE_MS) {
+      return;
+    }
     const since: number = Math.max(this.lastBeatAt, this.lastStartRequestAt);
     if (now - since < HEARTBEAT_STALE_MS || now < this.nextRecoveryAt) {
       return;
@@ -1024,12 +1092,19 @@ struct Index {
         appLog(context, 'ui', 'extension relaunch requested with saved config (no rebuild)');
       } catch (error) {
         const err = error as BusinessError;
-        appLog(context, 'ui', 'extension relaunch failed: ' + (err.message ?? 'unknown'));
-        // A half-dead VPN entry can reject the next start; clear it so the
-        // next backoff round starts from a clean system slot.
-        try {
-          await stopVpn(vpnWant(context, this.notifyMe, this.rebindOnNetChange));
-        } catch (stopError) {
+        this.reviveFailures++;
+        appLog(context, 'ui', 'extension relaunch failed (' + this.reviveFailures + '): ' +
+          (err.message ?? 'unknown'));
+        // Do NOT stop on the first rejection: a live extension that is merely
+        // busy rebinding rejects a duplicate start, and stopping it would turn
+        // a network switch into a full VPN drop. Only clear the system slot
+        // after several consecutive failures.
+        if (this.reviveFailures >= 3) {
+          this.reviveFailures = 0;
+          try {
+            await stopVpn(vpnWant(context, this.notifyMe, this.rebindOnNetChange));
+          } catch (stopError) {
+          }
         }
       }
     } finally {

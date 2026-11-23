@@ -708,8 +708,9 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
     this.netAvailableHandler = (data: connection.NetHandle) => {
       this.appendLog('network available, rebinding carriers');
       try {
+        const started: number = Date.now();
         const accepted: number = native.rebind();
-        this.appendLog('rebind accepted ' + accepted);
+        this.appendLog('rebind accepted ' + accepted + ' in ' + (Date.now() - started) + 'ms');
       } catch (error) {
         this.appendLog('rebind failed: ' + JSON.stringify(error));
       }
