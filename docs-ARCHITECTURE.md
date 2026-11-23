@@ -365,6 +365,14 @@ GFW / 绕过大陆 / 全局、使用规则集、拦截广告、更换规则集�
 - **桌面卡片**：`EntryFormAbility` 不再 import `AppLog`/`Xray`，避免卡片进程为了写一行日志加载 26 MB 的 `libentry.so`；`form_config.json` 的 `displayName`/`description` 改用普通字符串，避免 `$string:` 在 profile 里被转成数字 id 后解析失败。卡片仍不出现时先看应用沙箱 `files/xray/app.log` 里的 `[card]` 行：有 `form added` 说明 form 进程和配置都正常，问题在渲染；一行都没有则是系统没有绑定 form（签名/安装问题）。
 - **启动器图标**：`AppScope/resources/base/media/layered_image.json` 指向 1024×1024 的 `icon_background`/`icon_foreground`；`app.json5` 和 `module.json5` 里所有 Ability 的 `icon` 都改成 `$media:layered_image`（module 的 icon 会覆盖 app 的，必须两处一起改）。`startWindowIcon` 仍用 512 的 `app_icon`。
 
+### 8.3 不可见桌面保活组件（way_watchdog）
+
+- `form_config.json` 有两张卡：`way_widget`（2*2 可见快捷开关）和 `way_watchdog`（1*1 全透明）。`way_watchdog` 设 `updateEnabled: true`、`updateDuration: 1`（30 分钟兜底），并在每次 `onAddForm`/`onUpdateForm` 后用 `setFormNextRefreshTime(formId, 5)` 把下一次系统刷新压到最短的 5 分钟。
+- 组件进程每次被拉起（添加、系统刷新、以及进程存活期内的 5 s 定时器）都会读 `way` 偏好里的 `vpnActive`/`userOff`/`ssidSuspended` 和 `status.json`：用户意图为开、不在挂起 Wi-Fi、且心跳丢失或状态为 `stopped`/`error` 时，用已保存的 `config.json` 直接 `vpnExtension.startVpnExtensionAbility` 重建 VPN；10 s 内不重复尝试。结果写 `files/xray/app.log` 的 `[card] watchdog ...`。
+- **平台限制**：`FormExtensionAbility` 进程不常驻——生命周期回调结束后约 10 s 退出，定时器随之停止；系统刷新最快 5 分钟一次。所以它是“独立恢复触发器”，不是 5 s 守护进程。UI 的 5 s 看门狗仍是第一道；组件覆盖的是 UI 进程也不在的场景。
+- **不能自动加卡**：HarmonyOS 不向第三方应用开放 `formHost`/自动添加桌面卡片的 API；App 在首次连上后弹一次提示，或在「保活」卡点「添加」，通过 `formProvider.openFormManager` 打开系统卡片管理，由用户添加一次。之后卡片全透明，不占可见画面。
+- 两张卡共用 `EntryFormAbility`，`onAddForm` 按 `ohos.extra.param.key.form_name` 区分（`way_watchdog` 才启动看门狗）。卡片代码不 import `Xray`/`Store`，只依赖 `CardLog`/`Watchdog`；即使 form 进程里的 `startVpn` 被系统拒绝，也只写 `[card] watchdog relaunch failed`，不影响 UI 路径。
+
 ## 9. 已知限制（务必读）
 
 1. 本机真机（`VDE-AL10`，API 26）已 `hdc install` 并逐项验证，截图存 `verify/`：

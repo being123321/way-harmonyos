@@ -1,46 +1,77 @@
-import { FormExtensionAbility, formBindingData, formInfo } from '@kit.FormKit';
-import { fileIo as fs } from '@kit.CoreFileKit';
+import { FormExtensionAbility, formBindingData, formInfo, formProvider } from '@kit.FormKit';
 import type { Want } from '@kit.AbilityKit';
-import type { common } from '@kit.AbilityKit';
+import type { BusinessError } from '@kit.BasicServicesKit';
+import { cardLog } from './CardLog';
+import { WATCHDOG_FORM_NAME, checkAndRevive } from './Watchdog';
 
-// 桌面卡片只做一次"转发意图"，不持有隧道。
-//
-// This file deliberately does NOT import AppLog/Xray: AppLog pulls in Xray,
-// which loads libentry.so and the VPN kit. The form extension runs in its own,
-// memory-tight process that only needs FormKit; pulling the 26 MB core in just
-// to append a log line made the form process start slowly (and, on some ROMs,
-// fail before onAddForm is reached, so the card never appeared). Keep the card
-// ability self-contained and log through fileIo directly.
-function cardLog(context: common.Context, message: string): void {
-  try {
-    const dir: string = context.filesDir + '/xray';
-    if (!fs.accessSync(dir)) {
-      fs.mkdirSync(dir, true);
-    }
-    const date = new Date();
-    const pad = (value: number): string => value < 10 ? '0' + value : '' + value;
-    const stamp: string = date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate()) +
-      ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes()) + ':' + pad(date.getSeconds());
-    const path: string = dir + '/app.log';
-    const file = fs.openSync(path, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.APPEND);
-    fs.writeSync(file.fd, stamp + ' [card] ' + message + '\n');
-    fs.closeSync(file);
-  } catch (error) {
-  }
-}
-
+// Desktop cards:
+//   * way_widget    - the visible connect/disconnect card;
+//   * way_watchdog  - a 1x1 transparent card whose lifecycle acts as an
+//                     independent VPN recovery trigger when the UI process is
+//                     gone (see Watchdog.ets for the platform lifetime limits).
 export default class WayFormAbility extends FormExtensionAbility {
-  // Called synchronously when the launcher asks whether the card is ready.
-  // READY is the normal state for a card that needs no initial network data.
+  private watchdogTimer: number = -1;
+
   onAcquireFormState(want: Want): formInfo.FormState {
     return formInfo.FormState.READY;
   }
 
   onAddForm(want: Want): formBindingData.FormBindingData {
     const params: Record<string, Object> = want.parameters ?? {};
-    const dimension: string = (params['ohos.extra.param.key.form_dimension'] as string) ?? '';
-    cardLog(this.context, 'form added' + (dimension.length > 0 ? ' (' + dimension + ')' : ''));
+    const formName: string = (params['ohos.extra.param.key.form_name'] as string) ?? '';
+    cardLog(this.context, 'form added: ' + (formName.length > 0 ? formName : 'unknown'));
+    if (formName === WATCHDOG_FORM_NAME) {
+      this.runWatchdog('');
+      // onAddForm has no formId; look the published form up shortly after and
+      // ask for the first refresh in 5 minutes.
+      setTimeout(() => {
+        this.scheduleRefresh();
+      }, 1500);
+    }
     return formBindingData.createFormBindingData({});
+  }
+
+  onUpdateForm(formId: string, wantParams?: Record<string, Object>): void {
+    cardLog(this.context, 'form updated: ' + formId);
+    this.runWatchdog(formId);
+  }
+
+  private runWatchdog(formId: string): void {
+    checkAndRevive(this.context).then((result: string) => {
+      cardLog(this.context, 'watchdog: ' + result);
+    }).catch((error: BusinessError) => {
+      cardLog(this.context, 'watchdog error: ' + JSON.stringify(error));
+    });
+    if (formId.length > 0) {
+      formProvider.setFormNextRefreshTime(formId, 5).catch((error: BusinessError) => {
+        cardLog(this.context, 'watchdog refresh failed: ' + JSON.stringify(error));
+      });
+    }
+    // The form process normally lives ~10 s after the last callback; keep a
+    // short in-process loop so a VPN that dies during that window is caught.
+    if (this.watchdogTimer === -1) {
+      this.watchdogTimer = setInterval(() => {
+        checkAndRevive(this.context).then((result: string) => {
+          cardLog(this.context, 'watchdog tick: ' + result);
+        }).catch((error: BusinessError) => {
+          cardLog(this.context, 'watchdog tick error: ' + JSON.stringify(error));
+        });
+      }, 5000);
+    }
+  }
+
+  private scheduleRefresh(): void {
+    formProvider.getPublishedRunningFormInfos().then((forms: formInfo.RunningFormInfo[]) => {
+      for (const form of forms) {
+        if (form.formName === WATCHDOG_FORM_NAME) {
+          this.runWatchdog(form.formId);
+          return;
+        }
+      }
+      cardLog(this.context, 'watchdog form not published yet');
+    }).catch((error: BusinessError) => {
+      cardLog(this.context, 'watchdog form lookup failed: ' + JSON.stringify(error));
+    });
   }
 
   onFormEvent(formId: string, message: string): void {
@@ -48,6 +79,18 @@ export default class WayFormAbility extends FormExtensionAbility {
   }
 
   onRemoveForm(formId: string): void {
-    cardLog(this.context, 'form removed');
+    cardLog(this.context, 'form removed: ' + formId);
+    this.stopWatchdog();
+  }
+
+  onStop(): void {
+    this.stopWatchdog();
+  }
+
+  private stopWatchdog(): void {
+    if (this.watchdogTimer !== -1) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = -1;
+    }
   }
 }
