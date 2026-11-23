@@ -2184,23 +2184,25 @@ struct Index {
         })
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
 
-      // Ambient status light *behind* the cards: it lights the page and bleeds
-      // through the translucent card surface instead of sitting on top of it.
+      // Ambient status light *behind* the cards, painted on the page background
+      // itself. It is fixed here (not inside a card), so scrolling the list does
+      // not drag the glow along with the cards; the translucent card surfaces
+      // let it bleed through.
       Column()
-        .width(300)
-        .height(230)
+        .width('100%')
+        .height(460)
         .radialGradient({
-          center: [250, 62],
-          radius: 150,
+          center: ['78%', '0%'],
+          radius: 380,
           colors: [
-            [this.statusGlow(this.alphaHex(this.glowLevel() * 0.34)), 0.0],
-            [this.statusGlow(this.alphaHex(this.glowLevel() * 0.16)), 0.5],
+            [this.statusGlow(this.alphaHex(0.05 + 0.34 * this.glowLevel())), 0.0],
+            [this.statusGlow(this.alphaHex(0.02 + 0.14 * this.glowLevel())), 0.5],
             [this.statusGlow('00'), 1.0]
           ]
         })
         .hitTestBehavior(HitTestMode.Transparent)
-        .align(Alignment.TopEnd)
-        .margin({ top: -20, right: -30 })
+        .align(Alignment.Top)
+        .margin({ top: -20 })
 
       Column() {
         Scroll() {
@@ -2430,21 +2432,12 @@ struct Index {
     }
     .width('100%')
     .padding(16)
-    // Card body: translucent surface + hairline highlight. The light is a
-    // gradient painted into the card itself (top-right corner), so the surface
-    // looks lit instead of covered by a veil; it tracks the live throughput.
+    // Card body: translucent surface + hairline highlight. The status light is
+    // painted on the page background (the radial bloom behind the scroll
+    // content), not inside the card, so it stays put when the card scrolls.
     .backgroundColor('#B3131A2C')
     .border({ width: 1, color: '#12FFFFFF' })
     .borderRadius(18)
-    .radialGradient({
-      center: ['100%', '0%'],
-      radius: 330,
-      colors: [
-        [this.statusGlow(this.alphaHex(0.05 + 0.34 * this.glowLevel())), 0.0],
-        [this.statusGlow(this.alphaHex(0.02 + 0.14 * this.glowLevel())), 0.42],
-        [this.statusGlow('00'), 1.0]
-      ]
-    })
     .shadow({ radius: 18, color: '#4D000000', offsetY: 6 })
     .margin({ top: 6 })
   }
@@ -2563,15 +2556,6 @@ struct Index {
     .padding(16)
     .backgroundColor('#101827')
     .borderRadius(20)
-    // The light reaches this card too, just weaker than the status card.
-    .radialGradient({
-      center: ['100%', '0%'],
-      radius: 260,
-      colors: [
-        [this.statusGlow(this.alphaHex(0.02 + 0.12 * this.glowLevel())), 0.0],
-        [this.statusGlow('00'), 1.0]
-      ]
-    })
     .border({ width: 1, color: '#0AFFFFFF' })
     .shadow({ radius: 26, color: '#3D000000', offsetY: 8 })
   }

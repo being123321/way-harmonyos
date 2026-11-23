@@ -315,12 +315,14 @@ export default class EntryAbility extends UIAbility {
     });
 
     // Edge-to-edge: paint under the status and navigation bars, keep the bars
-    // themselves transparent with light icons.
+    // themselves transparent with light icons. This must happen BEFORE the PiP
+    // setup: PiP is optional and can throw on devices that do not support it,
+    // and it used to share this try block, which skipped the transparent bars
+    // and left the page inset by the status bar (header too low, first card
+    // misaligned, background bloom clipped).
+    let win: window.Window | null = null;
     try {
-      const win: window.Window = windowStage.getMainWindowSync();
-      // PiP needs a typeNode created from the main window's UIContext.
-      PipManager.getInstance().makeTypeNode(win.getUIContext());
-      PipManager.getInstance().prepare(this.context);
+      win = windowStage.getMainWindowSync();
       win.setWindowLayoutFullScreen(true).catch((error: BusinessError) => {
         hilog.warn(DOMAIN, TAG, 'fullscreen failed: %{public}s', JSON.stringify(error));
       });
@@ -338,6 +340,17 @@ export default class EntryAbility extends UIAbility {
       });
     } catch (error) {
       hilog.warn(DOMAIN, TAG, 'window setup failed: %{public}s', JSON.stringify(error));
+    }
+
+    // PiP is a separate, optional layer; a failure here must not affect the
+    // window/status-bar setup above.
+    try {
+      if (win !== null) {
+        PipManager.getInstance().makeTypeNode(win.getUIContext());
+        PipManager.getInstance().prepare(this.context);
+      }
+    } catch (error) {
+      hilog.warn(DOMAIN, TAG, 'pip setup failed: %{public}s', JSON.stringify(error));
     }
   }
 
