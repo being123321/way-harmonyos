@@ -2844,6 +2844,7 @@ struct Index {
           })
       }
       .width('100%')
+      .padding({ left: 12, right: 12 })
       .margin({ top: 10 })
 
       if (this.ssidExpanded) {
