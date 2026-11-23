@@ -85,6 +85,20 @@ export default class TempAbility extends UIAbility {
       }
       await this.delay(600);
       const notifId: number = await this.acquire();
+      if (notifId >= 0) {
+        // If the VPN extension was already running under the UI's old task id,
+        // startVpn is a duplicate start and does not re-bind handlers. Push the
+        // new notification id so the live view replaces this task card instead
+        // of publishing to the stopped id (which left only the generic card).
+        try {
+          const data: commonEventManager.CommonEventPublishData = {
+            parameters: { 'taskNotificationId': notifId }
+          };
+          commonEventManager.publish('com.way.app.TASK_ID', data, () => {
+          });
+        } catch (error) {
+        }
+      }
       const entry = selectedEntry(this.context);
       const name: string = entry === null ? '' : entry.name;
       await startVpn(vpnWant(this.context, true, true, notifId, name));

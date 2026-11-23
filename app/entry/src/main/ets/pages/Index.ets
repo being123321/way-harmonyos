@@ -231,6 +231,21 @@ struct Index {
         'ohos.extra.param.key.form_dimension': formInfo.FormDimension.Dimension_2_2
       }
     };
+    // Release the UI's task BEFORE the picker previews the card. Otherwise the
+    // UI task (generic system card) and the TempAbility task (live view) both
+    // stay alive and the shade shows two notifications. The takeover event is
+    // still the fallback for the long-press picker path.
+    const context = this.ctx;
+    if (context !== null) {
+      this.keepAliveOwnedByTemp = true;
+      if (this.keepAliveStarted) {
+        this.keepAliveStarted = false;
+        this.taskNotificationId = -1;
+        backgroundTaskManager.stopBackgroundRunning(context).catch((): void => {
+        });
+        appLog(context, 'keepalive', 'released UI task before opening widget manager');
+      }
+    }
     try {
       formProvider.openFormManager(want);
     } catch (error) {
@@ -238,7 +253,8 @@ struct Index {
     }
   }
 
-  private preparePip(): void {    const context = this.ctx;
+  private preparePip(): void {
+    const context = this.ctx;
     if (context === null) {
       return;
     }
