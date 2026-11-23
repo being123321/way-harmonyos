@@ -145,6 +145,7 @@ struct Index {
   @State hasRuleSet: boolean = false;
   @State ruleSetText: string = '未导入（使用内置规则）';
   @State useRuleSet: boolean = false;
+  @State fakeDns: boolean = true;
   @State ruleBusy: boolean = false;
   @State ruleProgress: string = '';
   @State hasBackup: boolean = false;
@@ -508,6 +509,7 @@ struct Index {
     this.onDemand = onDemandEnabled(context);
     this.rules = ssidRules(context);
     this.useRuleSet = store.getSync('useRuleSet', false) as boolean;
+    this.fakeDns = store.getSync('fakeDns', true) as boolean;
     this.blockAds = store.getSync('blockAds', true) as boolean;
     this.dohDns = store.getSync('dohDns', true) as boolean;
     this.autoConnect = store.getSync('autoConnect', true) as boolean;
@@ -562,6 +564,7 @@ struct Index {
     store.putSync('blockQuic', this.blockQuic);
     store.putSync('debugLog', this.debugLog);
     store.putSync('useRuleSet', this.useRuleSet);
+    store.putSync('fakeDns', this.fakeDns);
     store.putSync('blockAds', this.blockAds);
     store.putSync('dohDns', this.dohDns);
     store.putSync('autoConnect', this.autoConnect);
@@ -745,6 +748,14 @@ struct Index {
   }
 
 
+  private toggleFakeDns(value: boolean): void {
+    this.fakeDns = value;
+    this.persist();
+    promptAction.showToast({
+      message: value ? 'FakeIP 已开启，重连后生效' : 'FakeIP 已关闭，重连后生效'
+    });
+  }
+
   // One place that turns the UI state into routing options, so connect and the
   // live switches cannot drift apart.
   private buildOptions(context: common.UIAbilityContext): SplitOptions {
@@ -759,7 +770,7 @@ struct Index {
       ruleSet: this.useRuleSet ? readRuleSet(context) : null,
       blockAds: this.blockAds,
       doh: this.dohDns,
-      domainFirst: true,
+      fakeDns: this.fakeDns,
       bootstrapHosts: this.bootstrapHosts
     };
     return options;
@@ -2761,6 +2772,28 @@ struct Index {
       .width('100%')
       .margin({ top: 10 })
 
+
+      Row() {
+        Column() {
+          Text('FakeIP')
+            .fontSize(13)
+            .fontColor('#D6E4F7')
+          Text('域名优先；规则集模式也生效')
+            .fontSize(11)
+            .fontColor('#5C7192')
+            .margin({ top: 2 })
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+
+        Toggle({ type: ToggleType.Switch, isOn: this.fakeDns })
+          .selectedColor('#54C4FF')
+          .onChange((value: boolean) => {
+            this.toggleFakeDns(value);
+          })
+      }
+      .width('100%')
+      .margin({ top: 10 })
 
       Row() {
         Column() {

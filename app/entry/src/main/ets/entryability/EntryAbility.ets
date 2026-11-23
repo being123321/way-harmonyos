@@ -259,7 +259,7 @@ export default class EntryAbility extends UIAbility {
       ruleSet: activeRuleSet(this.context),
       blockAds: ruleSetAdsEnabled(this.context),
       doh: dohEnabled(this.context),
-      domainFirst: true,
+      fakeDns: true,
       bootstrapHosts: null
     };
     buildAndSaveTunnel(this.context, entry, options);

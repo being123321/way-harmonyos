@@ -26,10 +26,10 @@ export interface SplitOptions {
   blockAds: boolean;
   // Domestic DoH (direct) + foreign DoH (through the node) instead of plain UDP.
   doh: boolean;
-  // Domain-first split: CN/direct domains resolve to real IPs, proxy-bound
-  // domains get a fake IP from dns.fakeIp, so the domain is known before the
-  // connection is routed instead of only after sniffing.
-  domainFirst: boolean;
+  // FakeIP domain-first split. When on, both the built-in modes and the rule
+  // set use dns.fakeIp: a fake IP maps back to the domain before routing, so a
+  // rule set's domain rules no longer depend on TLS/QUIC sniffing.
+  fakeDns: boolean;
   // Diagnostic logging: 'debug' writes every routing decision to the core log.
   // Off by default; only for troubleshooting routes, DNS or protocol issues.
   debugLog: boolean;
@@ -217,7 +217,9 @@ const FAKE_IP_TTL: number = 300;
 const PROBE_DOMAINS: string[] = ['domain:gstatic.com', 'domain:www.gstatic.com', 'domain:google.com'];
 
 function applyFakeDns(root: Record<string, Object>, options: SplitOptions): void {
-  if (!options.domainFirst || options.ruleSet !== null) {
+  // The Rust core implements FakeIP through dns.fakeIp; the Go `fakedns`
+  // special DNS server is rejected by this kernel, so never insert it.
+  if (!options.fakeDns) {
     return;
   }
   if (options.mode !== MODE_BYPASS && options.mode !== MODE_GFW) {
@@ -236,17 +238,11 @@ function applyFakeDns(root: Record<string, Object>, options: SplitOptions): void
     'address': options.doh ? DOH_DOMESTIC : '223.5.5.5',
     'domains': PROBE_DOMAINS
   };
-  const fake: Record<string, Object> = { 'address': 'fakedns' };
   if (options.mode === MODE_GFW) {
-    // Only the curated proxy list is faked; everything else keeps the real
-    // resolver and the direct catch-all.
-    fake['domains'] = GFW_SUFFIXES;
-    servers.unshift(fake);
     servers.unshift(probeReal);
   } else {
-    // bypass: the domestic server is first and only matches geosite:cn. Put
-    // fakedns right after it so non-CN domains get a fake IP and CN domains
-    // still resolve to real domestic addresses.
+    // Keep the domestic real resolver first for geosite:cn; dns.fakeIp drives
+    // the fake mapping automatically, so no separate fakedns server is added.
     let insertAt: number = 0;
     for (let i = 0; i < servers.length; i++) {
       const server: Record<string, Object> = servers[i] as Record<string, Object>;
@@ -255,7 +251,7 @@ function applyFakeDns(root: Record<string, Object>, options: SplitOptions): void
         insertAt = i + 1;
       }
     }
-    servers.splice(insertAt, 0, probeReal, fake);
+    servers.splice(insertAt, 0, probeReal);
   }
   dns['servers'] = servers;
   dns['fakeIp'] = {
@@ -428,8 +424,10 @@ export function applyBuiltInRules(configJson: string, options: SplitOptions): st
     for (const candidate of inbounds) {
       const inbound: Record<string, Object> = candidate as Record<string, Object>;
       if (inbound['protocol'] === 'tun') {
-        const fakeDns: boolean = options.domainFirst && options.ruleSet === null &&
+        const fakeDns: boolean = options.fakeDns &&
           (options.mode === MODE_BYPASS || options.mode === MODE_GFW);
+        // `fakedns` is a no-op in this kernel; dns.fakeIp restores the domain
+        // automatically. Keep it only as a harmless compatibility marker.
         const destOverride: Object[] = fakeDns
           ? ['fakedns', 'http', 'tls', 'quic']
           : ['http', 'tls', 'quic'];
