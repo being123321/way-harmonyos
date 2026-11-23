@@ -15,11 +15,11 @@ import { udpQuicLatency } from './Latency';
 export const TEST_CONCURRENCY: number = 4;
 export const TEST_TIMEOUT_MS: number = 6000;
 
-// Plain HTTP 204 (the same target the status/liveness probe uses): TLS would
-// add two round trips unrelated to how the node relays traffic, and
-// 1.1.1.1 is blocked by some nodes/ISPs. gstatic is the common url-test
-// target in mihomo/FlClash and answers with an empty 204.
-const TEST_URL: string = 'http://www.gstatic.com/generate_204';
+// Plain HTTP on an IP literal: with domain-first FakeDNS a hostname probe would
+// get a fake IP and never reach the target, so the probe must not need DNS.
+// 1.1.1.1 is an anycast IP (no resolver on either side); TLS would add two
+// round trips unrelated to how the node relays traffic.
+const TEST_URL: string = 'http://1.1.1.1/';
 export const TEST_HOST: string = '';
 
 export const VIA_HTTP: string = 'http';

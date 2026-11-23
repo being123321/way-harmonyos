@@ -743,6 +743,7 @@ struct Index {
       ruleSet: this.useRuleSet ? readRuleSet(context) : null,
       blockAds: this.blockAds,
       doh: this.dohDns,
+      domainFirst: true,
       bootstrapHosts: this.bootstrapHosts
     };
     return options;

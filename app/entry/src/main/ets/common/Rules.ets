@@ -26,6 +26,10 @@ export interface SplitOptions {
   blockAds: boolean;
   // Domestic DoH (direct) + foreign DoH (through the node) instead of plain UDP.
   doh: boolean;
+  // Domain-first split: CN/direct domains resolve to real IPs, proxy-bound
+  // domains get a fake IP from dns.fakeIp, so the domain is known before the
+  // connection is routed instead of only after sniffing.
+  domainFirst: boolean;
   // Diagnostic logging: 'debug' writes every routing decision to the core log.
   // Off by default; only for troubleshooting routes, DNS or protocol issues.
   debugLog: boolean;
@@ -198,6 +202,63 @@ function applyDohDns(root: Record<string, Object>, geodata: boolean): void {
   root['dns'] = dns;
 }
 
+// Domain-first hybrid: keep the domestic real resolver first for geosite:cn,
+// then let fakeDNS hand out fake IPs for the domains that will be proxied. The
+// TUN reverts a fake IP to the domain before routing, so geosite/geoip and the
+// rule set no longer depend on sniffing for TLS/QUIC/ECH.
+//
+// Pool 198.19.0.0/16 is deliberate: the TUN DNS anchor is 198.18.0.1, and
+// v2rayNG's 198.18.0.0/15 default would collide with it.
+const FAKE_IP_POOL: string = '198.19.0.0/16';
+const FAKE_IP_POOL_SIZE: number = 60000;
+const FAKE_IP_TTL: number = 300;
+
+function applyFakeDns(root: Record<string, Object>, options: SplitOptions): void {
+  if (!options.domainFirst || options.ruleSet !== null) {
+    return;
+  }
+  if (options.mode !== MODE_BYPASS && options.mode !== MODE_GFW) {
+    return;
+  }
+  const rawDns: Object | undefined = root['dns'] as Object | undefined;
+  if (rawDns === undefined || rawDns === null) {
+    return;
+  }
+  const dns: Record<string, Object> = rawDns as Record<string, Object>;
+  const servers: Object[] = asArray(dns['servers'] as Object | undefined);
+  if (servers.length === 0) {
+    return;
+  }
+  const fake: Record<string, Object> = { 'address': 'fakedns' };
+  if (options.mode === MODE_GFW) {
+    // Only the curated proxy list is faked; everything else keeps the real
+    // resolver and the direct catch-all.
+    fake['domains'] = GFW_SUFFIXES;
+    servers.unshift(fake);
+  } else {
+    // bypass: the domestic server is first and only matches geosite:cn. Put
+    // fakedns right after it so non-CN domains get a fake IP and CN domains
+    // still resolve to real domestic addresses.
+    let insertAt: number = 0;
+    for (let i = 0; i < servers.length; i++) {
+      const server: Record<string, Object> = servers[i] as Record<string, Object>;
+      const domains: Object | undefined = server['domains'] as Object | undefined;
+      if (domains !== undefined && domains !== null) {
+        insertAt = i + 1;
+      }
+    }
+    servers.splice(insertAt, 0, fake);
+  }
+  dns['servers'] = servers;
+  dns['fakeIp'] = {
+    'enabled': true,
+    'ipv4Pool': FAKE_IP_POOL,
+    'poolSize': FAKE_IP_POOL_SIZE,
+    'ttl': FAKE_IP_TTL
+  } as Record<string, Object>;
+  root['dns'] = dns;
+}
+
 function dohRouteRule(proxyTag: string): Object {
   return makeRule(proxyTag, [], DOH_FOREIGN_IPS, 'DoH');
 }
@@ -359,7 +420,11 @@ export function applyBuiltInRules(configJson: string, options: SplitOptions): st
     for (const candidate of inbounds) {
       const inbound: Record<string, Object> = candidate as Record<string, Object>;
       if (inbound['protocol'] === 'tun') {
-        const destOverride: Object[] = ['http', 'tls', 'quic'];
+        const fakeDns: boolean = options.domainFirst && options.ruleSet === null &&
+          (options.mode === MODE_BYPASS || options.mode === MODE_GFW);
+        const destOverride: Object[] = fakeDns
+          ? ['fakedns', 'http', 'tls', 'quic']
+          : ['http', 'tls', 'quic'];
         const sniffing: Record<string, Object> = {
           'enabled': true,
           'destOverride': destOverride
@@ -385,6 +450,7 @@ export function applyBuiltInRules(configJson: string, options: SplitOptions): st
     } else if (options.geodata) {
       applySplitDns(root);
     }
+    applyFakeDns(root, options);
 
     // "Global" wins over everything: no split rules at all, everything through
     // the node. This must stay before the rule-set branch.
