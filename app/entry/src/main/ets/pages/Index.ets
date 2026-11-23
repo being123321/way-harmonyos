@@ -2858,29 +2858,28 @@ struct Index {
         this.ssidExpanded = !this.ssidExpanded;
       })
 
-      Row() {
-        Column() {
-          Text('后台运行 VPN')
-            .fontSize(13)
-            .fontColor('#D6E4F7')
-          Text('无需添加卡片，开启后立即生效')
-            .fontSize(11)
-            .fontColor('#5C7192')
-            .margin({ top: 2 })
-        }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
-        Toggle({ type: ToggleType.Switch, isOn: this.keepAliveOnRemove })
-          .selectedColor('#54C4FF')
-          .onChange((value: boolean) => {
-            this.toggleKeepAliveOnRemove(value);
-          })
-      }
-      .width('100%')
-      .padding({ left: 12, right: 12 })
-      .margin({ top: 10 })
-
       if (this.ssidExpanded) {
+        Row() {
+          Column() {
+            Text('后台运行 VPN')
+              .fontSize(13)
+              .fontColor('#D6E4F7')
+            Text('无需添加卡片，开启后立即生效')
+              .fontSize(11)
+              .fontColor('#5C7192')
+              .margin({ top: 2 })
+          }
+          .alignItems(HorizontalAlign.Start)
+          .layoutWeight(1)
+          Toggle({ type: ToggleType.Switch, isOn: this.keepAliveOnRemove })
+            .selectedColor('#54C4FF')
+            .onChange((value: boolean) => {
+              this.toggleKeepAliveOnRemove(value);
+            })
+        }
+        .width('100%')
+        .margin({ top: 10 })
+
         Text(this.onDemand
           ? ('按 Wi-Fi 自动挂起 · 已添加 ' + this.rules.length + ' 条')
           : '关闭时只手动连接；打开后按 Wi-Fi 自动连接/挂起')
