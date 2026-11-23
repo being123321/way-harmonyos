@@ -1907,24 +1907,25 @@ struct Index {
   }
 
 
-  private toggleOnDemand(value: boolean): void {
+  // On-demand is driven by the rule list, not a separate switch: adding any
+  // rule enables it, deleting the last rule disables it.
+  private syncOnDemand(): void {
     const context = this.ctx;
     if (context === null) {
       return;
     }
-    this.onDemand = value;
-    setFlag(context, 'onDemand', value);
-    if (!value) {
-      // Turning on-demand off must not leave the app auto-reconnecting.
+    const enabled: boolean = this.rules.length > 0;
+    this.onDemand = enabled;
+    setFlag(context, 'onDemand', enabled);
+    if (!enabled) {
       setSsidSuspended(context, false);
       if (this.state === 'suspended') {
         this.state = 'stopped';
         this.message = '断开';
         this.setSwitch(false);
       }
-    } else {
-      this.refreshSsid();
     }
+    this.refreshSsid();
   }
 
   private wifiTarget(): string {
@@ -1960,6 +1961,7 @@ struct Index {
       return;
     }
     this.rules = setSsidRule(context, target, action);
+    this.syncOnDemand();
     this.manualSsid = '';
   }
 
@@ -1970,6 +1972,7 @@ struct Index {
     }
     const next: string = rule.action === SSID_SUSPEND ? SSID_DIRECT : SSID_SUSPEND;
     this.rules = setSsidRule(context, rule.ssid, next);
+    this.syncOnDemand();
   }
 
   private setCurrentWifiRule(action: string): void {
@@ -1983,6 +1986,7 @@ struct Index {
       return;
     }
     this.rules = setSsidRule(context, target, action);
+    this.syncOnDemand();
   }
 
   private deleteRule(ssid: string): void {
@@ -1991,6 +1995,7 @@ struct Index {
       return;
     }
     this.rules = removeSsidRule(context, ssid);
+    this.syncOnDemand();
   }
 
   private clearRules(): void {
@@ -2000,6 +2005,7 @@ struct Index {
     }
     clearSsidRules(context);
     this.rules = [];
+    this.syncOnDemand();
   }
 
   private cycleGeoSource(): void {
@@ -2162,7 +2168,7 @@ struct Index {
               Text('HarmonyOS 代理客户端')
                 .fontSize(12)
                 .fontColor('#5C7192')
-              Text('内核 xray-rust ' + this.coreInfo + ' · com.way.app')
+              Text('xray-rust 0.10.1 · ABI ' + this.coreInfo + ' · com.way.app')
                 .fontSize(10)
                 .fontColor('#44536B')
             }
@@ -2369,7 +2375,7 @@ struct Index {
           .fontSize(10)
           .fontColor('#4C5D77')
         Blank()
-        Text(this.isOn ? '内核 xray-rust ' + this.coreInfo : '')
+        Text(this.isOn ? 'xray-rust 0.10.1 · ABI ' + this.coreInfo : '')
           .fontSize(9)
           .fontColor('#2E3A54')
       }
@@ -2838,17 +2844,11 @@ struct Index {
         Text('按需启动')
           .fontSize(14)
           .fontColor('#A9BAD1')
-        Text(this.onDemand ? ('已加 ' + this.rules.length + ' 条') : '关闭')
+        Text(this.rules.length > 0 ? ('已加 ' + this.rules.length + ' 条') : '未添加')
           .fontSize(12)
           .fontColor('#54C4FF')
           .margin({ left: 10 })
           .layoutWeight(1)
-        Toggle({ type: ToggleType.Switch, isOn: this.onDemand })
-          .selectedColor('#54C4FF')
-          .margin({ right: 10 })
-          .onChange((value: boolean) => {
-            this.toggleOnDemand(value);
-          })
         Text(this.ssidExpanded ? '⌃' : '⌄')
           .fontSize(14)
           .fontColor('#5C7192')
@@ -2880,16 +2880,15 @@ struct Index {
         .width('100%')
         .margin({ top: 10 })
 
-        Text(this.onDemand
+        Text(this.rules.length > 0
           ? ('按 Wi-Fi 自动挂起 · 已添加 ' + this.rules.length + ' 条')
-          : '关闭时只手动连接；打开后按 Wi-Fi 自动连接/挂起')
+          : '添加 Wi-Fi 规则后启用按需启动；删除全部规则即关闭')
           .fontSize(11)
           .fontColor('#5C7192')
           .width('100%')
           .margin({ top: 6 })
 
-        if (this.onDemand) {
-          Text(this.currentWifi.length > 0 ? ('当前 Wi-Fi：' + this.currentWifi) : '当前未连接 Wi-Fi')
+        Text(this.currentWifi.length > 0 ? ('当前 Wi-Fi：' + this.currentWifi) : '当前未连接 Wi-Fi')
             .fontSize(11)
             .fontColor(this.currentWifi.length > 0 ? '#7C8FA9' : '#4C5D77')
             .width('100%')
@@ -2958,7 +2957,6 @@ struct Index {
             .width('100%')
             .margin({ top: 6 })
           }, (rule: SsidRule) => rule.ssid)
-        }
       }
     }
     .width('100%')
