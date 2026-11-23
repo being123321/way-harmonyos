@@ -1,4 +1,5 @@
 import { fileIo as fs } from '@kit.CoreFileKit';
+import { util } from '@kit.ArkTS';
 import type { common } from '@kit.AbilityKit';
 import { ensureXrayDir, xrayDir } from './Xray';
 
@@ -22,8 +23,19 @@ export function readAppLog(context: common.Context, limit: number): string {
     if (!fs.accessSync(path)) {
       return '';
     }
-    const text: string = fs.readTextSync(path);
-    return text.length > limit ? text.substring(text.length - limit) : text;
+    const size: number = fs.statSync(path).size;
+    if (size === 0) {
+      return '';
+    }
+    const readLen: number = Math.min(limit, size);
+    const buffer: ArrayBuffer = new ArrayBuffer(readLen);
+    const file = fs.openSync(path, fs.OpenMode.READ_ONLY);
+    try {
+      fs.readSync(file.fd, buffer, { offset: size - readLen, length: readLen });
+    } finally {
+      fs.closeSync(file);
+    }
+    return util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(buffer));
   } catch (error) {
     return '';
   }

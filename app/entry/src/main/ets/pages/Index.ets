@@ -136,6 +136,7 @@ struct Index {
   // the FlClash "auto-connect on launch" behaviour: the manual swipe is still a
   // full stop (no background resurrection), but the next launch restores it.
   @State autoConnect: boolean = true;
+  @State keepAliveOnRemove: boolean = false;
   private autoConnectTried: boolean = false;
   private taskId: number = -1;
   private taskNotificationId: number = -1;
@@ -429,7 +430,21 @@ struct Index {
     if (!last) {
       return;
     }
-    appLog(context, 'lifecycle', 'auto-connect on launch (lastConnected=true)');
+    const saved: string = loadConfig(context);
+    if (saved.length > 0) {
+      // Fast resume: the saved tunnel config is still valid, so reuse it and
+      // only re-acquire the task/extension. The old full connect() rebuilt the
+      // whole config, waited up to 2.5 s for notification readiness, and tried
+      // three VPN starts; after a drop that turned a 1-click restart into a
+      // visibly slow one.
+      appLog(context, 'lifecycle', 'auto-connect fast resume (saved config)');
+      this.state = 'starting';
+      this.message = '正在恢复上次连接';
+      this.setSwitch(true);
+      await this.reviveExtension();
+      return;
+    }
+    appLog(context, 'lifecycle', 'auto-connect on launch (no saved config, full connect)');
     await this.connect();
   }
 
@@ -482,6 +497,7 @@ struct Index {
     // If the widget-preview TempAbility owns the task, the UI must not request
     // another one (that was the source of the duplicate notification).
     this.keepAliveOwnedByTemp = wayStore.getSync('tempKeepAlive', false) as boolean;
+    this.keepAliveOnRemove = wayStore.getSync('keepAliveOnRemove', false) as boolean;
     // Routing is controlled by the mode buttons alone: a stale false here used
     // to disable every rule silently, which sent domestic apps through the node.
     this.splitOn = true;
@@ -1102,6 +1118,9 @@ struct Index {
         await this.connect();
         return;
       }
+      if (this.notifyMe) {
+        await this.ensureNotifyReady(600);
+      }
       if (!this.keepAliveStarted) {
         await this.startKeepAliveTask();
       }
@@ -1318,6 +1337,14 @@ struct Index {
     } else if (op === 'disconnect') {
       this.disconnect().catch((): void => {
       });
+    } else if (op === 'keepaliveOff') {
+      this.stopTempAbility();
+      this.keepAliveOwnedByTemp = false;
+      this.keepAliveStarted = false;
+      this.taskNotificationId = -1;
+      this.reviveTask().catch((): void => {
+      });
+      promptAction.showToast({ message: '保底测试已关闭' });
     }
   }
 
@@ -1683,29 +1710,45 @@ struct Index {
       if (!active) {
         // Explicit switch-off ends the widget-preview keepalive owner too.
         store.putSync('tempKeepAlive', false);
+        store.putSync('tempStartedAt', 0);
       }
       await store.flush();
     } catch (error) {
     }
   }
 
-  // The windowless TempAbility owns the continuous task, so destroying the main
-  // window no longer drops it (which used to kill the process and the tunnel).
-  private async startTempAbility(): Promise<void> {
+  // FlClash's "remove from recents" switch. ON = keep the VPN service alive
+  // when the main task is removed, and allow the widget/negatives-screen card
+  // to wake the hidden TempAbility. OFF = stop TempAbility and let onDestroy
+  // perform the normal full stop.
+  private async toggleKeepAliveOnRemove(value: boolean): Promise<void> {
+    this.keepAliveOnRemove = value;
     const context = this.ctx;
     if (context === null) {
       return;
     }
     try {
-      const want: Want = {
-        bundleName: 'com.way.app',
-        abilityName: 'TempAbility'
-      };
-      await context.startAbility(want);
-      appLog(context, 'ui', 'temp ability started');
+      const way = await preferences.getPreferences(context, 'way');
+      way.putSync('keepAliveOnRemove', value);
+      await way.flush();
     } catch (error) {
-      const err = error as BusinessError;
-      appLog(context, 'ui', 'temp ability failed: ' + (err.message ?? 'unknown'));
+    }
+    if (value) {
+      appLog(context, 'lifecycle', 'background-vpn ON: VPN kept after task removal');
+      // FlClash-style entry: open the system card preview directly. No start
+      // button and no "去添加/稍后" dialog; the card shows the way logo, and
+      // leaving the preview is enough.
+      promptAction.showToast({ message: '直接取消不影响开启功能', duration: 4000 });
+      this.openKeepAliveForm();
+    } else {
+      appLog(context, 'lifecycle', 'remove-from-recents OFF: stopping TempAbility');
+      this.stopTempAbility();
+      this.keepAliveOwnedByTemp = false;
+      this.keepAliveStarted = false;
+      this.taskNotificationId = -1;
+      this.reviveTask().catch((): void => {
+      });
+      promptAction.showToast({ message: '已关闭：后台运行 VPN 将停止' });
     }
   }
 
@@ -2759,6 +2802,27 @@ struct Index {
       .onClick(() => {
         this.ssidExpanded = !this.ssidExpanded;
       })
+
+      Row() {
+        Column() {
+          Text('后台运行 VPN')
+            .fontSize(13)
+            .fontColor('#D6E4F7')
+          Text('直接取消不影响开启功能')
+            .fontSize(11)
+            .fontColor('#5C7192')
+            .margin({ top: 2 })
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+        Toggle({ type: ToggleType.Switch, isOn: this.keepAliveOnRemove })
+          .selectedColor('#54C4FF')
+          .onChange((value: boolean) => {
+            this.toggleKeepAliveOnRemove(value);
+          })
+      }
+      .width('100%')
+      .margin({ top: 10 })
 
       if (this.ssidExpanded) {
         Text(this.onDemand

@@ -212,6 +212,9 @@ function applyDohDns(root: Record<string, Object>, geodata: boolean): void {
 const FAKE_IP_POOL: string = '198.19.0.0/16';
 const FAKE_IP_POOL_SIZE: number = 60000;
 const FAKE_IP_TTL: number = 300;
+// The delay/liveness probe is a hostname; it must not be faked. Give these
+// domains a real resolver before fakedns, matching v2rayNG's gstatic target.
+const PROBE_DOMAINS: string[] = ['domain:gstatic.com', 'domain:www.gstatic.com', 'domain:google.com'];
 
 function applyFakeDns(root: Record<string, Object>, options: SplitOptions): void {
   if (!options.domainFirst || options.ruleSet !== null) {
@@ -229,12 +232,17 @@ function applyFakeDns(root: Record<string, Object>, options: SplitOptions): void
   if (servers.length === 0) {
     return;
   }
+  const probeReal: Record<string, Object> = {
+    'address': options.doh ? DOH_DOMESTIC : '223.5.5.5',
+    'domains': PROBE_DOMAINS
+  };
   const fake: Record<string, Object> = { 'address': 'fakedns' };
   if (options.mode === MODE_GFW) {
     // Only the curated proxy list is faked; everything else keeps the real
     // resolver and the direct catch-all.
     fake['domains'] = GFW_SUFFIXES;
     servers.unshift(fake);
+    servers.unshift(probeReal);
   } else {
     // bypass: the domestic server is first and only matches geosite:cn. Put
     // fakedns right after it so non-CN domains get a fake IP and CN domains
@@ -247,7 +255,7 @@ function applyFakeDns(root: Record<string, Object>, options: SplitOptions): void
         insertAt = i + 1;
       }
     }
-    servers.splice(insertAt, 0, fake);
+    servers.splice(insertAt, 0, probeReal, fake);
   }
   dns['servers'] = servers;
   dns['fakeIp'] = {

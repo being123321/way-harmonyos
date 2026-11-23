@@ -1244,7 +1244,7 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
   private async probeLiveness(): Promise<void> {
     try {
       const raw: string =
-        JSON.stringify(await native.probeOutbound('http://1.1.1.1/', 8000, '') as Object);
+        JSON.stringify(await native.probeOutbound('https://www.gstatic.com/generate_204', 8000, '') as Object);
       const result: Record<string, Object> = JSON.parse(raw) as Record<string, Object>;
       const failureKind: number = (result['failureKind'] as number) ?? 1;
       if (failureKind !== 0) {

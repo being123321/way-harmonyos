@@ -1,4 +1,5 @@
 import { fileIo as fs } from '@kit.CoreFileKit';
+import { util } from '@kit.ArkTS';
 import { commonEventManager } from '@kit.BasicServicesKit';
 import { vpnExtension } from '@kit.NetworkKit';
 import { common } from '@kit.AbilityKit';
@@ -824,9 +825,23 @@ export function readLogs(context: common.Context, limit: number): string {
         continue;
       }
       try {
-        const text: string = fs.readTextSync(path);
-        const tail: string = text.length > budget ? text.substring(text.length - budget) : text;
-        parts.push('== ' + name + ' ==\n' + tail);
+        // Read only the tail. Reading the whole file and then substring-ing it
+        // made every 3 s log refresh allocate a string the size of the debug
+        // log; with routeDecision logging that file grows fast, so memory and
+        // GC pressure climbed with uptime.
+        const size: number = fs.statSync(path).size;
+        if (size > 0) {
+          const readLen: number = Math.min(budget, size);
+          const buffer: ArrayBuffer = new ArrayBuffer(readLen);
+          const file = fs.openSync(path, fs.OpenMode.READ_ONLY);
+          try {
+            fs.readSync(file.fd, buffer, { offset: size - readLen, length: readLen });
+          } finally {
+            fs.closeSync(file);
+          }
+          const tail: string = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(buffer));
+          parts.push('== ' + name + ' ==\n' + tail);
+        }
       } catch (error) {
       }
     }

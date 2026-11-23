@@ -3,15 +3,20 @@
     {
       "name": "way_widget",
       "displayName": "way 快捷开关",
-      "description": "不需要添加至桌面或负一屏。\n进入此页面直接退出即可。",
+      "description": "先在 App 开启「后台运行 VPN」，进入此页面直接退出即可；直接取消不影响开启功能，不需要把卡片加到桌面。",
       "src": "./ets/card/WidgetCard.ets",
       "uiSyntax": "arkts",
-      "window": { "designWidth": 720, "autoDesignWidth": true },
+      "window": {
+        "designWidth": 720,
+        "autoDesignWidth": true
+      },
       "colorMode": "auto",
       "isDefault": true,
       "updateEnabled": false,
       "defaultDimension": "2*2",
-      "supportDimensions": ["2*2"]
+      "supportDimensions": [
+        "2*2"
+      ]
     }
   ]
 }

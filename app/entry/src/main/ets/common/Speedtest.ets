@@ -15,11 +15,11 @@ import { udpQuicLatency } from './Latency';
 export const TEST_CONCURRENCY: number = 4;
 export const TEST_TIMEOUT_MS: number = 6000;
 
-// Plain HTTP on an IP literal: with domain-first FakeDNS a hostname probe would
-// get a fake IP and never reach the target, so the probe must not need DNS.
-// 1.1.1.1 is an anycast IP (no resolver on either side); TLS would add two
-// round trips unrelated to how the node relays traffic.
-const TEST_URL: string = 'http://1.1.1.1/';
+// v2rayNG's default delay-test target (DELAY_TEST_URL). The domain gets a real
+// IP because Rules.applyFakeDns installs a real-DNS exception for
+// gstatic.com/google.com before fakedns; without that exception FakeDNS would
+// hand the probe a fake IP.
+const TEST_URL: string = 'https://www.gstatic.com/generate_204';
 export const TEST_HOST: string = '';
 
 export const VIA_HTTP: string = 'http';

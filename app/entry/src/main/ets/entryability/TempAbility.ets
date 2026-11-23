@@ -79,8 +79,16 @@ export default class TempAbility extends UIAbility {
       const last: boolean = way.getSync('lastConnected', false) as boolean;
       const userOff: boolean = way.getSync('userOff', false) as boolean;
       const suspended: boolean = way.getSync('ssidSuspended', false) as boolean;
+      const enabled: boolean = way.getSync('keepAliveOnRemove', false) as boolean;
       appLog(this.context, 'keepalive',
-        'arm: active=' + active + ' last=' + last + ' userOff=' + userOff + ' suspended=' + suspended);
+        'arm: active=' + active + ' last=' + last + ' userOff=' + userOff + ' suspended=' + suspended +
+        ' keepOnRemove=' + enabled);
+      if (!enabled) {
+        appLog(this.context, 'keepalive', 'widget trigger ignored: "remove from recents" switch off');
+        this.context.terminateSelf().catch((): void => {
+        });
+        return;
+      }
       if (userOff || suspended || (!active && !last)) {
         appLog(this.context, 'keepalive', 'widget trigger ignored: intent off');
         this.context.terminateSelf().catch((): void => {
@@ -136,6 +144,8 @@ export default class TempAbility extends UIAbility {
       }
       // From here the TempAbility owns the keepalive.
       way.putSync('tempKeepAlive', true);
+      way.putSync('tempStartedAt', Date.now());
+      way.putSync('tempHeartbeat', Date.now());
       await way.flush();
       try {
         const data: commonEventManager.CommonEventPublishData = { parameters: {} };
@@ -160,9 +170,12 @@ export default class TempAbility extends UIAbility {
     });
   }
 
-  private clearKeepAliveFlag(): void {    try {
+  private clearKeepAliveFlag(): void {
+    try {
       const way = preferences.getPreferencesSync(this.context, { name: 'way' });
       way.putSync('tempKeepAlive', false);
+      way.putSync('tempStartedAt', 0);
+      way.putSync('tempHeartbeat', 0);
       way.flush();
     } catch (error) {
     }
@@ -310,6 +323,11 @@ export default class TempAbility extends UIAbility {
       if (way.getSync('ssidSuspended', false) as boolean) {
         return;
       }
+      // Proof of life for the hidden ability: the UI's Check button requires a
+      // recent heartbeat, not just the persisted tempKeepAlive flag (a hard
+      // kill can leave that flag set).
+      way.putSync('tempHeartbeat', Date.now());
+      await way.flush();
       const status = readStatus(this.context);
       const now: number = Date.now();
       // 12 s, not the UI's 5 s: a network switch can block native.rebind() and

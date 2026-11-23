@@ -36,7 +36,8 @@ struct WidgetCard {
     // FlClash-style trigger: the launcher previews this card in the widget
     // picker before it is added. onAppear fires there too, so merely opening
     // the picker and exiting arms the keepalive ability; the card itself does
-    // not need to stay on the desktop.
+    // not need to stay on the desktop. TempAbility checks the "remove from
+    // recents" switch (keepAliveOnRemove) before doing anything.
     .onAppear(() => {
       postCardAction(this, {
         action: 'call',

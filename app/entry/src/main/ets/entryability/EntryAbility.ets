@@ -83,7 +83,12 @@ export default class EntryAbility extends UIAbility {
   private tempKeepAliveActive(): boolean {
     try {
       const way = preferences.getPreferencesSync(this.context, { name: 'way' });
-      return way.getSync('tempKeepAlive', false) as boolean;
+      // FlClash's "remove from recents" switch keeps the VPN service alive even
+      // before the widget has armed TempAbility; TempAbility itself is gated by
+      // the same flag.
+      const temp: boolean = way.getSync('tempKeepAlive', false) as boolean;
+      const keepOnRemove: boolean = way.getSync('keepAliveOnRemove', false) as boolean;
+      return temp || keepOnRemove;
     } catch (error) {
       return false;
     }
