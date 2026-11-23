@@ -110,10 +110,14 @@ struct Index {
   private prevDown: number = 0;
   private prevStamp: number = 0;
   private trafficSubscriber: commonEventManager.CommonEventSubscriber | null = null;
+  private takeoverSubscriber: commonEventManager.CommonEventSubscriber | null = null;
   // 连接前解析好的节点服务器地址（写进 config 的 dns.hosts）。
   private bootstrapHosts: Record<string, string[]> | null = null;
   private usedFallback: boolean = false;
   private keepAliveStarted: boolean = false
+  // True while the widget-preview TempAbility owns the continuous task; the UI
+  // must not request a second task (that produced two notifications).
+  private keepAliveOwnedByTemp: boolean = false;
   // Watchdog for the extension heartbeat: lastBeatAt is the extension's own
   // status.updatedAt, lastStartRequestAt is when this UI last asked the system
   // to launch it. Recovery is bounded (RECOVERY_MAX_ATTEMPTS) with backoff.
@@ -180,6 +184,7 @@ struct Index {
       promptAction.showToast({ message: '读取设置失败' });
     });
     this.watchNetworkChanges();
+    this.watchKeepAliveTakeover();
     this.startPolling();
   }
 
@@ -252,6 +257,7 @@ struct Index {
     this.stopPolling();
     this.unsubscribeTraffic();
     this.unwatchNetworkChanges();
+    this.unwatchKeepAliveTakeover();
   }
 
   // Observe network changes so a switch (Wi-Fi <-> cellular) pauses the
@@ -294,6 +300,45 @@ struct Index {
       try {
         conn.unregister(() => {
         });
+      } catch (error) {
+      }
+    }
+  }
+
+  // The widget-preview TempAbility publishes this before it requests its own
+  // continuous task. Release the UI's task first, otherwise both tasks show a
+  // notification (the system task card + the live view).
+  private async watchKeepAliveTakeover(): Promise<void> {
+    if (this.takeoverSubscriber !== null) {
+      return;
+    }
+    try {
+      const sub: commonEventManager.CommonEventSubscriber =
+        await commonEventManager.createSubscriber({ events: ['com.way.app.KEEPALIVE_TAKEOVER'] });
+      commonEventManager.subscribe(sub, () => {
+        this.keepAliveOwnedByTemp = true;
+        if (this.keepAliveStarted) {
+          this.keepAliveStarted = false;
+          this.taskNotificationId = -1;
+          const context = this.ctx;
+          if (context !== null) {
+            backgroundTaskManager.stopBackgroundRunning(context).catch((): void => {
+            });
+            appLog(context, 'keepalive', 'TempAbility took over the continuous task');
+          }
+        }
+      });
+      this.takeoverSubscriber = sub;
+    } catch (error) {
+    }
+  }
+
+  private unwatchKeepAliveTakeover(): void {
+    const sub = this.takeoverSubscriber;
+    this.takeoverSubscriber = null;
+    if (sub !== null) {
+      try {
+        commonEventManager.unsubscribe(sub);
       } catch (error) {
       }
     }
@@ -466,6 +511,9 @@ struct Index {
     const wayStore = await preferences.getPreferences(context, 'way');
     this.intentOn = (wayStore.getSync('vpnActive', false) as boolean) &&
       !(wayStore.getSync('userOff', false) as boolean);
+    // If the widget-preview TempAbility owns the task, the UI must not request
+    // another one (that was the source of the duplicate notification).
+    this.keepAliveOwnedByTemp = wayStore.getSync('tempKeepAlive', false) as boolean;
     // Routing is controlled by the mode buttons alone: a stale false here used
     // to disable every rule silently, which sent domestic apps through the node.
     this.splitOn = true;
@@ -972,7 +1020,7 @@ struct Index {
       // An SSID suspension stops the task; a resumed tunnel needs its single
       // live-view card back (the extension cannot request it on its own).
       if (status.state === 'running' && !stale && !this.keepAliveStarted &&
-        now - this.lastNotifRefreshAt > 3000) {
+        !this.keepAliveOwnedByTemp && now - this.lastNotifRefreshAt > 3000) {
         this.lastNotifRefreshAt = now;
         this.reviveTask().catch(() => {
         });
@@ -1636,6 +1684,11 @@ struct Index {
     if (context === null) {
       return -1;
     }
+    // The widget-preview TempAbility owns the single continuous task; asking
+    // for another one is what produced two notifications.
+    if (this.keepAliveOwnedByTemp) {
+      return -1;
+    }
     if (this.keepAliveStarted && this.taskNotificationId >= 0) {
       return this.taskNotificationId;
     }
@@ -1696,6 +1749,11 @@ struct Index {
       (cancelInfo: backgroundTaskManager.ContinuousTaskCancelInfo) => {
         const context = this.ctx;
         if (context === null) {
+          return;
+        }
+        if (this.keepAliveOwnedByTemp) {
+          // Expected: we released our task on purpose for the TempAbility.
+          appLog(context, 'ui', 'continuous task canceled (owned by TempAbility)');
           return;
         }
         appLog(context, 'ui', 'continuous task canceled, reviving');
@@ -1873,6 +1931,7 @@ struct Index {
     this.stopKeepAliveTask();
     this.markActive(false);
     this.stopTempAbility();
+    this.keepAliveOwnedByTemp = false;
     PipManager.getInstance().setAutoStart(context, false);
     PipManager.getInstance().stop();
     // Turning the switch off on a suspended Wi-Fi means "off", not "suspend

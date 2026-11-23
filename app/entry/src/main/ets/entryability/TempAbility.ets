@@ -75,6 +75,15 @@ export default class TempAbility extends UIAbility {
       // must not stop a VPN that this keepalive ability owns.
       way.putSync('tempKeepAlive', true);
       await way.flush();
+      // Ask the UI to release its continuous task first. Two tasks would show
+      // two notifications (system task card + live view).
+      try {
+        const data: commonEventManager.CommonEventPublishData = { parameters: {} };
+        commonEventManager.publish('com.way.app.KEEPALIVE_TAKEOVER', data, () => {
+        });
+      } catch (error) {
+      }
+      await this.delay(600);
       const notifId: number = await this.acquire();
       const entry = selectedEntry(this.context);
       const name: string = entry === null ? '' : entry.name;
@@ -88,8 +97,15 @@ export default class TempAbility extends UIAbility {
     }
   }
 
-  private clearKeepAliveFlag(): void {
-    try {
+  private delay(ms: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      setTimeout(() => {
+        resolve();
+      }, ms);
+    });
+  }
+
+  private clearKeepAliveFlag(): void {    try {
       const way = preferences.getPreferencesSync(this.context, { name: 'way' });
       way.putSync('tempKeepAlive', false);
       way.flush();
