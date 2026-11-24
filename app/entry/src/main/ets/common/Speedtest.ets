@@ -1,6 +1,6 @@
 import { socket } from '@kit.NetworkKit';
 import { ConfigEntry } from './Store';
-import { NodeEndpoint, cancelProbes, nodeEndpoint, probeOutbound } from './Xray';
+import { NodeEndpoint, OutboundProbeResult, OutboundProbeSpec, cancelProbes, nodeEndpoint, probeOutbound, probeProfiles } from './Xray';
 import { udpQuicLatency } from './Latency';
 
 // Delay test, modelled on v2rayNG:
@@ -12,8 +12,8 @@ import { udpQuicLatency } from './Latency';
 //   * not connected -> a TCP handshake (or a UDP/QUIC probe for UDP-only nodes
 //     such as Hysteria2) to the node itself, since there is no tunnel to use;
 //   * four probes at a time, four seconds each, results ordered by delay.
-export const TEST_CONCURRENCY: number = 4;
-export const TEST_TIMEOUT_MS: number = 6000;
+export const TEST_CONCURRENCY: number = 16;
+export const TEST_TIMEOUT_MS: number = 4000;
 
 // v2rayNG's default delay-test target (DELAY_TEST_URL). The domain gets a real
 // IP because Rules.applyFakeDns installs a real-DNS exception for
@@ -164,6 +164,33 @@ async function drain(entries: ConfigEntry[], cursor: TestCursor, viaTunnel: bool
     cursor.value = index + 1;
     const entry: ConfigEntry = entries[index];
     const result: LatencyResult = await testOne(entry, viaTunnel, tagOf(probeTags, entry.id));
+    onResult(result);
+  }
+}
+
+// v2rayNG-style speed test: probes through a temporary TUN-less core built from
+// the supplied tunnel config. The live tunnel/core are untouched.
+export async function testAllConfig(entries: ConfigEntry[], configJson: string,
+  geodataDir: string, onResult: (result: LatencyResult) => void): Promise<void> {
+  const probes: OutboundProbeSpec[] = [];
+  for (const entry of entries) {
+    probes.push({ tag: entry.id, url: TEST_URL, timeoutMs: TEST_TIMEOUT_MS });
+  }
+  let results: OutboundProbeResult[] = [];
+  try {
+    results = await probeProfiles(configJson, probes, geodataDir);
+  } catch (error) {
+  }
+  for (let i = 0; i < entries.length; i++) {
+    const entry: ConfigEntry = entries[i];
+    const probe: OutboundProbeResult | null = i < results.length ? results[i] : null;
+    const ok: boolean = probe !== null && probe.status === 0 && probe.failureKind === 0 && probe.delayMs > 0;
+    const result: LatencyResult = {
+      id: entry.id,
+      ms: ok && probe !== null ? probe.delayMs : -1,
+      via: VIA_HTTP,
+      at: Date.now()
+    };
     onResult(result);
   }
 }

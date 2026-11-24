@@ -10,6 +10,8 @@
 #include <shared_mutex>
 #include <string>
 #include <vector>
+#include <thread>
+#include <atomic>
 
 #include "xray_ffi.h"
 
@@ -531,6 +533,224 @@ napi_value ProbeOutbound(napi_env env, napi_callback_info info) {
   return promise;
 }
 
+
+// v2rayNG-style speed test: build a temporary core from a TUN-less config
+// (the profile outbounds only), probe each tagged outbound, then tear it down.
+// The live tunnel/core are untouched, so the router and the running VPN keep
+// their state while the node list is being measured.
+struct ProfileProbeSpec {
+  std::string tag;
+  std::string url;
+  int32_t timeoutMs = 8000;
+};
+
+struct ProfileProbeOutcome {
+  std::string tag;
+  int32_t status = -1;
+  uint64_t delayMs = 0;
+  int32_t failureKind = 0;
+  uint16_t httpStatus = 0;
+  std::string message;
+};
+
+struct ProfileProbeWork {
+  std::string config;
+  std::string geodata;
+  std::string error;
+  std::vector<ProfileProbeSpec> specs;
+  std::vector<ProfileProbeOutcome> outcomes;
+  napi_deferred deferred = nullptr;
+  napi_async_work work = nullptr;
+};
+
+void ProbeProfilesExecute(napi_env, void *data) {
+  auto *w = static_cast<ProfileProbeWork *>(data);
+  XrayError *err = nullptr;
+  XrayCoreHandle *core = xray_core_new(&err);
+  if (core == nullptr) {
+    w->error = "xray_core_new failed: " + TakeError(&err, "unknown error");
+    return;
+  }
+  if (!w->geodata.empty()) {
+    xray_core_set_geodata_search_dir(core, w->geodata.c_str(), &err);
+  }
+  if (xray_core_load_config_json(core, w->config.c_str(), &err) != XRAY_STATUS_OK) {
+    w->error = "probe config rejected: " + TakeError(&err, "config error");
+    xray_core_free(core);
+    return;
+  }
+  if (xray_core_start(core, &err) != XRAY_STATUS_OK) {
+    w->error = "probe core start failed: " + TakeError(&err, "start error");
+    xray_core_stop(core, &err);
+    xray_core_free(core);
+    return;
+  }
+  // v2rayN-style: probe many outbounds at once instead of one by one.
+  w->outcomes.resize(w->specs.size());
+  std::atomic<size_t> next{0};
+  auto worker = [&]() {
+    for (;;) {
+      const size_t index = next.fetch_add(1);
+      if (index >= w->specs.size()) {
+        return;
+      }
+      const auto &spec = w->specs[index];
+      ProfileProbeOutcome o;
+      o.tag = spec.tag;
+      XrayError *probeErr = nullptr;
+      uint64_t delayMs = 0;
+      int32_t failureKind = 0;
+      uint16_t httpStatus = 0;
+      o.status = static_cast<int32_t>(xray_core_probe_outbound_url(
+          core, spec.url.c_str(), static_cast<uint64_t>(spec.timeoutMs),
+          spec.tag.empty() ? nullptr : spec.tag.c_str(), &delayMs, &failureKind,
+          &httpStatus, &probeErr));
+      o.delayMs = delayMs;
+      o.failureKind = failureKind;
+      o.httpStatus = httpStatus;
+      if (o.status != static_cast<int32_t>(XRAY_STATUS_OK)) {
+        o.message = TakeError(&probeErr, "probe error");
+      }
+      w->outcomes[index] = o;
+    }
+  };
+  const size_t hardware = std::thread::hardware_concurrency();
+  size_t workers = hardware == 0 ? 8 : hardware * 2;
+  if (workers < 8) workers = 8;
+  if (workers > 24) workers = 24;
+  if (workers > w->specs.size()) workers = w->specs.size();
+  std::vector<std::thread> threads;
+  for (size_t i = 0; i < workers; i++) {
+    threads.emplace_back(worker);
+  }
+  for (auto &t : threads) {
+    t.join();
+  }
+  xray_core_stop(core, &err);
+  xray_core_free(core);
+}
+
+void ProbeProfilesComplete(napi_env env, napi_status status, void *data) {
+  auto *w = static_cast<ProfileProbeWork *>(data);
+  if (status == napi_ok && w->deferred != nullptr) {
+    if (!w->error.empty()) {
+      napi_value msg = nullptr;
+      napi_create_string_utf8(env, w->error.c_str(), NAPI_AUTO_LENGTH, &msg);
+      napi_reject_deferred(env, w->deferred, msg);
+    } else {
+      napi_value array = nullptr;
+      napi_create_array_with_length(env, w->outcomes.size(), &array);
+      for (size_t i = 0; i < w->outcomes.size(); i++) {
+        const auto &o = w->outcomes[i];
+        napi_value item = nullptr;
+        napi_create_object(env, &item);
+        auto setNum = [env, item](const char *name, int32_t value) {
+          napi_value v = nullptr;
+          napi_create_int32(env, value, &v);
+          napi_set_named_property(env, item, name, v);
+        };
+        napi_value tag = nullptr;
+        napi_create_string_utf8(env, o.tag.c_str(), o.tag.size(), &tag);
+        napi_set_named_property(env, item, "tag", tag);
+        setNum("status", o.status);
+        setNum("delayMs", static_cast<int32_t>(o.delayMs));
+        setNum("failureKind", o.failureKind);
+        setNum("httpStatus", static_cast<int32_t>(o.httpStatus));
+        napi_value message = nullptr;
+        napi_create_string_utf8(env, o.message.c_str(), o.message.size(), &message);
+        napi_set_named_property(env, item, "message", message);
+        napi_set_element(env, array, static_cast<uint32_t>(i), item);
+      }
+      napi_resolve_deferred(env, w->deferred, array);
+    }
+  }
+  if (w->work != nullptr) {
+    napi_delete_async_work(env, w->work);
+  }
+  delete w;
+}
+
+// probeProfiles(configJson, probes, geodataDir?)
+// - configJson: the full tunnel JSON with inbounds removed
+// - probes: [{tag,url,timeoutMs}]
+// - geodataDir: optional geosite/geoip search dir
+napi_value ProbeProfiles(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 2) {
+    return Throw(env, "probeProfiles(configJson, probes, geodataDir?)");
+  }
+  std::string config;
+  if (!GetUtf8(env, argv[0], &config)) {
+    return Throw(env, "probeProfiles: config must be a string");
+  }
+  bool isArray = false;
+  if (napi_is_array(env, argv[1], &isArray) != napi_ok || !isArray) {
+    return Throw(env, "probeProfiles: probes must be an array");
+  }
+  uint32_t count = 0;
+  napi_get_array_length(env, argv[1], &count);
+  auto *work = new ProfileProbeWork();
+  work->config = config;
+  if (argc > 2 && argv[2] != nullptr) {
+    napi_valuetype type = napi_undefined;
+    napi_typeof(env, argv[2], &type);
+    if (type == napi_string) {
+      GetUtf8(env, argv[2], &work->geodata);
+    }
+  }
+  for (uint32_t i = 0; i < count; i++) {
+    napi_value item = nullptr;
+    if (napi_get_element(env, argv[1], i, &item) != napi_ok || item == nullptr) {
+      continue;
+    }
+    ProfileProbeSpec spec;
+    napi_value tag = nullptr;
+    napi_value url = nullptr;
+    napi_value timeout = nullptr;
+    if (napi_get_named_property(env, item, "tag", &tag) == napi_ok) {
+      GetUtf8(env, tag, &spec.tag);
+    }
+    if (napi_get_named_property(env, item, "url", &url) == napi_ok) {
+      GetUtf8(env, url, &spec.url);
+    }
+    if (napi_get_named_property(env, item, "timeoutMs", &timeout) == napi_ok) {
+      napi_valuetype t = napi_undefined;
+      napi_typeof(env, timeout, &t);
+      if (t == napi_number) {
+        napi_get_value_int32(env, timeout, &spec.timeoutMs);
+      }
+    }
+    if (spec.url.empty()) {
+      continue;
+    }
+    if (spec.timeoutMs < 1) spec.timeoutMs = 1;
+    if (spec.timeoutMs > 60000) spec.timeoutMs = 60000;
+    work->specs.push_back(spec);
+  }
+  napi_value promise = nullptr;
+  napi_deferred deferred = nullptr;
+  if (napi_create_promise(env, &deferred, &promise) != napi_ok) {
+    delete work;
+    return Throw(env, "probeProfiles: cannot create promise");
+  }
+  work->deferred = deferred;
+  napi_value resourceName = nullptr;
+  napi_create_string_utf8(env, "xrayProbeProfiles", NAPI_AUTO_LENGTH, &resourceName);
+  if (napi_create_async_work(env, nullptr, resourceName, ProbeProfilesExecute,
+                             ProbeProfilesComplete, work, &work->work) != napi_ok ||
+      napi_queue_async_work(env, work->work) != napi_ok) {
+    if (work->work != nullptr) {
+      napi_delete_async_work(env, work->work);
+    }
+    delete work;
+    napi_value msg = nullptr;
+    napi_create_string_utf8(env, "probeProfiles: cannot queue work", NAPI_AUTO_LENGTH, &msg);
+    napi_reject_deferred(env, deferred, msg);
+  }
+  return promise;
+}
+
 // Live connection inventory of the running core: one JSON document with
 // {schemaVersion, revision, connections:[{id,state,inboundTag,outboundTag,
 // network,addressType,address,port,startedUnixMs}]}.
@@ -658,6 +878,7 @@ static napi_value Init(napi_env env, napi_value exports) {
       {"rebind", nullptr, Rebind, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"probe", nullptr, Probe, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"probeOutbound", nullptr, ProbeOutbound, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"probeProfiles", nullptr, ProbeProfiles, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"cancelProbes", nullptr, ProbeCancel, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"replaceRouting", nullptr, ReplaceRouting, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"connectionSnapshot", nullptr, ConnectionSnapshot, nullptr, nullptr, nullptr, napi_default, nullptr},

@@ -84,6 +84,8 @@ const RELOAD_RESULT_EVENT: string = 'com.way.app.RELOAD_ROUTING_RESULT';
 const CONN_REQUEST_EVENT: string = 'com.way.app.CONNECTIONS';
 const CONN_RESULT_EVENT: string = 'com.way.app.CONNECTIONS_RESULT';
 const PROBE_RESULT_EVENT: string = 'com.way.app.PROBE_RESULT';
+const PROBE_PROFILES_REQUEST_EVENT: string = 'com.way.app.PROBE_PROFILES';
+const PROBE_PROFILES_RESULT_EVENT: string = 'com.way.app.PROBE_PROFILES_RESULT';
 
 export default class XrayVpnAbility extends VpnExtensionAbility {
   private conn: vpnExtension.VpnConnection | null = null;
@@ -102,6 +104,7 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
   private taskNotificationId: number = -1;
   private taskIdSubscriber: commonEventManager.CommonEventSubscriber | null = null;
   private probeSubscriber: commonEventManager.CommonEventSubscriber | null = null;
+  private probeProfilesSubscriber: commonEventManager.CommonEventSubscriber | null = null;
   private probeCancelSubscriber: commonEventManager.CommonEventSubscriber | null = null;
   private reloadSubscriber: commonEventManager.CommonEventSubscriber | null = null;
   private pssKb: number = 0;
@@ -125,6 +128,7 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
   onCreate(want: Want): void {
     this.bindHandlers(want);
     this.watchProbeRequests();
+    this.watchProbeProfilesRequests();
     this.watchProbeCancelRequests();
     this.watchReloadRequests();
     this.watchConnectionRequests();
@@ -957,12 +961,65 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
     }
   }
 
+  // v2rayNG-style speed test: the UI sends a TUN-less config plus the probe
+  // list; this process builds a temporary core, probes each tagged outbound,
+  // frees it, and returns the results. The live core/tunnel are untouched.
+  private async watchProbeProfilesRequests(): Promise<void> {
+    if (this.probeProfilesSubscriber !== null) {
+      return;
+    }
+    try {
+      const sub: commonEventManager.CommonEventSubscriber = await commonEventManager.createSubscriber({
+        events: [PROBE_PROFILES_REQUEST_EVENT]
+      });
+      commonEventManager.subscribe(sub, (error, data) => {
+        if (error !== undefined && error !== null && error.code !== 0) return;
+        const params: Record<string, Object> = data.parameters as Record<string, Object>;
+        if (params === undefined || params === null) return;
+        const requestId: string = (params['requestId'] as string) ?? '';
+        const config: string = (params['config'] as string) ?? '';
+        const probesRaw: string = (params['probes'] as string) ?? '[]';
+        const geodataDir: string = (params['geodataDir'] as string) ?? '';
+        this.runProbeProfiles(requestId, config, probesRaw, geodataDir);
+      });
+      this.probeProfilesSubscriber = sub;
+    } catch (error) {
+      this.appendLog('profiles probe watch failed: ' + JSON.stringify(error));
+    }
+  }
+
+  private async runProbeProfiles(requestId: string, config: string, probesRaw: string,
+    geodataDir: string): Promise<void> {
+    if (requestId.length === 0 || config.length === 0) return;
+    let results: string = '[]';
+    try {
+      const probes: Object[] = JSON.parse(probesRaw) as Object[];
+      results = JSON.stringify(await native.probeProfiles(config, probes, geodataDir) as Object);
+    } catch (error) {
+      this.appendLog('probeProfiles exception: ' + JSON.stringify(error));
+    }
+    const params: Record<string, Object> = { 'requestId': requestId, 'results': results };
+    const data: commonEventManager.CommonEventPublishData = { parameters: params };
+    try {
+      commonEventManager.publish(PROBE_PROFILES_RESULT_EVENT, data, () => {});
+    } catch (error) {
+    }
+  }
+
   private stopProbeWatch(): void {
     const sub = this.probeSubscriber;
     this.probeSubscriber = null;
     if (sub !== null) {
       try {
         commonEventManager.unsubscribe(sub);
+      } catch (error) {
+      }
+    }
+    const profilesSub = this.probeProfilesSubscriber;
+    this.probeProfilesSubscriber = null;
+    if (profilesSub !== null) {
+      try {
+        commonEventManager.unsubscribe(profilesSub);
       } catch (error) {
       }
     }

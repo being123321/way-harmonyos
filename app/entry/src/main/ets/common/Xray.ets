@@ -40,6 +40,8 @@ export const RELOAD_RESULT_EVENT: string = 'com.way.app.RELOAD_ROUTING_RESULT';
 export const CONN_REQUEST_EVENT: string = 'com.way.app.CONNECTIONS';
 export const CONN_RESULT_EVENT: string = 'com.way.app.CONNECTIONS_RESULT';
 export const PROBE_RESULT_EVENT: string = 'com.way.app.PROBE_RESULT';
+export const PROBE_PROFILES_REQUEST_EVENT: string = 'com.way.app.PROBE_PROFILES';
+export const PROBE_PROFILES_RESULT_EVENT: string = 'com.way.app.PROBE_PROFILES_RESULT';
 // Cancels the probes already in flight (ABI 1.15): the UI sends this when a new
 // run starts or the node page closes, so stale probes stop early instead of
 // occupying workers until their timeout.
@@ -710,6 +712,78 @@ export async function measureLatency(host: string, port: number,
 
 // Outbound tags of the config the tunnel is actually running: the node list
 // only asks for a core-side probe when the node is part of it.
+export interface OutboundProbeSpec {
+  tag: string;
+  url: string;
+  timeoutMs: number;
+}
+
+// v2rayNG-style real delay: the extension builds a temporary TUN-less core from
+// the supplied config, probes every tagged outbound, then frees it. The live
+// tunnel/core are not touched.
+export async function probeProfiles(configJson: string, probes: OutboundProbeSpec[],
+  geodataDir: string): Promise<OutboundProbeResult[]> {
+  const requestId: string = Date.now().toString(36) + Math.floor(Math.random() * 1000000).toString(36);
+  let subscriber: commonEventManager.CommonEventSubscriber | null = null;
+  try {
+    subscriber = await commonEventManager.createSubscriber({ events: [PROBE_PROFILES_RESULT_EVENT] });
+  } catch (error) {
+    return [];
+  }
+  const pending = subscriber;
+  return new Promise<OutboundProbeResult[]>((resolve) => {
+    let settled: boolean = false;
+    let timer: number = -1;
+    const finish = (value: OutboundProbeResult[]): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== -1) clearTimeout(timer);
+      try { commonEventManager.unsubscribe(pending); } catch (error) {}
+      resolve(value);
+    };
+    timer = setTimeout(() => finish([]), 90000);
+    try {
+      commonEventManager.subscribe(pending, (error, data) => {
+        if (error !== undefined && error !== null && error.code !== 0) return;
+        const params: Record<string, Object> = data.parameters as Record<string, Object>;
+        if (params === undefined || params === null) return;
+        if ((params['requestId'] as string) !== requestId) return;
+        const raw: string = (params['results'] as string) ?? '';
+        const results: OutboundProbeResult[] = [];
+        try {
+          const arr: Object[] = JSON.parse(raw) as Object[];
+          for (const item of arr) {
+            const o: Record<string, Object> = item as Record<string, Object>;
+            results.push({
+              status: numberOf(o['status'], -1),
+              delayMs: numberOf(o['delayMs'], 0),
+              failureKind: numberOf(o['failureKind'], 0),
+              httpStatus: numberOf(o['httpStatus'], 0),
+              message: textOf(o['message'])
+            });
+          }
+        } catch (e) {}
+        finish(results);
+      });
+    } catch (e) {
+      finish([]);
+      return;
+    }
+    const params: Record<string, Object> = {
+      'requestId': requestId,
+      'config': configJson,
+      'probes': JSON.stringify(probes),
+      'geodataDir': geodataDir
+    };
+    const data: commonEventManager.CommonEventPublishData = { parameters: params };
+    try {
+      commonEventManager.publish(PROBE_PROFILES_REQUEST_EVENT, data, () => {});
+    } catch (e) {
+      finish([]);
+    }
+  });
+}
+
 export function tunnelOutboundTags(context: common.Context): string[] {
   const tags: string[] = [];
   const text: string = loadConfig(context);

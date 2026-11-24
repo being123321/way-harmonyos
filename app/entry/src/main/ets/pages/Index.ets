@@ -13,12 +13,12 @@ import { commonEventManager } from '@kit.BasicServicesKit';
 import {
   Insets, ReloadResult, TunnelStatus, clearStatus, coreVersion, formatBytes, formatDuration, formatTime,
   reloadRouting, tunnelUp,
-  NodeEndpoint, formatSpeed, nodeEndpoint, nodeTypeLabel, outboundEndpoint, pageInsets, readLogs, tunnelOutboundTags,
+  NodeEndpoint, formatSpeed, nodeEndpoint, nodeTypeLabel, outboundEndpoint, pageInsets, readLogs, tunnelOutboundTags, xrayDir,
   readStatus, saveConfig, startVpn, stopVpn, vpnWant, loadConfig
 } from '../common/Xray';
 import { ConfigEntry, SubscriptionRecord, readStore, readSubs, selectEntry, selectedEntry } from '../common/Store';
 import { refreshSubscription } from '../common/Subscription';
-import { LatencyResult, TEST_HOST, testAll } from '../common/Speedtest';
+import { LatencyResult, TEST_HOST, testAll, testAllConfig } from '../common/Speedtest';
 import { resolveUdp } from '../common/UdpDns';
 import { LatencyEntry, readLatencyCache, recordLatency } from '../common/LatencyStore';
 import { appLog } from '../common/AppLog';
@@ -1226,15 +1226,41 @@ struct Index {
     // Same path as the node page: when the tunnel is up the core performs a
     // real HTTP probe through each node's outbound; only when it is down do we
     // fall back to a direct TCP/UDP handshake (a network RTT, not proxy delay).
+    // Temp TUN-less core, all nodes probed concurrently; fallback to the live
+    // core / direct TCP only if the temporary core cannot start.
     const viaTunnel: boolean = tunnelUp(context);
     const tags: string[] = viaTunnel ? tunnelOutboundTags(context) : [];
-    try {
-      await testAll(entries, viaTunnel, tags, (result: LatencyResult) => {
-        measured.set(result.id, result.ms);
-        recordLatency(context, result.id, result.ms, result.via);
-        this.nodeLatency = new Map<string, number>(measured);
-      });
-    } catch (error) {
+    const entry: ConfigEntry | null = selectedEntry(context);
+    let usedTemp: boolean = false;
+    if (entry !== null) {
+      try {
+        buildAndSaveTunnel(context, entry, this.buildOptions(context));
+        const raw: string = loadConfig(context);
+        const doc: Record<string, Object> = JSON.parse(raw) as Record<string, Object>;
+        doc['inbounds'] = [];
+        const tempConfig: string = JSON.stringify(doc);
+        if (tempConfig.length > 0) {
+          usedTemp = true;
+          await testAllConfig(entries, tempConfig, xrayDir(context) + '/geodata',
+            (result: LatencyResult) => {
+              measured.set(result.id, result.ms);
+              recordLatency(context, result.id, result.ms, result.via);
+              this.nodeLatency = new Map<string, number>(measured);
+            });
+        }
+      } catch (error) {
+        usedTemp = false;
+      }
+    }
+    if (!usedTemp) {
+      try {
+        await testAll(entries, viaTunnel, tags, (result: LatencyResult) => {
+          measured.set(result.id, result.ms);
+          recordLatency(context, result.id, result.ms, result.via);
+          this.nodeLatency = new Map<string, number>(measured);
+        });
+      } catch (error) {
+      }
     }
     this.nodeLatency = new Map<string, number>(measured);
     this.nodeProbing = false;
@@ -1279,7 +1305,7 @@ struct Index {
       this.entryName = item.name;
       this.hasEntry = true;
       if (this.isTunnelRunning()) {
-        await this.restartTunnel(context, item);
+        await this.applyRoutingChange(context, '已切换到 ' + item.name);
       }
     }
     this.nodeExpanded = false;
