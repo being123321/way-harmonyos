@@ -144,7 +144,8 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          FILES=(dist/way-*.hap dist/way-*.hap.sha256)
+          # artifact 解压后保留了 app/ 前缀，递归找
+          FILES=($(find dist -type f \( -name 'way-*.hap' -o -name 'way-*.hap.sha256' \)))
           if [ ${#FILES[@]} -eq 0 ]; then
             echo "::warning::No HAP produced (OHOS_CMDLINE_TOOLS_URL missing or build failed); skipping release."
             exit 0
