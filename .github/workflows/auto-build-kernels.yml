@@ -160,6 +160,9 @@ jobs:
 
       - name: Cross-compile libxray_ffi.a and libentry_rust.so
         env:
+          # 仓库里的 rust-toolchain.toml 把 channel 钉在 1.96.0(stable)，
+          # 而 -Z build-std 只有 nightly 能用，这里强制覆盖工具链
+          RUSTUP_TOOLCHAIN: nightly
           CC_aarch64_unknown_linux_ohos: ${{ runner.temp }}/ohos-clang-cc.sh
           CXX_aarch64_unknown_linux_ohos: ${{ runner.temp }}/ohos-clang-cxx.sh
           AR_aarch64_unknown_linux_ohos: ${{ steps.ohos_ndk.outputs.llvm_bin }}/llvm-ar
