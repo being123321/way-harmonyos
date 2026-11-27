@@ -118,8 +118,8 @@ jobs:
       - name: Checkout way-harmonyos
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain (aarch64-unknown-linux-ohos)
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Install Rust toolchain 1.96.0 + rust-src (aarch64-unknown-linux-ohos)
+        uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rust-src
 
@@ -160,9 +160,11 @@ jobs:
 
       - name: Cross-compile libxray_ffi.a and libentry_rust.so
         env:
-          # 仓库里的 rust-toolchain.toml 把 channel 钉在 1.96.0(stable)，
-          # 而 -Z build-std 只有 nightly 能用，这里强制覆盖工具链
-          RUSTUP_TOOLCHAIN: nightly
+          # xray-rust 的 rust-toolchain.toml 钉在 1.96.0；直接用 nightly 会因新 lint
+          # (trailing semicolon / fetch_update deprecated) 编译失败，
+          # 所以用 stable 1.96.0 + RUSTC_BOOTSTRAP=1 解锁 -Z build-std
+          RUSTC_BOOTSTRAP: "1"
+          RUSTUP_TOOLCHAIN: "1.96.0"
           CC_aarch64_unknown_linux_ohos: ${{ runner.temp }}/ohos-clang-cc.sh
           CXX_aarch64_unknown_linux_ohos: ${{ runner.temp }}/ohos-clang-cxx.sh
           AR_aarch64_unknown_linux_ohos: ${{ steps.ohos_ndk.outputs.llvm_bin }}/llvm-ar
@@ -286,6 +288,9 @@ jobs:
     if: always() && needs.check-upstream.outputs.need_release == 'true' && (needs.build-xray-rust.result == 'success' || needs.build-xray-core.result == 'success')
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout way-harmonyos
+        uses: actions/checkout@v4
+
       - name: Download built artifacts
         uses: actions/download-artifact@v4
         with:
