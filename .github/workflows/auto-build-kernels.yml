@@ -100,20 +100,7 @@ jobs:
           CORE_SRC="${{ steps.src.outputs.core_src }}"
           RUST_TAG="${{ github.event.inputs.xray_rust_ref }}"
           [ -n "${RUST_TAG}" ] || RUST_TAG=$(query_latest "${RUST_SRC}")
-          # XTLS/Xray-core 从 v26 起把 module path 改成了 /v26，而 way 的 Go 桥接仍按
-          # github.com/xtls/xray-core 引用，因此这里挑「最后一个 v25 及更早」的 release
-          pick_core_tag() {
-            local repo="$1" tag major
-            for tag in $(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${repo}/releases?per_page=30" 2>/dev/null | jq -r '.[].tag_name' || true); do
-              major=$(echo "${tag}" | sed -E 's/^v([0-9]+).*/\1/')
-              case "${major}" in ''|*[!0-9]*) continue ;; esac
-              if [ "${major}" -lt 26 ]; then echo "${tag}"; return; fi
-            done
-            echo ""
-          }
           CORE_TAG="${{ github.event.inputs.xray_core_ref }}"
-          [ -n "${CORE_TAG}" ] || CORE_TAG=$(pick_core_tag "${CORE_SRC}")
           [ -n "${CORE_TAG}" ] || CORE_TAG=$(query_latest "${CORE_SRC}")
 
           MANIFEST_URL="https://github.com/${{ github.repository }}/releases/download/kernels-latest/kernels-manifest.json"
@@ -324,9 +311,25 @@ jobs:
           # Support both official XTLS/Xray-core and user forks via go.mod replace
           CORE_SRC="${{ needs.check-upstream.outputs.core_src }}"
           if [ "${CORE_SRC}" != "XTLS/Xray-core" ]; then
+            # fork：直接把上游模块替换成 fork 的提交
             go mod edit -replace "github.com/xtls/xray-core=github.com/${CORE_SRC}@${CORE_TAG}"
           else
-            go get "github.com/xtls/xray-core@${CORE_TAG}"
+            # 上游：从 v25 起 module path 带大版本后缀（/v25、/v26 …），
+            # 桥接代码仍按 github.com/xtls/xray-core 引用，用 replace 映射过去
+            set +e
+            OUT=$(go get "github.com/xtls/xray-core@${CORE_TAG}" 2>&1)
+            RC=$?
+            set -e
+            if [ $RC -ne 0 ]; then
+              MODPATH=$(echo "${OUT}" | sed -n 's/.*module path must match major version ("\([^"]*\)").*/\1/p' | head -n 1)
+              if [ -n "${MODPATH}" ]; then
+                echo "detected versioned module path: ${MODPATH}"
+                go mod edit -replace "github.com/xtls/xray-core=${MODPATH}@${CORE_TAG}"
+              else
+                echo "${OUT}"
+                exit 1
+              fi
+            fi
           fi
           go mod tidy
 
