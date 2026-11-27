@@ -81,18 +81,23 @@ jobs:
           MANIFEST_URL="https://github.com/${{ github.repository }}/releases/download/kernels-latest/kernels-manifest.json"
           CUR_RUST=""
           CUR_CORE=""
+          CUR_RUST_SHA=""
+          CUR_CORE_SHA=""
           if curl -fsSL "${MANIFEST_URL}" -o /tmp/cur-manifest.json 2>/dev/null; then
             CUR_RUST=$(jq -r '.kernels[] | select(.id=="xray-rust") | .version // empty' /tmp/cur-manifest.json || true)
             CUR_CORE=$(jq -r '.kernels[] | select(.id=="xray-core") | .version // empty' /tmp/cur-manifest.json || true)
+            CUR_RUST_SHA=$(jq -r '.kernels[] | select(.id=="xray-rust") | .sha256 // empty' /tmp/cur-manifest.json || true)
+            CUR_CORE_SHA=$(jq -r '.kernels[] | select(.id=="xray-core") | .sha256 // empty' /tmp/cur-manifest.json || true)
           fi
 
           FORCE="${{ github.event.inputs.force_rebuild }}"
           BUILD_RUST="false"
           BUILD_CORE="false"
-          if [ "${FORCE}" = "true" ] || [ "${RUST_TAG}" != "${CUR_RUST}" ]; then
+          # 版本一致但 sha256 为空，说明上次只写了 manifest 没产物，必须重建
+          if [ "${FORCE}" = "true" ] || [ "${RUST_TAG}" != "${CUR_RUST}" ] || [ -z "${CUR_RUST_SHA}" ]; then
             BUILD_RUST="true"
           fi
-          if [ "${FORCE}" = "true" ] || [ "${CORE_TAG}" != "${CUR_CORE}" ]; then
+          if [ "${FORCE}" = "true" ] || [ "${CORE_TAG}" != "${CUR_CORE}" ] || [ -z "${CUR_CORE_SHA}" ]; then
             BUILD_CORE="true"
           fi
           NEED_RELEASE="false"
@@ -199,16 +204,16 @@ jobs:
           # Link HarmonyOS NAPI wrapper into libentry_rust.so
           "${RUNNER_TEMP}/ohos-clang-cxx.sh" -shared -fPIC -O2 -std=c++17 \
             -I"${GITHUB_WORKSPACE}/app/entry/src/main/cpp/include" \
-            -I"${steps.ohos_ndk.outputs.sysroot}/usr/include" \
+            -I"${{ steps.ohos_ndk.outputs.sysroot }}/usr/include" \
             "${GITHUB_WORKSPACE}/app/entry/src/main/cpp/xray_napi.cpp" \
             -Wl,--whole-archive "${OUT_DIR}/libxray_ffi.a" -Wl,--no-whole-archive \
-            -L"${steps.ohos_ndk.outputs.sysroot}/usr/lib/aarch64-linux-ohos" \
+            -L"${{ steps.ohos_ndk.outputs.sysroot }}/usr/lib/aarch64-linux-ohos" \
             -lace_napi.z -lhilog_ndk.z -lc++_shared \
             -Wl,--gc-sections -Wl,--exclude-libs,ALL -Wl,-O2 -Wl,--strip-all \
             -o "${OUT_DIR}/libentry_rust.so"
 
           # Sanity-check exported NAPI registration & absence of unexpected dynamic deps
-          "${steps.ohos_ndk.outputs.llvm_bin}/llvm-readelf" -d "${OUT_DIR}/libentry_rust.so" | grep -E 'NEEDED|SONAME' || true
+          "${{ steps.ohos_ndk.outputs.llvm_bin }}/llvm-readelf" -d "${OUT_DIR}/libentry_rust.so" | grep -E 'NEEDED|SONAME' || true
           sha256sum "${OUT_DIR}/libentry_rust.so" > "${OUT_DIR}/libentry_rust.so.sha256"
 
       - name: Upload xray-rust artifact
@@ -283,7 +288,7 @@ jobs:
             -ldflags="-s -w -X main.coreVersion=${CORE_TAG}" \
             -o "${OUT_DIR}/libxray_core_ohos.so" .
 
-          "${steps.ohos_ndk.outputs.llvm_bin}/llvm-readelf" -d "${OUT_DIR}/libxray_core_ohos.so" | grep -E 'NEEDED|SONAME' || true
+          "${{ steps.ohos_ndk.outputs.llvm_bin }}/llvm-readelf" -d "${OUT_DIR}/libxray_core_ohos.so" | grep -E 'NEEDED|SONAME' || true
           sha256sum "${OUT_DIR}/libxray_core_ohos.so" > "${OUT_DIR}/libxray_core_ohos.so.sha256"
 
       - name: Upload Xray-core artifact

@@ -83,13 +83,13 @@ jobs:
           DEVECO_SDK_HOME: ${{ steps.ohos_tools.outputs.tool_home }}/sdk
         run: |
           set -euo pipefail
-          export PATH="${steps.ohos_tools.outputs.tool_home}/bin:${PATH}"
+          export PATH="${{ steps.ohos_tools.outputs.tool_home }}/bin:${PATH}"
           # hvigor 通过 local.properties / DEVECO_SDK_HOME 定位 SDK
-          echo "sdk.dir=${steps.ohos_tools.outputs.tool_home}/sdk" > local.properties
+          echo "sdk.dir=${{ steps.ohos_tools.outputs.tool_home }}/sdk" > local.properties
           hvigorw assembleHap --mode module -p product=default --no-daemon --max-workers=2 -p buildMode=release
           RAW_HAP=$(find entry/build -name '*unsigned*.hap' | head -n 1)
           OUT_HAP="way-${{ steps.meta.outputs.version }}-${{ matrix.kernel }}-unsigned.hap"
-          python3 - "${RAW_HAP}" "${OUT_HAP}" "entry/libs/arm64-v8a/libentry.so" "${steps.ohos_tools.outputs.libcxx}" <<'PY'
+          python3 - "${RAW_HAP}" "${OUT_HAP}" "entry/libs/arm64-v8a/libentry.so" "${{ steps.ohos_tools.outputs.libcxx }}" <<'PY'
           import sys, zipfile
           src, dst, so_entry, so_cxx = sys.argv[1:5]
           with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, 'w') as zout:
