@@ -40,12 +40,32 @@ jobs:
   check-upstream:
     runs-on: ubuntu-latest
     outputs:
+      rust_src: ${{ steps.src.outputs.rust_src }}
+      core_src: ${{ steps.src.outputs.core_src }}
       rust_tag: ${{ steps.versions.outputs.rust_tag }}
       core_tag: ${{ steps.versions.outputs.core_tag }}
       build_rust: ${{ steps.versions.outputs.build_rust }}
       build_core: ${{ steps.versions.outputs.build_core }}
       need_release: ${{ steps.versions.outputs.need_release }}
     steps:
+      - name: Resolve upstream source repositories
+        id: src
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          resolve() {
+            local repo="$1"
+            curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${repo}" | jq -r '.parent.full_name // .full_name'
+          }
+          RUST_SRC=$(resolve "${XRAY_RUST_REPO}")
+          CORE_SRC=$(resolve "${XRAY_CORE_REPO}")
+          echo "rust_src=${RUST_SRC}" >> "${GITHUB_OUTPUT}"
+          echo "core_src=${CORE_SRC}" >> "${GITHUB_OUTPUT}"
+          echo "xray-rust: 配置=${XRAY_RUST_REPO} 上游=${RUST_SRC}"
+          echo "xray-core: 配置=${XRAY_CORE_REPO} 上游=${CORE_SRC}"
+
       - name: Query latest upstream / fork versions and current manifest
         id: versions
         env:
@@ -74,10 +94,14 @@ jobs:
             echo "${tag}"
           }
 
+          # 版本永远看上游（fork 不会自动同步，也拿不到上游 tag），
+          # 构建时优先用配置里的 fork，若 fork 没有该 ref 则回退到上游
+          RUST_SRC="${{ steps.src.outputs.rust_src }}"
+          CORE_SRC="${{ steps.src.outputs.core_src }}"
           RUST_TAG="${{ github.event.inputs.xray_rust_ref }}"
-          [ -n "${RUST_TAG}" ] || RUST_TAG=$(query_latest "${XRAY_RUST_REPO}")
+          [ -n "${RUST_TAG}" ] || RUST_TAG=$(query_latest "${RUST_SRC}")
           CORE_TAG="${{ github.event.inputs.xray_core_ref }}"
-          [ -n "${CORE_TAG}" ] || CORE_TAG=$(query_latest "${XRAY_CORE_REPO}")
+          [ -n "${CORE_TAG}" ] || CORE_TAG=$(query_latest "${CORE_SRC}")
 
           MANIFEST_URL="https://github.com/${{ github.repository }}/releases/download/kernels-latest/kernels-manifest.json"
           CUR_RUST=""
@@ -159,10 +183,15 @@ jobs:
       - name: Checkout xray-rust (${{ needs.check-upstream.outputs.rust_tag }})
         run: |
           set -euo pipefail
-          git clone --depth 1 --branch "${{ needs.check-upstream.outputs.rust_tag }}" \
-            "https://github.com/${XRAY_RUST_REPO}.git" "${RUNNER_TEMP}/xray-rust" \
-          || (git clone "https://github.com/${XRAY_RUST_REPO}.git" "${RUNNER_TEMP}/xray-rust" && \
-              git -C "${RUNNER_TEMP}/xray-rust" checkout "${{ needs.check-upstream.outputs.rust_tag }}")
+          REF="${{ needs.check-upstream.outputs.rust_tag }}"
+          SRC="${{ needs.check-upstream.outputs.rust_src }}"
+          clone_at() {
+            local repo="$1" ref="$2" dst="$3"
+            git clone --depth 1 --branch "${ref}" "https://github.com/${repo}.git" "${dst}" 2>/dev/null \
+              || (git clone "https://github.com/${repo}.git" "${dst}" && git -C "${dst}" checkout "${ref}")
+          }
+          clone_at "${XRAY_RUST_REPO}" "${REF}" "${RUNNER_TEMP}/xray-rust" \
+            || clone_at "${SRC}" "${REF}" "${RUNNER_TEMP}/xray-rust"
 
       - name: Apply way OHOS patch (kernel/way-ohos.patch)
         run: |
@@ -276,8 +305,9 @@ jobs:
           cd "${GITHUB_WORKSPACE}/app/native/xray-go-bridge"
           CORE_TAG="${{ needs.check-upstream.outputs.core_tag }}"
           # Support both official XTLS/Xray-core and user forks via go.mod replace
-          if [ "${XRAY_CORE_REPO}" != "XTLS/Xray-core" ]; then
-            go mod edit -replace "github.com/xtls/xray-core=github.com/${XRAY_CORE_REPO}@${CORE_TAG}"
+          CORE_SRC="${{ needs.check-upstream.outputs.core_src }}"
+          if [ "${CORE_SRC}" != "XTLS/Xray-core" ]; then
+            go mod edit -replace "github.com/xtls/xray-core=github.com/${CORE_SRC}@${CORE_TAG}"
           else
             go get "github.com/xtls/xray-core@${CORE_TAG}"
           fi
