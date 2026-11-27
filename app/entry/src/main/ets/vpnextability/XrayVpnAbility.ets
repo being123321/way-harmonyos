@@ -13,6 +13,16 @@ import { hidebug } from '@kit.PerformanceAnalysisKit';
 import { preferences } from '@kit.ArkData';
 import { wifiManager } from '@kit.ConnectivityKit';
 import { SSID_SUSPEND, findRule } from '../common/Ssid';
+import { initIpcAuth, publishScopedEvent, verifyIpcParams } from '../common/IpcAuth';
+import { appBundleName, appEvent, readTaskNotificationId, saveTaskNotificationId } from '../common/Xray';
+import { resolveUdp } from '../common/UdpDns';
+import { isFakeOrReservedIp, isIpAddressLiteral } from '../common/Latency';
+import { markCoreHealthy, readCoreState, rollbackCoreOnError } from '../common/Updater';
+import {
+  RecoveryBudget, VpnChannelSample, emptyRecoveryBudget, isRecoveryBudgetExhausted,
+  nextRecoveryAttempt, probeVpnChannel
+} from '../common/VpnRecovery';
+import { VpnMemoryPressureObserver } from '../common/VpnMemoryPressure';
 
 interface ProbeResult {
   delayMs: number;
@@ -40,6 +50,7 @@ interface XrayNative {
   warnings(): string;
   stats(): XrayStats;
   rebind(): number;
+  trimMemory(): boolean;
 }
 
 interface TunnelStatus {
@@ -70,27 +81,10 @@ const NOTIFICATION_ID: number = 1001;
 // tunnel. Without it they are routed back into our TUN and the tunnel floods
 // itself (280 MB up / 540 B down in the field test), so it stays on.
 const USE_PROTECT_PROCESS_NET: boolean = true;
-// Node-list delay test crosses processes: the UI cannot see the core handle (the
-// extension runs in its own process), so it asks this process over common events.
-const PROBE_REQUEST_EVENT: string = 'com.way.app.PROBE';
-// Cancels the probes already in flight (ABI 1.15), sent by the node list when a
-// new run starts or the page closes.
-const PROBE_CANCEL_EVENT: string = 'com.way.app.PROBE_CANCEL';
-// Live mode switch: the UI rewrites config.json and asks this process to swap
-// the routing table, so GFW / 绕过大陆 / 全局 apply without dropping the tunnel.
-const RELOAD_REQUEST_EVENT: string = 'com.way.app.RELOAD_ROUTING';
-const RELOAD_RESULT_EVENT: string = 'com.way.app.RELOAD_ROUTING_RESULT';
-// Live connection inventory (list + close) for the 连接 page.
-const CONN_REQUEST_EVENT: string = 'com.way.app.CONNECTIONS';
-const CONN_RESULT_EVENT: string = 'com.way.app.CONNECTIONS_RESULT';
-const PROBE_RESULT_EVENT: string = 'com.way.app.PROBE_RESULT';
-const PROBE_PROFILES_REQUEST_EVENT: string = 'com.way.app.PROBE_PROFILES';
-const PROBE_PROFILES_RESULT_EVENT: string = 'com.way.app.PROBE_PROFILES_RESULT';
 
 export default class XrayVpnAbility extends VpnExtensionAbility {
   private conn: vpnExtension.VpnConnection | null = null;
   private timerId: number = -1;
-  private configText: string = '';
   private logDir: string = '';
   private statusPath: string = '';
   private startedAt: number = 0;
@@ -98,7 +92,20 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
   private geodataDir: string = '';
   private restarts: number = 0;
   private lastProbeMs: number = 0;
-  private failedRestarts: number = 0;
+  private recoveryBudget: RecoveryBudget = emptyRecoveryBudget();
+  private recoveryPending: boolean = false;
+  private ownedVpnNetId: number = -1;
+  private foreignConsecutiveCount: number = 0;
+  private foreignCheckInFlight: boolean = false;
+  private memoryObserver: VpnMemoryPressureObserver | null = null;
+  private lastMemorySoftReclaimAt: number = 0;
+  private lastLiveViewAt: number = 0;
+  private lastNeedTaskIdAt: number = 0;
+  private lastLiveUp: number = -1;
+  private lastLiveDown: number = -1;
+  private lastStatusWriteAt: number = 0;
+  private lastProbeDownBytes: number = -1;
+  private debugLogEnabled: boolean = false;
   private rebindEnabled: boolean = true;
   private notifyEnabled: boolean = true;
   private taskNotificationId: number = -1;
@@ -110,6 +117,10 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
   private pssKb: number = 0;
   private cpuPercent: number = 0;
   private connSubscriber: commonEventManager.CommonEventSubscriber | null = null;
+  private uiVisibilitySubscriber: commonEventManager.CommonEventSubscriber | null = null;
+  private uiVisible: boolean = true;
+  private probeHostCache: Map<string, string[]> = new Map<string, string[]>();
+  private probeHostCacheAt: Map<string, number> = new Map<string, number>();
   private nodeName: string = '';
   private configPath: string = '';
   private netAvailableHandler: ((data: connection.NetHandle) => void) | null = null;
@@ -126,12 +137,16 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
   private ssidSuspended: boolean = false;
 
   onCreate(want: Want): void {
+    initIpcAuth(this.context);
     this.bindHandlers(want);
+    this.watchTaskId();
     this.watchProbeRequests();
     this.watchProbeProfilesRequests();
     this.watchProbeCancelRequests();
     this.watchReloadRequests();
     this.watchConnectionRequests();
+    this.watchUiVisibility();
+    this.startMemoryObserver();
     if (native.isRunning()) {
       // The system relaunched the extension while the core is still live:
       // keep the running tunnel instead of starting a second one.
@@ -164,16 +179,30 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
     this.rebindEnabled = params['rebindOnNetChange'] as boolean ?? true;
     this.notifyEnabled = params['notify'] as boolean ?? true;
     this.taskNotificationId = params['taskNotificationId'] as number ?? -1;
+    if (this.taskNotificationId < 0) {
+      this.taskNotificationId = readTaskNotificationId(this.context);
+    } else {
+      saveTaskNotificationId(this.context, this.taskNotificationId);
+    }
     this.nodeName = params['nodeName'] as string ?? '';
     this.geodataDir = params['geodataDir'] as string ?? '';
-    this.configText = '';
-    if (configPath.length > 0) {
-      try {
-        this.configText = fs.readTextSync(configPath);
-      } catch (error) {
-        this.appendLog('read config failed: ' + JSON.stringify(error));
-      }
+  }
+
+  // Read config.json on demand instead of pinning the full JSON string in heap
+  // memory for the lifetime of the VPN extension.
+  private readConfigText(): string {
+    const path: string = this.configPath.length > 0 ? this.configPath : (this.logDir + '/config.json');
+    if (path.length === 0) {
+      return '';
     }
+    try {
+      if (fs.accessSync(path)) {
+        return fs.readTextSync(path);
+      }
+    } catch (error) {
+      this.appendLog('read config failed: ' + JSON.stringify(error));
+    }
+    return '';
   }
 
   // SSID suspension lives in the extension, the way sing-box does it: the
@@ -241,17 +270,22 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
       clearInterval(this.timerId);
       this.timerId = -1;
     }
-    // Keep the task id: the UI owns the continuous task and may still have it
-    // up. A paused core just stops refreshing the live view until it resumes;
-    // cancelling here would leave the system card behind anyway.
+    // Update live-view notification with yellow dot when suspended by trusted Wi-Fi.
     this.writeStatus('suspended', '已挂起（' + ssid + '）');
+    this.publishStatusLiveView('suspended', '当前 Wi-Fi（' + ssid + '）已自动挂起');
     this.appendLog('ssid ' + ssid + ' suspended, core paused');
   }
 
   private resumeFromSsid(): void {
     this.ssidSuspended = false;
+    const cfg: string = this.readConfigText();
+    if (cfg.length === 0) {
+      this.appendLog('ssid resume failed: config empty');
+      this.writeStatus('error', '恢复失败');
+      return;
+    }
     try {
-      native.start(this.configText, this.tunFd, TUN_MTU, this.logDir, this.geodataDir);
+      native.start(cfg, this.tunFd, TUN_MTU, this.logDir, this.geodataDir);
     } catch (error) {
       this.appendLog('ssid resume failed: ' + ((error as BusinessError).message ?? ''));
       this.writeStatus('error', '恢复失败');
@@ -277,94 +311,126 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
   private async bootTunnel(): Promise<void> {
     this.ensureDir();
     this.appendLog('native version ' + native.version() + ', capabilities ' + native.capabilities());
-    if (this.configText.length === 0) {
+    let configText: string = this.readConfigText();
+    if (configText.length === 0) {
       // The UI may still be flushing config.json when the extension starts.
-      for (let attempt = 0; attempt < 10 && this.configText.length === 0; attempt++) {
+      for (let attempt = 0; attempt < 10 && configText.length === 0; attempt++) {
         await new Promise<void>((resolve) => {
           setTimeout(() => {
             resolve();
           }, 200);
         });
-        try {
-          if (this.configPath.length > 0 && fs.accessSync(this.configPath)) {
-            this.configText = fs.readTextSync(this.configPath);
-          }
-        } catch (error) {
-        }
+        configText = this.readConfigText();
       }
     }
-    if (this.configText.length === 0) {
+    if (configText.length === 0) {
       this.writeStatus('error', '配置文件为空');
       return;
     }
-    this.writeStatus('starting', '正在创建 VPN 接口');
-
-    const conn: vpnExtension.VpnConnection = vpnExtension.createVpnConnection(this.context);
-    this.conn = conn;
-
-    // Resolve the outbound servers before the tunnel exists and keep their
-    // addresses outside the default route: a second safety net next to
-    // protectProcessNet(), and the same idea the Apple adapter uses.
-    const excluded: vpnExtension.RouteInfo[] = await this.buildExcludedRoutes();
-    // Single-VPN mode: requesting a second vpnId put us behind the system's
-    // multi-VPN chooser, where apps only use the tunnel when they opt in. The
-    // single mode owns the default route for every app, like sing-box.
-    const vpnId: string = '';
-    const config: vpnExtension.VpnConfig = this.buildVpnConfig(this.dnsServers(), excluded, vpnId);
-    let fd: number = -1;
+    let phase: string = '准备配置';
     try {
-      fd = await conn.create(config);
-    } catch (error) {
-      const err = error as BusinessError;
-      this.writeStatus('error', '创建 VPN 接口失败: ' + err.code + ' ' + err.message);
-      this.appendLog('vpn create failed: ' + JSON.stringify(error));
-      return;
-    }
-    this.appendLog('tun fd=' + fd);
-    this.tunFd = fd;
+      this.debugLogEnabled = configText.indexOf('"loglevel":"debug"') >= 0 ||
+        configText.indexOf('"loglevel": "debug"') >= 0;
+      phase = '创建 VPN 接口';
+      this.writeStatus('starting', '正在创建 VPN 接口');
 
-    // Every socket the core opens must bypass the tunnel, otherwise the
-    // outbound connection loops back into our own TUN device.
-    if (USE_PROTECT_PROCESS_NET) {
+      const conn: vpnExtension.VpnConnection = vpnExtension.createVpnConnection(this.context);
+      this.conn = conn;
+
+      // Resolve the outbound servers before the tunnel exists and keep their
+      // addresses outside the default route: a second safety net next to
+      // protectProcessNet(), and the same idea the Apple adapter uses.
+      const excluded: vpnExtension.RouteInfo[] = await this.buildExcludedRoutes(configText);
+      // Single-VPN mode: requesting a second vpnId put us behind the system's
+      // multi-VPN chooser, where apps only use the tunnel when they opt in. The
+      // single mode owns the default route for every app, like sing-box.
+      const vpnId: string = '';
+      const config: vpnExtension.VpnConfig = this.buildVpnConfig(this.dnsServers(configText), excluded, vpnId);
+      let fd: number = -1;
       try {
-        await conn.protectProcessNet();
-        this.appendLog('protectProcessNet ok');
+        fd = await conn.create(config);
       } catch (error) {
         const err = error as BusinessError;
-        this.appendLog('protectProcessNet failed: ' + (err.message ?? JSON.stringify(error)));
+        if (err.code === 2203002) {
+          this.writeStatus('error', '已有其他 VPN 正在运行，请先关闭');
+        } else {
+          this.writeStatus('error', '创建 VPN 接口失败: ' + err.code + ' ' + err.message);
+        }
+        this.appendLog('vpn create failed: ' + JSON.stringify(error));
+        return;
       }
-    } else {
-      this.appendLog('protectProcessNet skipped, using excluded routes');
-    }
+      this.appendLog('tun fd=' + fd);
+      this.tunFd = fd;
 
-    try {
-      native.start(this.configText, fd, TUN_MTU, this.logDir, this.geodataDir);
+      // Every socket the core opens must bypass the tunnel, otherwise the
+      // outbound connection loops back into our own TUN device.
+      phase = '保护进程网络';
+      this.writeStatus('starting', '正在保护进程网络');
+      if (USE_PROTECT_PROCESS_NET) {
+        try {
+          await conn.protectProcessNet();
+          this.appendLog('protectProcessNet ok');
+        } catch (error) {
+          const err = error as BusinessError;
+          this.appendLog('protectProcessNet failed: ' + (err.message ?? JSON.stringify(error)));
+        }
+      } else {
+        this.appendLog('protectProcessNet skipped, using excluded routes');
+      }
+
+      phase = '启动 Xray 核心';
+      this.writeStatus('starting', '正在启动 Xray 核心');
+      try {
+        native.start(configText, fd, TUN_MTU, this.logDir, this.geodataDir);
+      } catch (error) {
+        const err = error as BusinessError;
+        const errMsg: string = err.message ?? JSON.stringify(error);
+        const coreState = readCoreState(this.context);
+        if (coreState.pendingCore.length > 0) {
+          const rolled = rollbackCoreOnError(this.context, errMsg);
+          this.appendLog('auto-rollback triggered: ' + rolled.lastRollbackReason);
+          this.writeStatus('error', rolled.lastRollbackReason);
+        } else {
+          this.writeStatus('error', 'Xray 启动失败: ' + errMsg);
+        }
+        this.appendLog('native.start failed: ' + errMsg);
+        await this.destroyConn();
+        return;
+      }
+      configText = '';
+      markCoreHealthy(this.context);
+
+      const warnings: string = native.warnings();
+      if (warnings.length > 0) {
+        this.appendLog('config warnings: ' + warnings);
+      }
+
+      this.watchNetworks();
+      this.writeStatus('running', '已连接');
+      this.appendLog('tunnel running');
+      this.mirrorCoreLog('start');
+      this.tick();
+      this.startTickLoop();
+      // Reclaim startup config/geodata parsing peak buffers once the tunnel settles.
+      setTimeout(() => {
+        if (native.isRunning()) {
+          this.reclaimMemory('post-boot');
+        }
+      }, 4000);
     } catch (error) {
       const err = error as BusinessError;
-      this.writeStatus('error', 'Xray 启动失败: ' + err.message);
-      this.appendLog('native.start failed: ' + ((error as BusinessError).message ?? JSON.stringify(error)));
+      const msg: string = phase + '异常: ' + (err.message ?? JSON.stringify(error));
+      this.writeStatus('error', msg);
+      this.appendLog('bootTunnel exception in ' + phase + ': ' + JSON.stringify(error));
       await this.destroyConn();
-      return;
     }
-
-    const warnings: string = native.warnings();
-    if (warnings.length > 0) {
-      this.appendLog('config warnings: ' + warnings);
-    }
-
-    this.watchNetworks();
-    this.writeStatus('running', '已连接');
-    this.appendLog('tunnel running');
-    this.mirrorCoreLog('start');
-    this.tick();
-    this.startTickLoop();
   }
 
   // The core answers DNS at its own anchor only when the config declares a DNS
   // module; otherwise syscall DNS is simply proxied to a public resolver.
-  private dnsServers(): string[] {
+  private dnsServers(configText: string): string[] {
     try {
-      const parsed: Record<string, Object> = JSON.parse(this.configText) as Record<string, Object>;
+      const parsed: Record<string, Object> = JSON.parse(configText) as Record<string, Object>;
       const dns: Object | undefined = parsed['dns'];
       if (dns !== undefined && dns !== null) {
         return [DNS_ANCHOR];
@@ -375,14 +441,10 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
   }
 
   // Outbound server addresses from the config, used for tunnel-exclusion routes.
-  // Only the default outbound's server is dialled by the tunnel itself. The
-  // other saved nodes are reached only by the probe API from this protected
-  // process, so excluding their hosts would cost one DNS lookup each (seconds
-  // when a name does not resolve) without protecting anything.
-  private serverHosts(): string[] {
+  private serverHosts(configText: string): string[] {
     const hosts: string[] = [];
     try {
-      const root: Record<string, Object> = JSON.parse(this.configText) as Record<string, Object>;
+      const root: Record<string, Object> = JSON.parse(configText) as Record<string, Object>;
       const outbounds: Object[] = (root['outbounds'] as Object[]) ?? [];
       if (outbounds.length === 0) {
         return hosts;
@@ -446,10 +508,10 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
     return Promise.race([lookup, timeout]);
   }
 
-  private async buildExcludedRoutes(): Promise<vpnExtension.RouteInfo[]> {
+  private async buildExcludedRoutes(configText: string): Promise<vpnExtension.RouteInfo[]> {
     const routes: vpnExtension.RouteInfo[] = [];
     const seen: Set<string> = new Set();
-    const hosts: string[] = this.serverHosts();
+    const hosts: string[] = this.serverHosts(configText);
     const resolved: string[][] = await Promise.all(hosts.map(
       (host: string): Promise<string[]> => this.resolveHost(host, 1500)));
     for (const ips of resolved) {
@@ -528,28 +590,129 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
     return config;
   }
 
-  // FlClash-style supervision: keep the core alive, react to network changes,
-  // and republish the persistent notification with live traffic.
-  private tick(): void {
-    if (!native.isRunning()) {
-      if (this.failedRestarts >= 3) {
-        this.writeStatus('error', '核心反复退出，已停止自动重启');
+  private startMemoryObserver(): void {
+    if (this.memoryObserver !== null) {
+      return;
+    }
+    const observer = new VpnMemoryPressureObserver(
+      async (reason: string): Promise<void> => {
+        this.reclaimMemory(reason);
+      },
+      (msg: string): void => {
+        this.appendLog(msg);
+      }
+    );
+    try {
+      observer.start(this.context.getApplicationContext());
+      this.memoryObserver = observer;
+    } catch (error) {
+      this.appendLog('memory observer start failed');
+    }
+  }
+
+  private stopMemoryObserver(): void {
+    const observer = this.memoryObserver;
+    this.memoryObserver = null;
+    if (observer !== null) {
+      observer.stop();
+    }
+  }
+
+  // Soft memory reclaim under OS memory pressure or RSS soft limit:
+  // cancel in-flight speedtest probes, truncate verbose logs, and flush native
+  // allocator thread caches back to the OS.
+  private reclaimMemory(reason: string): void {
+    this.appendLog('memory pressure reclaim (' + reason + '), pssKb=' + this.pssKb);
+    try {
+      native.cancelProbes();
+    } catch (error) {
+    }
+    try {
+      native.trimMemory();
+    } catch (error) {
+    }
+    this.trimCoreLog(true);
+  }
+
+  private async checkForeignVpn(): Promise<void> {
+    if (this.foreignCheckInFlight || this.conn === null || this.tunFd < 0) {
+      return;
+    }
+    this.foreignCheckInFlight = true;
+    try {
+      const sample: VpnChannelSample = await probeVpnChannel(this.ownedVpnNetId, TUN_ADDRESS_V4, TUN_ADDRESS_V6);
+      if (sample.state === 'owned' && sample.netId >= 0) {
+        this.ownedVpnNetId = sample.netId;
+        this.foreignConsecutiveCount = 0;
+      } else if (sample.state === 'foreign' && this.ownedVpnNetId >= 0) {
+        // Only act on foreign takeover if this firmware previously reported our
+        // own VPN netId and two consecutive probes confirm another VPN replaced it.
+        this.foreignConsecutiveCount++;
+        if (this.foreignConsecutiveCount >= 2) {
+          this.appendLog('confirmed foreign VPN takeover (previous netId=' + this.ownedVpnNetId + '), stopping core');
+          this.shutdown('系统 VPN 已被其他应用接管');
+        }
+      } else {
+        this.foreignConsecutiveCount = 0;
+      }
+    } finally {
+      this.foreignCheckInFlight = false;
+    }
+  }
+
+  private async attemptBoundedRestart(): Promise<void> {
+    if (this.recoveryPending) {
+      return;
+    }
+    const now: number = Date.now();
+    if (isRecoveryBudgetExhausted(this.recoveryBudget, now)) {
+      this.writeStatus('error', '120 秒内核心已重启 3 次，已停止自动重启');
+      return;
+    }
+    const nextBudget: RecoveryBudget | null = nextRecoveryAttempt(this.recoveryBudget, now);
+    if (nextBudget === null) {
+      return;
+    }
+    this.recoveryPending = true;
+    try {
+      const sample: VpnChannelSample = await probeVpnChannel(this.ownedVpnNetId, TUN_ADDRESS_V4, TUN_ADDRESS_V6);
+      if (sample.state === 'foreign') {
+        this.appendLog('core exit with foreign VPN active, stopping without retry');
+        this.shutdown('系统 VPN 已被其他应用接管');
         return;
       }
-      this.restarts++;
-      this.appendLog('core not running, restart attempt ' + this.restarts);
-      try {
-        const conn = this.conn;
-        if (conn === null || this.tunFd < 0) {
-          this.writeStatus('error', '连接对象已释放');
-          return;
-        }
-        native.restart(this.configText, this.tunFd, TUN_MTU, this.logDir, this.geodataDir);
-        this.failedRestarts = 0;
-      } catch (error) {
-        this.failedRestarts++;
-        this.appendLog('restart failed: ' + ((error as BusinessError).message ?? JSON.stringify(error)));
+      const conn = this.conn;
+      if (conn === null || this.tunFd < 0) {
+        this.writeStatus('error', '连接对象已释放');
+        return;
       }
+      this.recoveryBudget = nextBudget;
+      this.restarts++;
+      this.appendLog('core not running, bounded restart attempt ' + nextBudget.attempts + '/3 (total ' + this.restarts + ')');
+      const cfg: string = this.readConfigText();
+      if (cfg.length === 0) {
+        this.writeStatus('error', '配置文件为空');
+        return;
+      }
+      try {
+        native.restart(cfg, this.tunFd, TUN_MTU, this.logDir, this.geodataDir);
+        this.writeStatus('running', '已恢复连接');
+      } catch (error) {
+        this.appendLog('restart failed: ' + ((error as BusinessError).message ?? JSON.stringify(error)));
+        if (isRecoveryBudgetExhausted(this.recoveryBudget, Date.now())) {
+          this.writeStatus('error', '核心反复退出，已停止自动重启');
+        }
+      }
+    } finally {
+      this.recoveryPending = false;
+    }
+  }
+
+  // Bounded crash supervision, foreign-VPN detection, and throttled live-view updates.
+  private tick(): void {
+    if (!native.isRunning()) {
+      this.attemptBoundedRestart().catch((): void => {
+      });
       return;
     }
     const stats: XrayStats = native.stats();
@@ -557,6 +720,7 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
     const elapsed: number = this.lastStamp === 0 ? 0 : (now - this.lastStamp) / 1000;
     let upSpeed: number = 0;
     let downSpeed: number = 0;
+    const trafficActive: boolean = stats.up !== this.lastUp || stats.down !== this.lastDown;
     if (elapsed > 0) {
       upSpeed = Math.max(0, (stats.up - this.lastUp) / elapsed);
       downSpeed = Math.max(0, (stats.down - this.lastDown) / elapsed);
@@ -564,43 +728,71 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
     this.lastUp = stats.up;
     this.lastDown = stats.down;
     this.lastStamp = now;
-    if (this.taskIdSubscriber === null && this.tickCount === 1) {
-      this.watchTaskId();
-    }
-    this.publishTraffic(stats, upSpeed, downSpeed);
-    if (this.notifyEnabled && this.tickCount % 2 === 0) {
-      this.publishNotification(stats, downSpeed, upSpeed);
-    }
-    // 15 s, not 30 s: every probe writes one line to ability.log whether it
-    // succeeds or fails, so the log itself is a liveness signal for the UI
-    // supervisor even when there is no user traffic.
-    if (this.tickCount % 15 === 0 && this.tickCount > 0) {
-      this.probeLiveness();
-    }
-    if (this.tickCount % 5 === 0) {
+    if (this.uiVisible) {
+      if (trafficActive || this.tickCount % 5 === 0) {
+        this.publishTraffic(stats, upSpeed, downSpeed);
+      }
+      if (this.tickCount % 10 === 0) {
+        this.sampleUsage();
+      }
+    } else if (this.tickCount % 30 === 0) {
+      // In background/lockscreen keep periodic RSS soft-limit check active to prevent OOM kill.
       this.sampleUsage();
     }
-    this.writeStatus('running', '已连接', stats);
+    // Always keep status.json heartbeat fresh even in background (4 s cadence when UI is hidden,
+    // 2-3 s in foreground), otherwise keepalive watchdogs and tunnelUp() mistake it for dead.
+    const statusInterval: number = this.uiVisible ? (trafficActive ? 2000 : 3000) : 4000;
+    if (this.lastStatusWriteAt === 0 || now - this.lastStatusWriteAt >= statusInterval) {
+      this.lastStatusWriteAt = now;
+      this.writeStatus('running', '已连接', stats);
+    }
+    if (this.notifyEnabled) {
+      this.publishNotification(stats, downSpeed, upSpeed, now);
+    }
+    if (this.tickCount % 15 === 0 && this.tickCount > 0) {
+      this.checkForeignVpn().catch((): void => {
+      });
+    }
+    // Probe liveness ONLY while foreground UI is visible and downlink is idle.
+    if (this.uiVisible && this.tickCount % 60 === 0 && this.tickCount > 0) {
+      const curDown: number = Math.floor(stats.down);
+      if (this.lastProbeDownBytes === curDown) {
+        this.probeLiveness();
+      }
+      this.lastProbeDownBytes = curDown;
+    }
     this.tickCount++;
-    if (this.tickCount % 60 === 0) {
+    if (this.tickCount % 120 === 0) {
       this.appendLog('stats packets=' + stats.packets + ' up=' + stats.up + ' down=' + stats.down +
-        ' tcp=' + stats.tcpFlows + ' udp=' + stats.udpFlows + ' drops=' + stats.drops);
+        ' tcp=' + stats.tcpFlows + ' udp=' + stats.udpFlows + ' drops=' + stats.drops +
+        ' pss=' + Math.round(this.pssKb / 1024) + 'MB');
       this.mirrorCoreLog('stats');
     }
-    if (this.tickCount % 15 === 0) {
+    if (this.debugLogEnabled && this.tickCount % 30 === 0) {
       this.mirrorAccessLog();
     }
-    if (this.tickCount % 300 === 0) {
-      this.trimCoreLog();
+    if (this.tickCount % 30 === 0 && this.tickCount > 0) {
+      try {
+        native.trimMemory();
+      } catch (error) {
+      }
+    }
+    if (this.tickCount % 120 === 0) {
+      this.trimCoreLog(false);
     }
   }
 
-  // Sampled every few ticks: reading smaps_rollup is not free, and the numbers
-  // only need to be roughly current.
+  // Sampled every 10 s: reading smaps_rollup is not free, and the numbers only
+  // need to be roughly current. Enforces a 32 MB soft limit reclaim.
   private sampleUsage(): void {
     try {
       this.pssKb = Number(hidebug.getPss());
       this.cpuPercent = hidebug.getCpuUsage();
+      const now: number = Date.now();
+      if (this.pssKb > 32768 && now - this.lastMemorySoftReclaimAt > 60000) {
+        this.lastMemorySoftReclaimAt = now;
+        this.reclaimMemory('soft-limit-' + Math.round(this.pssKb / 1024) + 'MB');
+      }
     } catch (error) {
     }
   }
@@ -631,6 +823,9 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
     } catch (error) {
       this.appendLog('write status failed: ' + JSON.stringify(error));
     }
+    if (state === 'error' && this.notifyEnabled) {
+      this.publishStatusLiveView('error', message.length > 0 ? message : '无法连接');
+    }
   }
 
 
@@ -644,7 +839,7 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
       const info: wantAgent.WantAgentInfo = {
         wants: [
           {
-            bundleName: 'com.way.app',
+            bundleName: appBundleName(this.context),
             abilityName: 'EntryAbility'
           }
         ],
@@ -682,26 +877,17 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
   // the Clash API /traffic endpoint). The UI subscribes instead of polling the
   // status file every second.
   private publishTraffic(stats: XrayStats, upSpeed: number, downSpeed: number): void {
-    const data: commonEventManager.CommonEventPublishData = {
-      parameters: {
-        'up': Math.floor(stats.up),
-        'down': Math.floor(stats.down),
-        'upSpeed': Math.floor(upSpeed),
-        'downSpeed': Math.floor(downSpeed),
-        'tcp': stats.tcpFlows,
-        'udp': stats.udpFlows,
-        'startedAt': this.startedAt,
-        'state': 'running'
-      }
+    const params: Record<string, Object> = {
+      'up': Math.floor(stats.up),
+      'down': Math.floor(stats.down),
+      'upSpeed': Math.floor(upSpeed),
+      'downSpeed': Math.floor(downSpeed),
+      'tcp': stats.tcpFlows,
+      'udp': stats.udpFlows,
+      'startedAt': this.startedAt,
+      'state': 'running'
     };
-    try {
-      commonEventManager.publish('com.way.app.TRAFFIC', data, (error: BusinessError) => {
-        if (error !== undefined && error !== null && error.code !== 0) {
-          this.notifyFailures++;
-        }
-      });
-    } catch (error) {
-    }
+    publishScopedEvent(appEvent('TRAFFIC', this.context), params, this.context);
   }
 
 
@@ -753,6 +939,7 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
 
   private shutdown(reason: string): void {
     this.stopSsidWatch();
+    this.stopMemoryObserver();
     if (this.taskNotificationId >= 0) {
       notificationManager.cancel(this.taskNotificationId).catch(() => {
       });
@@ -763,17 +950,73 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
     }
     this.unwatchNetworks();
     this.stopKeepAlive();
+    this.stopTaskIdWatch();
     this.stopProbeWatch();
     this.stopReloadWatch();
     this.stopConnectionWatch();
+    this.stopUiVisibilityWatch();
     try {
       native.stop();
     } catch (error) {
       this.appendLog('native.stop failed: ' + JSON.stringify(error));
     }
     this.destroyConn();
+    this.ownedVpnNetId = -1;
     this.writeStatus('stopped', reason);
     this.appendLog('tunnel stopped: ' + reason);
+  }
+
+  private async watchUiVisibility(): Promise<void> {
+    if (this.uiVisibilitySubscriber !== null) {
+      return;
+    }
+    try {
+      const sub: commonEventManager.CommonEventSubscriber = await commonEventManager.createSubscriber({
+        events: [appEvent('UI_VISIBILITY', this.context)]
+      });
+      commonEventManager.subscribe(sub, (_error, data) => {
+        const params: Record<string, Object> = data.parameters as Record<string, Object>;
+        if (!verifyIpcParams(params, this.context)) {
+          return;
+        }
+        const v: Object | undefined = params['visible'];
+        const visible: boolean = v === 1 || v === true || v === '1';
+        const changed: boolean = this.uiVisible !== visible;
+        this.uiVisible = visible;
+        if (visible && changed && native.isRunning()) {
+          // Immediately refresh status.json & traffic counters when UI returns to foreground.
+          const stats: XrayStats = native.stats();
+          this.sampleUsage();
+          this.lastStatusWriteAt = Date.now();
+          this.writeStatus('running', '已连接', stats);
+          this.publishTraffic(stats, 0, 0);
+        }
+      });
+      this.uiVisibilitySubscriber = sub;
+    } catch (error) {
+    }
+  }
+
+  private stopUiVisibilityWatch(): void {
+    const sub = this.uiVisibilitySubscriber;
+    this.uiVisibilitySubscriber = null;
+    if (sub !== null) {
+      try {
+        commonEventManager.unsubscribe(sub);
+      } catch (error) {
+      }
+    }
+  }
+
+  private stopTaskIdWatch(): void {
+    const sub = this.taskIdSubscriber;
+    this.taskIdSubscriber = null;
+    if (sub !== null) {
+      try {
+        commonEventManager.unsubscribe(sub);
+      } catch (error) {
+      }
+    }
   }
 
   private async destroyConn(): Promise<void> {
@@ -792,19 +1035,34 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
   // notification away; it then pushes the new notification id here so the live
   // view keeps updating the right card.
   private async watchTaskId(): Promise<void> {
+    if (this.taskIdSubscriber !== null) {
+      return;
+    }
     try {
       const sub: commonEventManager.CommonEventSubscriber = await commonEventManager.createSubscriber({
-        events: ['com.way.app.TASK_ID']
+        events: [appEvent('TASK_ID', this.context)]
       });
-      commonEventManager.subscribe(sub, (error, data) => {
+      commonEventManager.subscribe(sub, (_error, data) => {
         const params: Record<string, Object> = data.parameters as Record<string, Object>;
-        if (params === undefined || params === null) {
+        if (!verifyIpcParams(params, this.context)) {
           return;
         }
         const id: number = params['taskNotificationId'] as number;
         if (id !== undefined && id !== null && id >= 0) {
+          const prevId: number = this.taskNotificationId;
+          if (prevId >= 0 && prevId !== id) {
+            // Cancel the previous live-view notification so two notifications
+            // can never coexist in the notification shade.
+            notificationManager.cancel(prevId).catch(() => {
+            });
+          }
           this.taskNotificationId = id;
+          saveTaskNotificationId(this.context, id);
+          this.lastLiveViewAt = 0;
           this.appendLog('live view moved to notification ' + id);
+          if (native.isRunning() && !this.ssidSuspended) {
+            this.publishStatusLiveView('running', '↓ 0 B/s  ↑ 0 B/s');
+          }
         }
       });
       this.taskIdSubscriber = sub;
@@ -823,44 +1081,81 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
     }
   }
 
-  // Live traffic in the notification bar: the persistent task notification and
-  // an app notification together are what keeps the process off the kill list,
-  // so the numbers here are the visible proof that the tunnel is still alive.
-  private publishNotification(stats: XrayStats, downSpeed: number, upSpeed: number): void {
-    // The task card is the single merged notification: the live view is drawn on
-    // the continuous-task id, which is what the system keeps alive. A separate
-    // plain notification would either be hidden or replace the card, so there is
-    // deliberately no fallback here (docs/keepalive-harmony.md).
-    if (this.taskNotificationId >= 0) {
-      this.publishLiveView(stats, downSpeed, upSpeed);
+  // Throttled single live-view traffic notification:
+  //   - When bytes changed: refresh at most once every 2000 ms.
+  //   - When idle (e.g. screen locked): refresh every 10000 ms so HarmonyOS
+  //     DATA_TRANSFER live-view watchdog never expires the lockscreen card.
+  private publishNotification(stats: XrayStats, downSpeed: number, upSpeed: number, now: number): void {
+    if (this.taskNotificationId < 0) {
+      const recovered: number = readTaskNotificationId(this.context);
+      if (recovered >= 0) {
+        this.taskNotificationId = recovered;
+      } else {
+        this.requestTaskNotification(now);
+        return;
+      }
     }
+    const upBytes: number = Math.floor(stats.up);
+    const downBytes: number = Math.floor(stats.down);
+    const trafficChanged: boolean = upBytes !== this.lastLiveUp || downBytes !== this.lastLiveDown;
+    const minInterval: number = trafficChanged ? 2000 : 10000;
+    if (this.lastLiveViewAt > 0 && now - this.lastLiveViewAt < minInterval) {
+      return;
+    }
+    this.lastLiveViewAt = now;
+    this.lastLiveUp = upBytes;
+    this.lastLiveDown = downBytes;
+    this.publishLiveView(stats, downSpeed, upSpeed);
   }
 
-  // Take over the continuous-task notification: publish SYSTEM_LIVE_VIEW on the
-  // id returned by startBackgroundRunning, exactly like TunBox does. Otherwise
-  // the system hides the app's own notification while the task card is up.
+  private requestTaskNotification(now: number): void {
+    if (now - this.lastNeedTaskIdAt < 15000) {
+      return;
+    }
+    this.lastNeedTaskIdAt = now;
+    publishScopedEvent(appEvent('NEED_TASK_ID', this.context), {}, this.context);
+  }
+
+  // Minimal single live-view traffic card with status dot:
+  //   running   -> 🟢 <node>
+  //   suspended -> 🟡 <node> · 已挂起
+  //   error     -> 🔴 <node> · 无法连接
   private publishLiveView(stats: XrayStats, downSpeed: number, upSpeed: number): void {
+    const liveLine: string = '↓ ' + formatBytes(downSpeed) + '/s  ↑ ' + formatBytes(upSpeed) + '/s';
+    this.publishStatusLiveView('running', liveLine);
+  }
+
+  private publishStatusLiveView(state: string, detailLine: string): void {
+    if (this.taskNotificationId < 0) {
+      const recovered: number = readTaskNotificationId(this.context);
+      if (recovered >= 0) {
+        this.taskNotificationId = recovered;
+      } else {
+        return;
+      }
+    }
     try {
-      // The live view is republished every two ticks. When the tunnel is idle
-      // the speeds stay at 0 B/s, so a timestamp is what makes the content
-      // change and stops the system from treating the update as a no-op.
-      const clock: string = this.clockStamp();
-      const elapsed: string = this.formatDuration(this.startedAt);
-      const liveLine: string = '↓' + formatBytes(downSpeed) + '/s ↑' + formatBytes(upSpeed) +
-        '/s · ' + elapsed + ' · ' + clock;
-      const title: string = this.nodeName.length > 0 ? this.nodeName : 'way';
+      const baseName: string = this.nodeName.length > 0 ? this.nodeName : 'way';
+      let title: string = '🟢 ' + baseName;
+      if (state === 'suspended') {
+        title = '🟡 ' + baseName + ' · 已挂起';
+      } else if (state === 'error') {
+        title = '🔴 ' + baseName + ' · 无法连接';
+      }
       const data: Record<string, Object> = {};
       data['title'] = title;
-      data['fileName'] = liveLine;
+      data['fileName'] = detailLine;
       const request: notificationManager.NotificationRequest = {
         id: this.taskNotificationId,
         notificationSlotType: notificationManager.SlotType.LIVE_VIEW,
+        isOngoing: true,
+        isUnremovable: true,
         content: {
           notificationContentType: notificationManager.ContentType.NOTIFICATION_CONTENT_SYSTEM_LIVE_VIEW,
           systemLiveView: {
             typeCode: 8,
-            title: 'way · ' + title,
-            text: liveLine
+            title: title,
+            text: detailLine
           }
         },
         template: {
@@ -868,9 +1163,20 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
           data: data
         }
       };
-      notificationManager.publish(request).catch((error: BusinessError) => {
-        if (this.tickCount % 60 === 0) {
-          this.appendLog('live view update failed: ' + (error.message ?? 'unknown'));
+      notificationManager.publish(request).then(() => {
+        this.notifyFailures = 0;
+      }).catch((error: BusinessError) => {
+        this.notifyFailures++;
+        if (this.notifyFailures === 1 || this.tickCount % 30 === 0) {
+          this.appendLog('live view update failed (' + error.code + ', streak=' + this.notifyFailures +
+            '): ' + (error.message ?? 'unknown'));
+        }
+        // Only ask UI to re-acquire task id after consecutive failures, avoiding
+        // churn from transient lockscreen rate limits.
+        if (this.notifyFailures >= 3) {
+          this.taskNotificationId = -1;
+          saveTaskNotificationId(this.context, -1);
+          this.requestTaskNotification(Date.now());
         }
       });
     } catch (error) {
@@ -902,14 +1208,14 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
     }
     try {
       const sub: commonEventManager.CommonEventSubscriber = await commonEventManager.createSubscriber({
-        events: [PROBE_REQUEST_EVENT]
+        events: [appEvent('PROBE', this.context)]
       });
       commonEventManager.subscribe(sub, (error, data) => {
         if (error !== undefined && error !== null && error.code !== 0) {
           return;
         }
         const params: Record<string, Object> = data.parameters as Record<string, Object>;
-        if (params === undefined || params === null) {
+        if (!verifyIpcParams(params, this.context)) {
           return;
         }
         const requestId: string = (params['requestId'] as string) ?? '';
@@ -953,12 +1259,7 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
       'httpStatus': httpStatus,
       'message': message
     };
-    const data: commonEventManager.CommonEventPublishData = { parameters: params };
-    try {
-      commonEventManager.publish(PROBE_RESULT_EVENT, data, () => {
-      });
-    } catch (error) {
-    }
+    publishScopedEvent(appEvent('PROBE_RESULT', this.context), params, this.context);
   }
 
   // v2rayNG-style speed test: the UI sends a TUN-less config plus the probe
@@ -970,17 +1271,19 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
     }
     try {
       const sub: commonEventManager.CommonEventSubscriber = await commonEventManager.createSubscriber({
-        events: [PROBE_PROFILES_REQUEST_EVENT]
+        events: [appEvent('PROBE_PROFILES', this.context)]
       });
       commonEventManager.subscribe(sub, (error, data) => {
         if (error !== undefined && error !== null && error.code !== 0) return;
         const params: Record<string, Object> = data.parameters as Record<string, Object>;
-        if (params === undefined || params === null) return;
+        if (!verifyIpcParams(params, this.context)) return;
         const requestId: string = (params['requestId'] as string) ?? '';
+        const reqFile: string = (params['reqFile'] as string) ?? '';
+        const resFile: string = (params['resFile'] as string) ?? '';
         const config: string = (params['config'] as string) ?? '';
         const probesRaw: string = (params['probes'] as string) ?? '[]';
         const geodataDir: string = (params['geodataDir'] as string) ?? '';
-        this.runProbeProfiles(requestId, config, probesRaw, geodataDir);
+        this.runProbeProfiles(requestId, config, probesRaw, geodataDir, reqFile, resFile);
       });
       this.probeProfilesSubscriber = sub;
     } catch (error) {
@@ -988,20 +1291,155 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
     }
   }
 
-  private async runProbeProfiles(requestId: string, config: string, probesRaw: string,
-    geodataDir: string): Promise<void> {
-    if (requestId.length === 0 || config.length === 0) return;
-    let results: string = '[]';
+  // Extract every outbound server hostname from a temporary probe config and
+  // resolve them via plain UDP DNS inside this protectProcessNet() extension
+  // process, injecting clean physical IPv4 addresses into `dns.hosts`.
+  // Without this, xray-core-rs's bootstrap resolver falls back to system
+  // getaddrinfo(), which returns FakeIP 198.19.x.x while VPN is active and
+  // makes every protected outbound socket time out in a black hole.
+  private async injectProtectedProbeHosts(configText: string): Promise<string> {
     try {
-      const probes: Object[] = JSON.parse(probesRaw) as Object[];
-      results = JSON.stringify(await native.probeProfiles(config, probes, geodataDir) as Object);
+      const root: Record<string, Object> = JSON.parse(configText) as Record<string, Object>;
+      const outbounds: Object[] = (root['outbounds'] as Object[]) ?? [];
+      const domains: string[] = [];
+      const addHost = (candidate: Object | undefined): void => {
+        if (typeof candidate !== 'string') return;
+        const host: string = stripPort((candidate as string).trim());
+        if (host.length === 0 || isIpAddressLiteral(host)) return;
+        if (domains.indexOf(host) < 0) {
+          domains.push(host);
+        }
+      };
+      for (const item of outbounds) {
+        const ob: Record<string, Object> = item as Record<string, Object>;
+        const settings: Record<string, Object> | undefined = ob['settings'] as Record<string, Object> | undefined;
+        if (settings === undefined || settings === null) continue;
+        addHost(settings['address']);
+        const vnext: Object[] | undefined = settings['vnext'] as Object[] | undefined;
+        if (vnext !== undefined) {
+          for (const v of vnext) {
+            addHost((v as Record<string, Object>)['address']);
+          }
+        }
+        const servers: Object[] | undefined = settings['servers'] as Object[] | undefined;
+        if (servers !== undefined) {
+          for (const s of servers) {
+            addHost((s as Record<string, Object>)['address']);
+          }
+        }
+        const peers: Object[] | undefined = settings['peers'] as Object[] | undefined;
+        if (peers !== undefined) {
+          for (const p of peers) {
+            addHost((p as Record<string, Object>)['endpoint']);
+          }
+        }
+      }
+      if (domains.length === 0) {
+        return configText;
+      }
+      const dnsObj: Record<string, Object> = (root['dns'] as Record<string, Object>) ?? {};
+      const hostsObj: Record<string, string[]> = (dnsObj['hosts'] as Record<string, string[]>) ?? {};
+      const nowMs: number = Date.now();
+      const pending: string[] = [];
+      for (const d of domains) {
+        if (hostsObj[d] !== undefined && hostsObj[d].length > 0) {
+          continue;
+        }
+        const cached: string[] | undefined = this.probeHostCache.get(d);
+        const cachedAt: number = this.probeHostCacheAt.get(d) ?? 0;
+        if (cached !== undefined && cached.length > 0 && nowMs - cachedAt < 30000) {
+          hostsObj[d] = cached;
+          continue;
+        }
+        pending.push(d);
+      }
+      if (pending.length > 0) {
+        const lookups: Promise<void>[] = pending.map((domain: string): Promise<void> => {
+          return resolveUdp(domain, 1200).then((ips: string[]) => {
+            const clean: string[] = [];
+            for (const ip of ips) {
+              if (!isFakeOrReservedIp(ip) && clean.indexOf(ip) < 0) {
+                clean.push(ip);
+              }
+            }
+            if (clean.length > 0) {
+              hostsObj[domain] = clean;
+              this.probeHostCache.set(domain, clean);
+              this.probeHostCacheAt.set(domain, Date.now());
+            }
+          }).catch((): void => {
+          });
+        });
+        const all: Promise<void> = Promise.all(lookups).then((): void => {
+        });
+        const budget: Promise<void> = new Promise<void>((resolve) => {
+          setTimeout(() => resolve(), 1800);
+        });
+        await Promise.race([all, budget]);
+      }
+      if (Object.keys(hostsObj).length > 0) {
+        dnsObj['hosts'] = hostsObj as Object;
+        root['dns'] = dnsObj;
+        return JSON.stringify(root);
+      }
     } catch (error) {
-      this.appendLog('probeProfiles exception: ' + JSON.stringify(error));
+      this.appendLog('injectProtectedProbeHosts failed: ' + JSON.stringify(error));
     }
-    const params: Record<string, Object> = { 'requestId': requestId, 'results': results };
-    const data: commonEventManager.CommonEventPublishData = { parameters: params };
+    return configText;
+  }
+
+  private async runProbeProfiles(requestId: string, config: string, probesRaw: string,
+    geodataDir: string, reqFile: string = '', resFile: string = ''): Promise<void> {
+    if (requestId.length === 0) return;
+    let ok: boolean = false;
+    let results: string = '[]';
+    let errorMsg: string = '';
     try {
-      commonEventManager.publish(PROBE_PROFILES_RESULT_EVENT, data, () => {});
+      let effectiveConfig: string = config;
+      let probes: Object[] = [];
+      let effectiveGeo: string = geodataDir;
+      if (reqFile.length > 0 && fs.accessSync(reqFile)) {
+        const reqText: string = fs.readTextSync(reqFile);
+        const reqDoc: Record<string, Object> = JSON.parse(reqText) as Record<string, Object>;
+        effectiveConfig = (reqDoc['config'] as string) ?? '';
+        probes = (reqDoc['probes'] as Object[]) ?? [];
+        effectiveGeo = (reqDoc['geodataDir'] as string) ?? '';
+      } else {
+        probes = JSON.parse(probesRaw) as Object[];
+      }
+      if (effectiveConfig.length === 0) {
+        throw new Error('empty probe config');
+      }
+      effectiveConfig = await this.injectProtectedProbeHosts(effectiveConfig);
+      results = JSON.stringify(await native.probeProfiles(effectiveConfig, probes, effectiveGeo) as Object);
+      ok = true;
+    } catch (error) {
+      const err = error as BusinessError;
+      errorMsg = typeof error === 'string' ? error : (err.message ?? JSON.stringify(error));
+      this.appendLog('probeProfiles exception: ' + errorMsg);
+    }
+    let inlineResults: string = results;
+    let writtenResFile: string = '';
+    if (resFile.length > 0) {
+      try {
+        const f = fs.openSync(resFile, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
+        fs.writeSync(f.fd, results);
+        fs.closeSync(f);
+        writtenResFile = resFile;
+        inlineResults = '';
+      } catch (writeErr) {
+      }
+    }
+    const params: Record<string, Object> = {
+      'requestId': requestId,
+      'ok': ok ? 1 : 0,
+      'results': inlineResults,
+      'resFile': writtenResFile,
+      'error': errorMsg
+    };
+    publishScopedEvent(appEvent('PROBE_PROFILES_RESULT', this.context), params, this.context);
+    try {
+      native.trimMemory();
     } catch (error) {
     }
   }
@@ -1041,10 +1479,14 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
     }
     try {
       const sub: commonEventManager.CommonEventSubscriber = await commonEventManager.createSubscriber({
-        events: [PROBE_CANCEL_EVENT]
+        events: [appEvent('PROBE_CANCEL', this.context)]
       });
       commonEventManager.subscribe(sub, (error, data) => {
         if (error !== undefined && error !== null && error.code !== 0) {
+          return;
+        }
+        const params: Record<string, Object> = data.parameters as Record<string, Object>;
+        if (!verifyIpcParams(params, this.context)) {
           return;
         }
         try {
@@ -1069,15 +1511,17 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
     }
     try {
       const sub: commonEventManager.CommonEventSubscriber = await commonEventManager.createSubscriber({
-        events: [RELOAD_REQUEST_EVENT]
+        events: [appEvent('RELOAD_ROUTING', this.context)]
       });
       commonEventManager.subscribe(sub, (error, data) => {
         if (error !== undefined && error !== null && error.code !== 0) {
           return;
         }
         const params: Record<string, Object> = data.parameters as Record<string, Object>;
-        const requestId: string = (params === undefined || params === null)
-          ? '' : ((params['requestId'] as string) ?? '');
+        if (!verifyIpcParams(params, this.context)) {
+          return;
+        }
+        const requestId: string = (params['requestId'] as string) ?? '';
         this.appendLog('routing reload requested ' + requestId);
         this.runReloadRequest(requestId);
       });
@@ -1116,12 +1560,7 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
       'ok': ok ? 1 : 0,
       'message': message
     };
-    const data: commonEventManager.CommonEventPublishData = { parameters: payload };
-    try {
-      commonEventManager.publish(RELOAD_RESULT_EVENT, data, () => {
-      });
-    } catch (error) {
-    }
+    publishScopedEvent(appEvent('RELOAD_ROUTING_RESULT', this.context), payload, this.context);
   }
 
   // Live connection inventory: {op:'list'} returns the core snapshot JSON,
@@ -1132,17 +1571,18 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
     }
     try {
       const sub: commonEventManager.CommonEventSubscriber = await commonEventManager.createSubscriber({
-        events: [CONN_REQUEST_EVENT]
+        events: [appEvent('CONNECTIONS', this.context)]
       });
       commonEventManager.subscribe(sub, (error, data) => {
         if (error !== undefined && error !== null && error.code !== 0) {
           return;
         }
         const params: Record<string, Object> = data.parameters as Record<string, Object>;
-        const requestId: string = (params === undefined || params === null)
-          ? '' : ((params['requestId'] as string) ?? '');
-        const op: string = (params === undefined || params === null)
-          ? '' : ((params['op'] as string) ?? 'list');
+        if (!verifyIpcParams(params, this.context)) {
+          return;
+        }
+        const requestId: string = (params['requestId'] as string) ?? '';
+        const op: string = (params['op'] as string) ?? 'list';
         if (op === 'close') {
           const id: number = Number(params['id'] ?? 0);
           this.runCloseConnection(requestId, id);
@@ -1209,21 +1649,16 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
   }
 
   private publishLatency(requestId: string, ms: number): void {
-    const data: commonEventManager.CommonEventPublishData = {
-      parameters: {
-        'requestId': requestId,
-        'ok': ms >= 0 ? 1 : 0,
-        'json': '' + ms
-      }
+    const params: Record<string, Object> = {
+      'requestId': requestId,
+      'ok': ms >= 0 ? 1 : 0,
+      'json': '' + ms
     };
-    try {
-      commonEventManager.publish(CONN_RESULT_EVENT, data, () => {
-      });
-    } catch (error) {
-    }
+    publishScopedEvent(appEvent('CONNECTIONS_RESULT', this.context), params, this.context);
   }
 
-  private runConnectionList(requestId: string): void {    let ok: boolean = false;
+  private runConnectionList(requestId: string): void {
+    let ok: boolean = false;
     let payload: string = '';
     try {
       payload = native.connectionSnapshot();
@@ -1233,18 +1668,12 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
       payload = failure.message === undefined ? 'snapshot failed' : failure.message;
       this.appendLog('connection snapshot failed: ' + payload);
     }
-    const data: commonEventManager.CommonEventPublishData = {
-      parameters: {
-        'requestId': requestId,
-        'ok': ok ? 1 : 0,
-        'json': payload
-      }
+    const params: Record<string, Object> = {
+      'requestId': requestId,
+      'ok': ok ? 1 : 0,
+      'json': payload
     };
-    try {
-      commonEventManager.publish(CONN_RESULT_EVENT, data, () => {
-      });
-    } catch (error) {
-    }
+    publishScopedEvent(appEvent('CONNECTIONS_RESULT', this.context), params, this.context);
   }
 
   private runCloseConnection(requestId: string, id: number): void {
@@ -1259,18 +1688,12 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
       payload = failure.message === undefined ? 'close failed' : failure.message;
       this.appendLog('close connection failed: ' + payload);
     }
-    const data: commonEventManager.CommonEventPublishData = {
-      parameters: {
-        'requestId': requestId,
-        'ok': ok ? 1 : 0,
-        'json': payload
-      }
+    const params: Record<string, Object> = {
+      'requestId': requestId,
+      'ok': ok ? 1 : 0,
+      'json': payload
     };
-    try {
-      commonEventManager.publish(CONN_RESULT_EVENT, data, () => {
-      });
-    } catch (error) {
-    }
+    publishScopedEvent(appEvent('CONNECTIONS_RESULT', this.context), params, this.context);
   }
 
   private stopConnectionWatch(): void {
@@ -1295,13 +1718,13 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
     }
   }
 
-  // Periodic request through the tunnel: keeps the carrier active (so the system
-  // sees ongoing traffic) and surfaces dead tunnels early. Async so an 8 s probe
-  // no longer stalls the status heartbeat.
+  // Idle liveness probe: uses HTTPS 443 with globally cached TLS CA roots
+  // (`CACHED_SYSTEM_TLS` in xray-rust) so port-80 filtering never causes false
+  // reconnects and CA roots are never re-allocated on the heap.
   private async probeLiveness(): Promise<void> {
     try {
       const raw: string =
-        JSON.stringify(await native.probeOutbound('https://www.gstatic.com/generate_204', 8000, '') as Object);
+        JSON.stringify(await native.probeOutbound('https://www.gstatic.com/generate_204', 5000, '') as Object);
       const result: Record<string, Object> = JSON.parse(raw) as Record<string, Object>;
       const failureKind: number = (result['failureKind'] as number) ?? 1;
       if (failureKind !== 0) {
@@ -1309,7 +1732,6 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
         this.appendLog('rebind accepted ' + native.rebind());
       } else {
         this.lastProbeMs = (result['delayMs'] as number) ?? 0;
-        this.appendLog('probe ok ' + this.lastProbeMs + 'ms');
       }
     } catch (error) {
       this.appendLog('probe error: ' + JSON.stringify(error));
@@ -1368,17 +1790,23 @@ export default class XrayVpnAbility extends VpnExtensionAbility {
     }
   }
 
-  private trimCoreLog(): void {
-    try {
-      const path: string = this.logDir + '/xray-error.log';
-      if (!fs.accessSync(path)) {
-        return;
+  private trimCoreLog(force: boolean = false): void {
+    const limit: number = force ? 128 * 1024 : 512 * 1024;
+    const names: string[] = ['xray-error.log', 'xray-access.log', 'ability.log'];
+    for (const name of names) {
+      try {
+        const path: string = this.logDir + '/' + name;
+        if (!fs.accessSync(path)) {
+          continue;
+        }
+        if (fs.statSync(path).size > limit) {
+          fs.truncateSync(path, 0);
+          if (name !== 'ability.log') {
+            this.appendLog('core log truncated: ' + name + (force ? ' (pressure)' : ''));
+          }
+        }
+      } catch (error) {
       }
-      if (fs.statSync(path).size > 8 * 1024 * 1024) {
-        fs.truncateSync(path, 0);
-        this.appendLog('core log truncated');
-      }
-    } catch (error) {
     }
   }
 

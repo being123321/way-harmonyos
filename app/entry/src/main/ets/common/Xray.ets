@@ -6,6 +6,7 @@ import { common } from '@kit.AbilityKit';
 import { window } from '@kit.ArkUI';
 import type { Want } from '@kit.AbilityKit';
 import native from 'libentry.so';
+import { publishScopedEvent, verifyIpcParams } from './IpcAuth';
 
 export interface Insets {
   top: number;
@@ -30,26 +31,62 @@ export async function pageInsets(context: common.Context): Promise<Insets> {
   }
 }
 
-// Cross-process probe RPC between the node list (UI process) and the VPN
-// extension (its own process, owner of the core handle).
-export const PROBE_REQUEST_EVENT: string = 'com.way.app.PROBE';
-// Live routing swap (mode switch) request/answer between UI and extension.
-export const RELOAD_REQUEST_EVENT: string = 'com.way.app.RELOAD_ROUTING';
-export const RELOAD_RESULT_EVENT: string = 'com.way.app.RELOAD_ROUTING_RESULT';
-// Live connection inventory request/answer between UI and extension.
-export const CONN_REQUEST_EVENT: string = 'com.way.app.CONNECTIONS';
-export const CONN_RESULT_EVENT: string = 'com.way.app.CONNECTIONS_RESULT';
-export const PROBE_RESULT_EVENT: string = 'com.way.app.PROBE_RESULT';
-export const PROBE_PROFILES_REQUEST_EVENT: string = 'com.way.app.PROBE_PROFILES';
-export const PROBE_PROFILES_RESULT_EVENT: string = 'com.way.app.PROBE_PROFILES_RESULT';
-// Cancels the probes already in flight (ABI 1.15): the UI sends this when a new
-// run starts or the node page closes, so stale probes stop early instead of
-// occupying workers until their timeout.
-export const PROBE_CANCEL_EVENT: string = 'com.way.app.PROBE_CANCEL';
-
 export const BUNDLE_NAME: string = 'com.way.app';
 export const VPN_ABILITY: string = 'XrayVpnAbility';
 const XRAY_DIR: string = 'xray';
+let cachedBundleName: string = '';
+
+// Resolves the actual installed bundleName dynamically at runtime so re-signing
+// the unsigned HAP with any custom bundleName works seamlessly for VPN, cards,
+// WantAgent, and scoped cross-process events.
+export function appBundleName(context?: common.Context | null): string {
+  if (context !== undefined && context !== null) {
+    try {
+      const name: string = context.applicationInfo?.name ?? '';
+      if (name.length > 0) {
+        cachedBundleName = name;
+        return cachedBundleName;
+      }
+    } catch (error) {
+    }
+  }
+  return cachedBundleName.length > 0 ? cachedBundleName : BUNDLE_NAME;
+}
+
+export function appEvent(suffix: string, context?: common.Context | null): string {
+  return appBundleName(context) + '.' + suffix;
+}
+
+const TASK_NOTIF_FILE: string = 'task-notif.json';
+
+export function saveTaskNotificationId(context: common.Context, id: number): void {
+  try {
+    const path: string = ensureXrayDir(context) + '/' + TASK_NOTIF_FILE;
+    const payload: Record<string, Object> = {
+      'id': id,
+      'updatedAt': Date.now()
+    };
+    const file = fs.openSync(path, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
+    fs.writeSync(file.fd, JSON.stringify(payload));
+    fs.closeSync(file);
+  } catch (error) {
+  }
+}
+
+export function readTaskNotificationId(context: common.Context): number {
+  try {
+    const path: string = xrayDir(context) + '/' + TASK_NOTIF_FILE;
+    if (!fs.accessSync(path)) {
+      return -1;
+    }
+    const text: string = fs.readTextSync(path);
+    const parsed: Record<string, Object> = JSON.parse(text) as Record<string, Object>;
+    const id: number = Number(parsed['id'] ?? -1);
+    return Number.isFinite(id) && id >= 0 ? id : -1;
+  } catch (error) {
+    return -1;
+  }
+}
 
 export interface TunnelStatus {
   state: string;
@@ -289,6 +326,10 @@ export function outboundEndpoint(outbound: Record<string, Object>): NodeEndpoint
   if (endpoint !== null) {
     return endpoint;
   }
+  endpoint = endpointFrom(settings['server'], settings['server_port']);
+  if (endpoint !== null) {
+    return endpoint;
+  }
   const vnext: Object[] | undefined = settings['vnext'] as Object[] | undefined;
   if (vnext !== undefined && vnext.length > 0) {
     const first: Record<string, Object> = vnext[0] as Record<string, Object>;
@@ -345,6 +386,89 @@ export function nodeEndpoint(configJson: string): NodeEndpoint | null {
   } catch (error) {
     return null;
   }
+}
+
+export interface NodeBadge {
+  text: string;
+  fg: string;
+  bg: string;
+}
+
+// Extracts Anywhere-style compact protocol/transport/security/flow tags from a
+// saved node JSON (e.g. VLESS + TCP + REALITY + Vision, HY2 + QUIC).
+export function extractNodeBadges(type: string, configJson: string): NodeBadge[] {
+  const badges: NodeBadge[] = [];
+  const protoLabel: string = nodeTypeLabel(type);
+  badges.push({ text: protoLabel, fg: '#6CCBFF', bg: '#162D4A' });
+  try {
+    const root: Record<string, Object> = JSON.parse(configJson) as Record<string, Object>;
+    const outbounds: Object[] = (root['outbounds'] as Object[]) ?? [];
+    let target: Record<string, Object> | null = null;
+    for (const item of outbounds) {
+      const ob: Record<string, Object> = item as Record<string, Object>;
+      if (!isHelperOutbound(ob) && outboundEndpoint(ob) !== null) {
+        target = ob;
+        break;
+      }
+    }
+    if (target === null) {
+      return badges;
+    }
+    const streamRaw: Object | undefined = target['streamSettings'] as Object | undefined;
+    if (streamRaw !== undefined && streamRaw !== null) {
+      const stream: Record<string, Object> = streamRaw as Record<string, Object>;
+      const netRaw: string = textOf(stream['network']).toLowerCase();
+      if (netRaw.length > 0 && netRaw !== 'raw') {
+        let netLabel: string = netRaw.toUpperCase();
+        if (netRaw === 'xhttp' || netRaw === 'splithttp') {
+          netLabel = 'XHTTP';
+        } else if (netRaw === 'httpupgrade') {
+          netLabel = 'HTTPUp';
+        } else if (netRaw === 'grpc') {
+          netLabel = 'gRPC';
+        } else if (netRaw === 'ws') {
+          netLabel = 'WS';
+        } else if (netRaw === 'tcp') {
+          netLabel = 'TCP';
+        } else if (netRaw === 'h2' || netRaw === 'http') {
+          netLabel = 'H2';
+        } else if (netRaw === 'hysteria' || netRaw === 'quic') {
+          netLabel = 'QUIC';
+        }
+        badges.push({ text: netLabel, fg: '#4DE6A8', bg: '#13332B' });
+      }
+      const secRaw: string = textOf(stream['security']).toLowerCase();
+      if (secRaw === 'reality') {
+        badges.push({ text: 'REALITY', fg: '#FFB463', bg: '#382716' });
+      } else if (secRaw === 'tls') {
+        badges.push({ text: 'TLS', fg: '#FFB463', bg: '#382716' });
+      }
+    } else if (protoLabel === 'HY2') {
+      badges.push({ text: 'QUIC', fg: '#4DE6A8', bg: '#13332B' });
+    } else if (protoLabel === 'WG') {
+      badges.push({ text: 'UDP', fg: '#4DE6A8', bg: '#13332B' });
+    }
+    const settingsRaw: Object | undefined = target['settings'] as Object | undefined;
+    if (settingsRaw !== undefined && settingsRaw !== null) {
+      const settings: Record<string, Object> = settingsRaw as Record<string, Object>;
+      let flow: string = textOf(settings['flow']);
+      if (flow.length === 0) {
+        const vnext: Object[] | undefined = settings['vnext'] as Object[] | undefined;
+        if (vnext !== undefined && vnext.length > 0) {
+          const first: Record<string, Object> = vnext[0] as Record<string, Object>;
+          const users: Object[] | undefined = first['users'] as Object[] | undefined;
+          if (users !== undefined && users.length > 0) {
+            flow = textOf((users[0] as Record<string, Object>)['flow']);
+          }
+        }
+      }
+      if (flow.toLowerCase().indexOf('vision') >= 0) {
+        badges.push({ text: 'Vision', fg: '#C7A6FF', bg: '#281F44' });
+      }
+    }
+  } catch (error) {
+  }
+  return badges;
 }
 
 // Compact protocol badge for the node list; the raw protocol names are too long
@@ -414,30 +538,25 @@ function numberOf(value: Object | undefined, fallback: number): number {
 // Ask the extension to cancel the probes already running. Fire-and-forget: the
 // caller does not wait for an answer, a cancelled probe just resolves as a
 // failure in whichever worker still awaits it.
-export function cancelProbes(): void {
-  const data: commonEventManager.CommonEventPublishData = { parameters: {} };
-  try {
-    commonEventManager.publish(PROBE_CANCEL_EVENT, data, () => {
-    });
-  } catch (error) {
-  }
+export function cancelProbes(context?: common.Context | null): void {
+  publishScopedEvent(appEvent('PROBE_CANCEL', context), {}, context);
 }
 
 // HTTP(S) GET through one named outbound of the running core: the node's real
 // delay, measured by the proxy itself (v2rayNG's "real delay").
 //
 // The core lives in the VPN extension's process, so this process cannot call the
-// FFI directly: the request goes to `com.way.app.PROBE`, the extension runs the
-// probe as NAPI async work and answers on `com.way.app.PROBE_RESULT`. `status`
+// FFI directly: the request goes to `<bundle>.PROBE`, the extension runs the
+// probe as NAPI async work and answers on `<bundle>.PROBE_RESULT`. `status`
 // is the FFI status: non-zero means the probe did not run at all (the tag is not
 // part of the running config, or the core is down), and the caller should fall
 // back to a direct TCP/UDP probe.
 export async function probeOutbound(url: string, timeoutMs: number,
-  tag: string): Promise<OutboundProbeResult> {
+  tag: string, context?: common.Context | null): Promise<OutboundProbeResult> {
   const requestId: string = Date.now().toString(36) + Math.floor(Math.random() * 1000000).toString(36);
   let subscriber: commonEventManager.CommonEventSubscriber | null = null;
   try {
-    subscriber = await commonEventManager.createSubscriber({ events: [PROBE_RESULT_EVENT] });
+    subscriber = await commonEventManager.createSubscriber({ events: [appEvent('PROBE_RESULT', context)] });
   } catch (error) {
     return probeFailure('probe: cannot subscribe');
   }
@@ -468,7 +587,7 @@ export async function probeOutbound(url: string, timeoutMs: number,
           return;
         }
         const params: Record<string, Object> = data.parameters as Record<string, Object>;
-        if (params === undefined || params === null) {
+        if (!verifyIpcParams(params, context)) {
           return;
         }
         if ((params['requestId'] as string) !== requestId) {
@@ -489,9 +608,7 @@ export async function probeOutbound(url: string, timeoutMs: number,
         'url': url,
         'timeoutMs': timeoutMs
       };
-      const data: commonEventManager.CommonEventPublishData = { parameters: payload };
-      commonEventManager.publish(PROBE_REQUEST_EVENT, data, () => {
-      });
+      publishScopedEvent(appEvent('PROBE', context), payload, context);
     } catch (error) {
       finish(probeFailure('probe: cannot publish'));
     }
@@ -522,7 +639,7 @@ export async function reloadRouting(context: common.Context): Promise<ReloadResu
   const requestId: string = Date.now().toString(36) + Math.floor(Math.random() * 1000000).toString(36);
   let subscriber: commonEventManager.CommonEventSubscriber | null = null;
   try {
-    subscriber = await commonEventManager.createSubscriber({ events: [RELOAD_RESULT_EVENT] });
+    subscriber = await commonEventManager.createSubscriber({ events: [appEvent('RELOAD_ROUTING_RESULT', context)] });
   } catch (error) {
     const failed: ReloadResult = { ok: false, reason: 'subscribe failed' };
     return failed;
@@ -555,7 +672,7 @@ export async function reloadRouting(context: common.Context): Promise<ReloadResu
           return;
         }
         const params: Record<string, Object> = data.parameters as Record<string, Object>;
-        if (params === undefined || params === null) {
+        if (!verifyIpcParams(params, context)) {
           return;
         }
         if ((params['requestId'] as string) !== requestId) {
@@ -569,9 +686,7 @@ export async function reloadRouting(context: common.Context): Promise<ReloadResu
         finish(result);
       });
       const payload: Record<string, Object> = { 'requestId': requestId };
-      const data: commonEventManager.CommonEventPublishData = { parameters: payload };
-      commonEventManager.publish(RELOAD_REQUEST_EVENT, data, () => {
-      });
+      publishScopedEvent(appEvent('RELOAD_ROUTING', context), payload, context);
     } catch (error) {
       const failed: ReloadResult = { ok: false, reason: 'publish failed' };
       finish(failed);
@@ -603,7 +718,7 @@ async function askConnections(params: Record<string, Object>): Promise<Connectio
   const requestId: string = Date.now().toString(36) + Math.floor(Math.random() * 1000000).toString(36);
   let subscriber: commonEventManager.CommonEventSubscriber | null = null;
   try {
-    subscriber = await commonEventManager.createSubscriber({ events: [CONN_RESULT_EVENT] });
+    subscriber = await commonEventManager.createSubscriber({ events: [appEvent('CONNECTIONS_RESULT')] });
   } catch (error) {
     return { ok: false, payload: 'cannot subscribe' };
   }
@@ -634,7 +749,7 @@ async function askConnections(params: Record<string, Object>): Promise<Connectio
           return;
         }
         const params: Record<string, Object> = data.parameters as Record<string, Object>;
-        if (params === undefined || params === null || (params['requestId'] as string) !== requestId) {
+        if (!verifyIpcParams(params) || (params['requestId'] as string) !== requestId) {
           return;
         }
         const reply: ConnectionReply = {
@@ -649,9 +764,7 @@ async function askConnections(params: Record<string, Object>): Promise<Connectio
       for (const key of Object.keys(params)) {
         payload[key] = params[key];
       }
-      const data: commonEventManager.CommonEventPublishData = { parameters: payload };
-      commonEventManager.publish(CONN_REQUEST_EVENT, data, () => {
-      });
+      publishScopedEvent(appEvent('CONNECTIONS'), payload);
     } catch (error) {
       finish({ ok: false, payload: 'publish failed' });
     }
@@ -716,71 +829,157 @@ export interface OutboundProbeSpec {
   tag: string;
   url: string;
   timeoutMs: number;
+  socksPort?: number;
+}
+
+export interface ProbeProfilesBatchResult {
+  ok: boolean;
+  results: OutboundProbeResult[];
+  error: string;
+}
+
+function parseProbeResultsArray(raw: string): OutboundProbeResult[] {
+  const results: OutboundProbeResult[] = [];
+  if (raw.length === 0) {
+    return results;
+  }
+  try {
+    const arr: Object[] = JSON.parse(raw) as Object[];
+    for (const item of arr) {
+      const o: Record<string, Object> = item as Record<string, Object>;
+      results.push({
+        status: numberOf(o['status'], -1),
+        delayMs: numberOf(o['delayMs'], 0),
+        failureKind: numberOf(o['failureKind'], 0),
+        httpStatus: numberOf(o['httpStatus'], 0),
+        message: textOf(o['message'])
+      });
+    }
+  } catch (e) {
+  }
+  return results;
+}
+
+// Runs the temporary probe core directly in the UI process when the VPN is not
+// active (no TUN exists, so outbound sockets go direct without needing
+// protectProcessNet or the VPN extension process).
+export async function probeProfilesLocal(configJson: string, probes: OutboundProbeSpec[],
+  geodataDir: string): Promise<ProbeProfilesBatchResult> {
+  try {
+    const raw: string = JSON.stringify(
+      await native.probeProfiles(configJson, probes as Object[], geodataDir) as Object);
+    return { ok: true, results: parseProbeResultsArray(raw), error: '' };
+  } catch (error) {
+    const message: string = typeof error === 'string' ? error : JSON.stringify(error);
+    return { ok: false, results: [], error: message };
+  }
 }
 
 // v2rayNG-style real delay: the extension builds a temporary TUN-less core from
-// the supplied config, probes every tagged outbound, then frees it. The live
-// tunnel/core are not touched.
+// the supplied config, resolves node hosts via protected UDP DNS (avoiding
+// FakeIP 198.19.x.x), probes every tagged outbound, then frees it.
+// Uses private sandbox files for request/response payloads so HarmonyOS
+// CommonEvent parameter size limits can never silently drop a batch.
 export async function probeProfiles(configJson: string, probes: OutboundProbeSpec[],
-  geodataDir: string): Promise<OutboundProbeResult[]> {
+  geodataDir: string, timeoutMs: number = 22000,
+  context?: common.Context | null): Promise<ProbeProfilesBatchResult> {
   const requestId: string = Date.now().toString(36) + Math.floor(Math.random() * 1000000).toString(36);
+  let reqFilePath: string = '';
+  let resFilePath: string = '';
+  if (context !== undefined && context !== null) {
+    try {
+      const dir: string = ensureXrayDir(context);
+      reqFilePath = dir + '/probe-req-' + requestId + '.json';
+      resFilePath = dir + '/probe-res-' + requestId + '.json';
+      const reqDoc: Record<string, Object> = {
+        'config': configJson,
+        'probes': probes as Object,
+        'geodataDir': geodataDir
+      };
+      const file = fs.openSync(reqFilePath, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
+      fs.writeSync(file.fd, JSON.stringify(reqDoc));
+      fs.closeSync(file);
+    } catch (error) {
+      reqFilePath = '';
+      resFilePath = '';
+    }
+  }
+  const cleanupFiles = (): void => {
+    for (const p of [reqFilePath, resFilePath]) {
+      if (p.length > 0) {
+        try {
+          if (fs.accessSync(p)) {
+            fs.unlinkSync(p);
+          }
+        } catch (error) {
+        }
+      }
+    }
+  };
   let subscriber: commonEventManager.CommonEventSubscriber | null = null;
   try {
-    subscriber = await commonEventManager.createSubscriber({ events: [PROBE_PROFILES_RESULT_EVENT] });
+    subscriber = await commonEventManager.createSubscriber({ events: [appEvent('PROBE_PROFILES_RESULT', context)] });
   } catch (error) {
-    return [];
+    cleanupFiles();
+    return { ok: false, results: [], error: 'cannot subscribe' };
   }
   const pending = subscriber;
-  return new Promise<OutboundProbeResult[]>((resolve) => {
+  return new Promise<ProbeProfilesBatchResult>((resolve) => {
     let settled: boolean = false;
     let timer: number = -1;
-    const finish = (value: OutboundProbeResult[]): void => {
+    const finish = (value: ProbeProfilesBatchResult): void => {
       if (settled) return;
       settled = true;
       if (timer !== -1) clearTimeout(timer);
       try { commonEventManager.unsubscribe(pending); } catch (error) {}
+      cleanupFiles();
       resolve(value);
     };
-    timer = setTimeout(() => finish([]), 90000);
+    timer = setTimeout(() => finish({ ok: false, results: [], error: 'extension probe timeout' }), timeoutMs);
     try {
       commonEventManager.subscribe(pending, (error, data) => {
         if (error !== undefined && error !== null && error.code !== 0) return;
         const params: Record<string, Object> = data.parameters as Record<string, Object>;
-        if (params === undefined || params === null) return;
+        if (!verifyIpcParams(params, context)) return;
         if ((params['requestId'] as string) !== requestId) return;
-        const raw: string = (params['results'] as string) ?? '';
-        const results: OutboundProbeResult[] = [];
-        try {
-          const arr: Object[] = JSON.parse(raw) as Object[];
-          for (const item of arr) {
-            const o: Record<string, Object> = item as Record<string, Object>;
-            results.push({
-              status: numberOf(o['status'], -1),
-              delayMs: numberOf(o['delayMs'], 0),
-              failureKind: numberOf(o['failureKind'], 0),
-              httpStatus: numberOf(o['httpStatus'], 0),
-              message: textOf(o['message'])
-            });
+        const okFlag: Object | undefined = params['ok'];
+        const ok: boolean = okFlag === undefined ? true : (okFlag === 1 || okFlag === '1');
+        let raw: string = (params['results'] as string) ?? '';
+        const resFile: string = (params['resFile'] as string) ?? '';
+        if (raw.length === 0 && resFile.length > 0) {
+          try {
+            if (fs.accessSync(resFile)) {
+              raw = fs.readTextSync(resFile);
+            }
+          } catch (readErr) {
           }
-        } catch (e) {}
-        finish(results);
+        }
+        const errText: string = textOf(params['error']);
+        finish({ ok: ok, results: parseProbeResultsArray(raw), error: errText });
       });
     } catch (e) {
-      finish([]);
+      finish({ ok: false, results: [], error: 'subscribe failed' });
       return;
     }
-    const params: Record<string, Object> = {
-      'requestId': requestId,
-      'config': configJson,
-      'probes': JSON.stringify(probes),
-      'geodataDir': geodataDir
-    };
-    const data: commonEventManager.CommonEventPublishData = { parameters: params };
-    try {
-      commonEventManager.publish(PROBE_PROFILES_REQUEST_EVENT, data, () => {});
-    } catch (e) {
-      finish([]);
-    }
+    // Yield briefly so CES finishes registering the subscriber before publishing.
+    setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      const params: Record<string, Object> = reqFilePath.length > 0
+        ? {
+          'requestId': requestId,
+          'reqFile': reqFilePath,
+          'resFile': resFilePath
+        }
+        : {
+          'requestId': requestId,
+          'config': configJson,
+          'probes': JSON.stringify(probes),
+          'geodataDir': geodataDir
+        };
+      publishScopedEvent(appEvent('PROBE_PROFILES', context), params, context);
+    }, 35);
   });
 }
 
@@ -811,7 +1010,7 @@ export function coreVersion(): string {
 export function vpnWant(context: common.Context, notify: boolean, rebind: boolean,
   taskNotificationId: number = -1, nodeName: string = ''): Want {
   const want: Want = {
-    bundleName: BUNDLE_NAME,
+    bundleName: appBundleName(context),
     abilityName: VPN_ABILITY,
     parameters: {
       'configPath': configPath(context),
@@ -890,7 +1089,9 @@ export function readLogs(context: common.Context, limit: number): string {
     if (!fs.accessSync(dir)) {
       return '';
     }
-    const names: string[] = ['ability.log', 'app.log'];
+    // Put app.log (keepalive/card/UI lifecycle) first so verbose core route logs
+    // in ability.log never push keepalive diagnostics out of the 30-line view.
+    const names: string[] = ['app.log', 'ability.log'];
     const budget: number = limit > 2000 ? limit / 2 : 1000;
     const parts: string[] = [];
     for (const name of names) {

@@ -6,22 +6,41 @@ import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { wantAgent, WantAgent } from '@kit.AbilityKit';
 import type { Want } from '@kit.AbilityKit';
 import type { BusinessError } from '@kit.BasicServicesKit';
+import { pasteboard, deviceInfo } from '@kit.BasicServicesKit';
 import { preferences } from '@kit.ArkData';
-import { promptAction, router } from '@kit.ArkUI';
+import { promptAction, router, uiMaterial } from '@kit.ArkUI';
+import { CommonModifier } from '@ohos.arkui.modifier';
 import { connection } from '@kit.NetworkKit';
 import { commonEventManager } from '@kit.BasicServicesKit';
 import {
-  Insets, ReloadResult, TunnelStatus, clearStatus, coreVersion, formatBytes, formatDuration, formatTime,
-  reloadRouting, tunnelUp,
-  NodeEndpoint, formatSpeed, nodeEndpoint, nodeTypeLabel, outboundEndpoint, pageInsets, readLogs, tunnelOutboundTags, xrayDir,
-  readStatus, saveConfig, startVpn, stopVpn, vpnWant, loadConfig
+  ALL_THEMES, AppTheme, THEME_DARK, loadSavedThemeId, saveThemeId, syncWindowBars, themeById
+} from '../common/Theme';
+import {
+  APP_VERSION_NAME, CORE_ID_RUST, CORE_ID_UPSTREAM, CORE_RUST_REPO_URL, CORE_UPSTREAM_REPO_URL,
+  CORE_VERSION_NAME, CoreUpdateState, DISCLAIMER_TEXT, KernelManifestEntry, PROJECT_REPO_URL,
+  UpdateCheckResult, checkAllUpdates, defaultCoreState, isCoreBundled, markCoreHealthy,
+  readCoreState, rollbackCoreOnError, stageCoreUpdate
+} from '../common/Updater';
+import {
+  Insets, NodeBadge, ReloadResult, TunnelStatus, appBundleName, appEvent, clearStatus, coreVersion,
+  extractNodeBadges, formatBytes, formatDuration, formatTime, reloadRouting, tunnelUp,
+  NodeEndpoint, formatSpeed, nodeEndpoint, nodeTypeLabel, outboundEndpoint, pageInsets, readLogs,
+  tunnelOutboundTags, xrayDir, readStatus, saveConfig, saveTaskNotificationId, startVpn, stopVpn,
+  vpnWant, loadConfig
 } from '../common/Xray';
-import { ConfigEntry, SubscriptionRecord, readStore, readSubs, selectEntry, selectedEntry } from '../common/Store';
-import { refreshSubscription } from '../common/Subscription';
-import { LatencyResult, TEST_HOST, testAll, testAllConfig } from '../common/Speedtest';
+import {
+  ConfigEntry, SubscriptionRecord, entriesOfSub, findById, manualEntries, readStore, readSubs,
+  removeEntry, removeSub, selectEntry, selectedEntry, subIdOf, updateSub
+} from '../common/Store';
+import { formatExpire, formatQuota, refreshSubscription } from '../common/Subscription';
+import {
+  LatencyResult, TEST_CONCURRENCY, TEST_HOST, sortByLatency, testNodesRealDelay, testOne
+} from '../common/Speedtest';
+import { isFakeOrReservedIp } from '../common/Latency';
 import { resolveUdp } from '../common/UdpDns';
 import { LatencyEntry, readLatencyCache, recordLatency } from '../common/LatencyStore';
 import { appLog } from '../common/AppLog';
+import { initIpcAuth, publishScopedEvent, verifyIpcParams } from '../common/IpcAuth';
 import { MODE_BYPASS, MODE_GFW, MODE_GLOBAL, SplitOptions } from '../common/Rules';
 import { TunnelConfigResult, buildAndSaveTunnel, proxyOutbound } from '../common/TunnelConfig';
 import { SSID_DIRECT, SSID_SUSPEND, SsidRule, clearSsidRules, currentSsid, findRule, onDemandEnabled, removeSsidRule, setAppliedSsidAction, setFlag, setSsidRule, setSsidSuspended, setSuspendOverride, ssidRules, ssidSuspended, suspendOverride } from '../common/Ssid';
@@ -34,6 +53,7 @@ import { RuleBuildProgress, buildRuleSet } from '../common/RuleSource';
 
 const PREF_NAME: string = 'xray_prefs';
 const POLL_MS: number = 1000;
+const FG_SELECTED_PROBE_MS: number = 5 * 60 * 1000;
 // The extension writes status.json once per second. Five missed beats means
 // the extension process is gone (or its JS thread is wedged), so the UI
 // supervisor relaunches it instead of leaving the user with a dead switch.
@@ -109,13 +129,14 @@ struct Index {
   private prevStamp: number = 0;
   private trafficSubscriber: commonEventManager.CommonEventSubscriber | null = null;
   private takeoverSubscriber: commonEventManager.CommonEventSubscriber | null = null;
+  private needTaskIdSubscriber: commonEventManager.CommonEventSubscriber | null = null;
+  private taskReviveAttempts: number = 0;
   // 连接前解析好的节点服务器地址（写进 config 的 dns.hosts）。
   private bootstrapHosts: Record<string, string[]> | null = null;
   private usedFallback: boolean = false;
   private keepAliveStarted: boolean = false
-  // True while the widget-preview TempAbility owns the continuous task; the UI
-  // must not request a second task (that produced two notifications).
   private keepAliveOwnedByTemp: boolean = false;
+  @State keepAliveTaskCanceled: boolean = false;
   // Watchdog for the extension heartbeat: lastBeatAt is the extension's own
   // status.updatedAt, lastStartRequestAt is when this UI last asked the system
   // to launch it. Recovery is bounded (RECOVERY_MAX_ATTEMPTS) with backoff.
@@ -141,6 +162,10 @@ struct Index {
   private taskId: number = -1;
   private taskNotificationId: number = -1;
   private taskWatchRegistered: boolean = false;
+  private taskCancelHandler: ((cancelInfo: backgroundTaskManager.ContinuousTaskCancelInfo) => void) | null = null;
+  private taskAcquiring: boolean = false;
+  private lastTaskAcquireAt: number = 0;
+  private taskStableSince: number = 0;
   @State geoText: string = '未下载';
   @State hasRuleSet: boolean = false;
   @State ruleSetText: string = '未导入（使用内置规则）';
@@ -158,21 +183,69 @@ struct Index {
   @State nodeLatency: Map<string, number> = new Map<string, number>();
   @State nodeProbing: boolean = false;
   @State selectedId: string = '';
+  private activeNodeId: string = '';
   @State ssidExpanded: boolean = false;
   // Measured height of the floating title bar; used as the scroll's top spacer
   // so the first card never hides underneath it.
   @State headerHeight: number = 72;
   @State dohDns: boolean = true;
+  @State dnsLeakProtect: boolean = true;
+  @State webrtcLeakProtect: boolean = true;
   @State blockAdText: string = '0';
   @State geoBusy: boolean = false;
+  // Anywhere-style 3-tab navigation: 0 主页, 1 节点, 2 设置.
+  @State activeTab: number = 0;
+  // Anywhere-style drill-down sub-page inside Settings tab:
+  // '' | 'appearance' | 'routing' | 'privacy' | 'keepalive' | 'wifi' | 'logs' | 'about'
+  @State settingsSubPage: string = '';
+  @State themeId: string = 'dark';
+  @State theme: AppTheme = THEME_DARK;
+  // Floating frosted navigation bar drag-highlight state (modelled on sing-box-for-harmonyos).
+  @State navDragging: boolean = false;
+  @State navPointerX: number = 0;
+  @State navPreviewIndex: number = -1;
+  @State navBarWidth: number = 0;
+  private navIgnoreClickUntil: number = 0;
+  private nativeGlassSupport: boolean | null = null;
+  private glassModifierCache: Map<string, CommonModifier> = new Map<string, CommonModifier>();
+  // About & GitHub update / core rollback protection state.
+  @State updateChecking: boolean = false;
+  @State updateResult: UpdateCheckResult | null = null;
+  @State coreState: CoreUpdateState = defaultCoreState();
+  @State subs: SubscriptionRecord[] = [];
+  @State expandedSubId: string = '';
+  @State editingSubId: string = '';
+  @State editSubName: string = '';
+  @State editSubUrl: string = '';
+  @State updatingSubIds: string[] = [];
+  @State testingIds: string[] = [];
+  @State testDone: number = 0;
+  @State testTotal: number = 0;
+  @State sortByDelay: boolean = false;
+  private lastWaitPhase: string = '';
+  private startingSince: number = 0;
+  private initialSubExpanded: boolean = false;
 
   private ctx: common.UIAbilityContext | null = null;
   private timerId: number = -1;
   private tickCount: number = 0;
   private backgroundRunning: boolean = false;
+  private pageVisible: boolean = false;
+  private resumedAt: number = 0;
+  private fgProbeTimer: number = -1;
+  private fgProbeInFlight: boolean = false;
 
   aboutToAppear(): void {
     this.ctx = getContext(this) as common.UIAbilityContext;
+    initIpcAuth(this.ctx);
+    this.coreState = readCoreState(this.ctx);
+    loadSavedThemeId(this.ctx).then((id: string) => {
+      this.themeId = id;
+      this.theme = themeById(id);
+      if (this.ctx !== null) {
+        syncWindowBars(this.ctx, this.theme);
+      }
+    });
     pageInsets(this.ctx).then((value: Insets) => {
       this.insets = value;
     });
@@ -181,53 +254,454 @@ struct Index {
     });
     this.watchNetworkChanges();
     this.watchKeepAliveTakeover();
+    this.watchNeedTaskId();
     this.startPolling();
   }
 
   // The page timer must be restarted on every show: aboutToAppear runs only
-  // once, so clearing it on hide used to leave the dashboard frozen at the
-  // values captured when the app went background.
+  // once, so clearing it on hide keeps background CPU/data updates at zero
+  // (only the status bar live view keeps updating while in background).
   onPageShow(): void {
+    this.pageVisible = true;
+    this.resumedAt = Date.now();
+    this.notifyUiVisibility(true);
     this.consumeCardOp();
     this.refreshIntent();
     this.refreshEntry();
+    if (this.ctx !== null) {
+      this.coreState = readCoreState(this.ctx);
+      syncWindowBars(this.ctx, this.theme);
+    }
+    this.syncSelectedNodeIfRunning();
     this.refreshRuleSetStatus();
     this.loadLatencyCache();
     this.startPolling();
     this.subscribeTraffic();
-    this.poll();
+    this.startFgSelectedProbe();
+    setTimeout(() => {
+      if (this.pageVisible) {
+        this.poll();
+      }
+    }, 250);
   }
 
-  // FlClash-style keepalive entry: open the system widget picker for the way
-  // card. The picker previews the card, its onAppear calls TempAbility, and
-  // TempAbility starts the VPN + continuous task. The user just exits the
-  // picker; the card does not need to be added to the desktop.
-  private openKeepAliveForm(): void {
-    const want: Want = {
-      bundleName: 'com.way.app',
-      abilityName: 'WayFormAbility',
-      parameters: {
-        'ohos.extra.param.key.form_name': 'way_widget',
-        'ohos.extra.param.key.module_name': 'entry',
-        'ohos.extra.param.key.form_dimension': formInfo.FormDimension.Dimension_2_2
-      }
-    };
-    // Do NOT release the UI task here. TempAbility acquires its own task first
-    // and then broadcasts KEEPALIVE_TAKEOVER; the UI stops its task only after
-    // that. Stopping first left the VPN without any task if the picker preview
-    // failed to call TempAbility, and the system then reclaimed the VPN.
+  onPageHide(): void {
+    this.pageVisible = false;
+    this.stopPolling();
+    this.unsubscribeTraffic();
+    this.stopFgSelectedProbe();
+    this.notifyUiVisibility(false);
+  }
+
+  private notifyUiVisibility(visible: boolean): void {
+    const context = this.ctx;
+    if (context === null) {
+      return;
+    }
+    publishScopedEvent(appEvent('UI_VISIBILITY', context), { 'visible': visible ? 1 : 0 }, context);
+  }
+
+  // While the UI stays in the foreground, silently test the selected node once
+  // every 5 minutes and refresh its displayed latency + cache.
+  private startFgSelectedProbe(): void {
+    if (this.fgProbeTimer !== -1) {
+      return;
+    }
+    this.fgProbeTimer = setInterval(() => {
+      this.runFgSelectedProbe().catch((): void => {
+      });
+    }, FG_SELECTED_PROBE_MS);
+  }
+
+  private stopFgSelectedProbe(): void {
+    if (this.fgProbeTimer !== -1) {
+      clearInterval(this.fgProbeTimer);
+      this.fgProbeTimer = -1;
+    }
+  }
+
+  private async runFgSelectedProbe(): Promise<void> {
+    if (!this.pageVisible || this.busy || this.nodeProbing || this.fgProbeInFlight) {
+      return;
+    }
+    const context = this.ctx;
+    if (context === null) {
+      return;
+    }
+    const entry: ConfigEntry | null = selectedEntry(context);
+    if (entry === null) {
+      return;
+    }
+    this.fgProbeInFlight = true;
     try {
-      formProvider.openFormManager(want);
+      const viaTunnel: boolean = tunnelUp(context);
+      const tags: string[] = viaTunnel ? tunnelOutboundTags(context) : [];
+      let tag: string = '';
+      for (const item of tags) {
+        if (item === entry.id) {
+          tag = item;
+          break;
+        }
+      }
+      const res: LatencyResult = await testOne(entry, viaTunnel, tag, this.bootstrapHosts, context);
+      if (!this.pageVisible) {
+        return;
+      }
+      const next: Map<string, number> = new Map<string, number>(this.nodeLatency);
+      next.set(res.id, res.ms);
+      this.nodeLatency = next;
+      if (res.ms > 0) {
+        this.probeMs = res.ms;
+      }
+      recordLatency(context, res.id, res.ms, res.via);
     } catch (error) {
-      promptAction.showToast({ message: '打开卡片预览失败' });
+    } finally {
+      this.fgProbeInFlight = false;
+    }
+  }
+
+  // If the user picked a different node in the Configs page while the tunnel is
+  // already running, immediately switch the lean single-node core to it.
+  private syncSelectedNodeIfRunning(): void {
+    const context = this.ctx;
+    if (context === null || this.busy || !this.isTunnelRunning()) {
+      return;
+    }
+    const entry: ConfigEntry | null = selectedEntry(context);
+    if (entry === null) {
+      return;
+    }
+    if (this.activeNodeId.length === 0) {
+      this.activeNodeId = entry.id;
+      return;
+    }
+    if (entry.id !== this.activeNodeId) {
+      this.activeNodeId = entry.id;
+      this.selectedId = entry.id;
+      this.restartTunnel(context, entry).catch((): void => {
+      });
     }
   }
 
   aboutToDisappear(): void {
+    this.pageVisible = false;
     this.stopPolling();
     this.unsubscribeTraffic();
+    this.stopFgSelectedProbe();
+    this.notifyUiVisibility(false);
     this.unwatchNetworkChanges();
     this.unwatchKeepAliveTakeover();
+    this.unwatchNeedTaskId();
+    this.unregisterTaskWatch();
+  }
+
+  onBackPress(): boolean {
+    if (this.activeTab === 2 && this.settingsSubPage.length > 0) {
+      this.closeSettingsSubPage();
+      return true;
+    }
+    return false;
+  }
+
+  private openSettingsSubPage(page: string): void {
+    this.settingsSubPage = page;
+    if (page === 'logs') {
+      this.showLogs = true;
+      if (this.ctx !== null) {
+        this.logs = readLogs(this.ctx, 6000);
+      }
+    } else if (page === 'wifi') {
+      this.refreshSsid();
+    }
+  }
+
+  private closeSettingsSubPage(): void {
+    if (this.settingsSubPage === 'logs') {
+      this.showLogs = false;
+    }
+    this.settingsSubPage = '';
+  }
+
+  private settingsSubTitle(): string {
+    if (this.settingsSubPage === 'appearance') {
+      return '外观与主题';
+    }
+    if (this.settingsSubPage === 'routing') {
+      return '分流与路由';
+    }
+    if (this.settingsSubPage === 'privacy') {
+      return '隧道与隐私防护';
+    }
+    if (this.settingsSubPage === 'keepalive') {
+      return '后台保活与通知';
+    }
+    if (this.settingsSubPage === 'wifi') {
+      return '受信任 Wi-Fi';
+    }
+    if (this.settingsSubPage === 'logs') {
+      return '诊断与运行日志';
+    }
+    if (this.settingsSubPage === 'about') {
+      return '内核与关于';
+    }
+    return '设置';
+  }
+
+  private async selectTheme(id: string): Promise<void> {
+    const next: AppTheme = themeById(id);
+    this.themeId = next.id;
+    this.theme = next;
+    this.glassModifierCache.clear();
+    if (this.ctx !== null) {
+      await saveThemeId(this.ctx, next.id);
+      await syncWindowBars(this.ctx, next);
+    }
+  }
+
+  private async runUpdateCheck(): Promise<void> {
+    if (this.updateChecking) {
+      return;
+    }
+    this.updateChecking = true;
+    try {
+      const result: UpdateCheckResult = await checkAllUpdates();
+      this.updateResult = result;
+      if (result.error.length > 0) {
+        promptAction.showToast({ message: result.error });
+      } else if (result.app !== null && result.app.hasUpdate) {
+        promptAction.showToast({ message: '发现客户端新版本 ' + result.app.tag });
+      } else if (result.coreRust !== null && result.coreRust.hasUpdate) {
+        promptAction.showToast({ message: '发现 xray-rust 新版本 ' + result.coreRust.tag });
+      } else if (result.coreUpstream !== null) {
+        promptAction.showToast({ message: '已同步上游版本：Xray-core ' + result.coreUpstream.tag });
+      } else {
+        promptAction.showToast({ message: '当前已是最新版本' });
+      }
+    } finally {
+      this.updateChecking = false;
+    }
+  }
+
+  private manifestForCore(coreId: string): KernelManifestEntry | null {
+    if (this.updateResult === null) {
+      return null;
+    }
+    for (const item of this.updateResult.manifest) {
+      if (item.id === coreId) {
+        return item;
+      }
+    }
+    return null;
+  }
+
+  private selectCoreEngine(coreId: string): void {
+    const context = this.ctx;
+    if (context === null) {
+      return;
+    }
+    if (this.coreState.activeCore === coreId) {
+      promptAction.showToast({ message: '当前已使用 ' + coreId });
+      return;
+    }
+    const manifestEntry: KernelManifestEntry | null = this.manifestForCore(coreId);
+    const targetVer: string = manifestEntry !== null && manifestEntry.version.length > 0
+      ? manifestEntry.version
+      : (coreId === CORE_ID_RUST ? CORE_VERSION_NAME : 'latest');
+    this.coreState = stageCoreUpdate(context, coreId, targetVer);
+    if (!isCoreBundled(coreId)) {
+      this.coreState = rollbackCoreOnError(
+        context,
+        '当前安装包未内置 ' + coreId + ' 二进制，请下载 GitHub 自动构建双内核版'
+      );
+      promptAction.showToast({ message: this.coreState.lastRollbackReason, duration: 4000 });
+      return;
+    }
+    try {
+      const abi: string = coreVersion();
+      if (abi.length === 0) {
+        throw new Error('内核 ABI 校验返回空');
+      }
+      this.coreInfo = abi;
+      this.coreState = markCoreHealthy(context);
+      promptAction.showToast({ message: '已切换至 ' + coreId + ' ' + this.coreState.activeVersion });
+    } catch (error) {
+      const err = error as BusinessError;
+      this.coreState = rollbackCoreOnError(context, err.message ?? '内核初始化失败');
+      promptAction.showToast({ message: this.coreState.lastRollbackReason, duration: 4000 });
+    }
+  }
+
+  private verifyCoreIntegrity(): void {
+    const context = this.ctx;
+    if (context === null) {
+      return;
+    }
+    try {
+      const abi: string = coreVersion();
+      if (abi.length === 0) {
+        throw new Error('内核 ABI 版本读取为空');
+      }
+      this.coreInfo = abi;
+      this.coreState = markCoreHealthy(context);
+      promptAction.showToast({ message: '内核校验通过：xray-rust ' + CORE_VERSION_NAME + ' (ABI ' + abi + ')' });
+    } catch (error) {
+      const err = error as BusinessError;
+      const reason: string = err.message ?? '内核加载异常';
+      this.coreState = rollbackCoreOnError(context, reason);
+      promptAction.showToast({ message: this.coreState.lastRollbackReason, duration: 4000 });
+    }
+  }
+
+  private openExternalUrl(url: string, label: string): void {
+    const context = this.ctx;
+    if (context === null) {
+      this.copyPlainText(url, label);
+      return;
+    }
+    const want: Want = {
+      action: 'ohos.want.action.viewData',
+      entities: ['entity.system.browsable'],
+      uri: url
+    };
+    context.startAbility(want).catch(() => {
+      this.copyPlainText(url, label);
+    });
+  }
+
+  // ==================== Sing-box Style Floating Frosted Nav Bar Helpers ====================
+
+  private nativeGlassAvailable(): boolean {
+    if (this.nativeGlassSupport !== null) {
+      return this.nativeGlassSupport;
+    }
+    let supported: boolean = false;
+    try {
+      if (deviceInfo.apiAvailable('26.0.0')) {
+        supported = uiMaterial.isImmersiveMaterialSupported();
+      }
+    } catch (error) {
+      supported = false;
+    }
+    this.nativeGlassSupport = supported;
+    return supported;
+  }
+
+  private glassModifier(interactive: boolean): CommonModifier {
+    const key: string = (this.theme.isDark ? 'dark' : 'light') + '-' + interactive;
+    const cached: CommonModifier | undefined = this.glassModifierCache.get(key);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const modifier: CommonModifier = new CommonModifier();
+    if (this.nativeGlassAvailable()) {
+      try {
+        modifier.systemMaterial(new uiMaterial.ImmersiveMaterial({
+          style: uiMaterial.ImmersiveStyle.ULTRA_THIN,
+          materialColor: Color.Transparent,
+          colorInvert: false,
+          applyShadow: interactive,
+          interactive: interactive,
+          lightEffect: { color: this.theme.isDark ? '#55FFFFFF' : '#44FFFFFF' }
+        }));
+      } catch (error) {
+      }
+    }
+    this.glassModifierCache.set(key, modifier);
+    return modifier;
+  }
+
+  private navIndexForX(x: number): number {
+    if (!Number.isFinite(x) || this.navBarWidth <= 0) {
+      return -1;
+    }
+    return Math.min(2, Math.max(0, Math.floor(x / this.navBarWidth * 3)));
+  }
+
+  private highlightedNavIndex(): number {
+    return (this.navDragging && this.navPreviewIndex >= 0) ? this.navPreviewIndex : this.activeTab;
+  }
+
+  private navCapsuleWidth(): number {
+    return Math.max(0, this.navBarWidth / 3 - 8);
+  }
+
+  private navGlowLeft(): number {
+    const glowW: number = this.navCapsuleWidth();
+    if (this.navBarWidth <= 0 || glowW <= 0) {
+      return 4;
+    }
+    const idx: number = this.highlightedNavIndex();
+    const x: number = this.navDragging ? this.navPointerX : ((idx + 0.5) * this.navBarWidth / 3);
+    return Math.min(Math.max(4, this.navBarWidth - glowW - 4), Math.max(4, x - glowW / 2));
+  }
+
+  private selectMainTab(index: number): void {
+    if (index === 2 && this.activeTab === 2 && this.settingsSubPage.length > 0) {
+      this.closeSettingsSubPage();
+      return;
+    }
+    this.activeTab = index;
+    if (index === 1) {
+      this.refreshEntry();
+      this.loadLatencyCache();
+    } else if (index === 2 && this.ctx !== null) {
+      this.coreState = readCoreState(this.ctx);
+    }
+  }
+
+  private finishNavDrag(commit: boolean): void {
+    if (!this.navDragging) {
+      return;
+    }
+    const target: number = (commit && this.navPreviewIndex >= 0) ? this.navPreviewIndex : -1;
+    this.navDragging = false;
+    this.navPreviewIndex = -1;
+    this.navIgnoreClickUntil = Date.now() + 300;
+    if (target >= 0) {
+      this.selectMainTab(target);
+    }
+  }
+
+  private handleNavTouch(event: TouchEvent): void {
+    if (event.type === TouchType.Cancel) {
+      this.finishNavDrag(false);
+      return;
+    }
+    if (event.touches.length > 1) {
+      this.finishNavDrag(false);
+      return;
+    }
+    const point: TouchObject | undefined = event.changedTouches[0] || event.touches[0];
+    if (event.type === TouchType.Down && point !== undefined) {
+      this.navDragging = true;
+      this.navPointerX = point.x;
+      this.navPreviewIndex = this.navIndexForX(point.x);
+    } else if (event.type === TouchType.Move && this.navDragging && point !== undefined) {
+      const clampedX: number = Math.min(this.navBarWidth, Math.max(0, point.x));
+      this.navPointerX = clampedX;
+      this.navPreviewIndex = this.navIndexForX(clampedX);
+    } else if (event.type === TouchType.Up) {
+      if (this.navDragging && point !== undefined) {
+        const clampedX: number = Math.min(this.navBarWidth, Math.max(0, point.x));
+        this.navPointerX = clampedX;
+        this.navPreviewIndex = this.navIndexForX(clampedX);
+      }
+      this.finishNavDrag(true);
+    }
+  }
+
+  private privacySummary(): string {
+    const tags: string[] = [];
+    if (this.dnsLeakProtect) {
+      tags.push('DNS');
+    }
+    if (this.webrtcLeakProtect) {
+      tags.push('WebRTC');
+    }
+    if (tags.length === 0) {
+      return '基础';
+    }
+    return tags.join(' · ');
   }
 
   // Observe network changes so a switch (Wi-Fi <-> cellular) pauses the
@@ -275,18 +749,22 @@ struct Index {
     }
   }
 
-  // The widget-preview TempAbility publishes this before it requests its own
-  // continuous task. Release the UI's task first, otherwise both tasks show a
-  // notification (the system task card + the live view).
+  // Signed takeover event from TempAbility: release the UI's own continuous
+  // task immediately so ONLY TempAbility's single traffic live-view stays up.
   private async watchKeepAliveTakeover(): Promise<void> {
     if (this.takeoverSubscriber !== null) {
       return;
     }
     try {
       const sub: commonEventManager.CommonEventSubscriber =
-        await commonEventManager.createSubscriber({ events: ['com.way.app.KEEPALIVE_TAKEOVER'] });
-      commonEventManager.subscribe(sub, () => {
+        await commonEventManager.createSubscriber({ events: [appEvent('KEEPALIVE_TAKEOVER', this.ctx)] });
+      commonEventManager.subscribe(sub, (_error, data) => {
+        const params: Record<string, Object> = data.parameters as Record<string, Object>;
+        if (!verifyIpcParams(params, this.ctx)) {
+          return;
+        }
         this.keepAliveOwnedByTemp = true;
+        this.keepAliveTaskCanceled = false;
         if (this.keepAliveStarted) {
           this.keepAliveStarted = false;
           this.taskNotificationId = -1;
@@ -294,7 +772,7 @@ struct Index {
           if (context !== null) {
             backgroundTaskManager.stopBackgroundRunning(context).catch((): void => {
             });
-            appLog(context, 'keepalive', 'TempAbility took over the continuous task');
+            appLog(context, 'keepalive', 'TempAbility took over the single continuous task');
           }
         }
       });
@@ -314,6 +792,51 @@ struct Index {
     }
   }
 
+  // Signed request from XrayVpnAbility when lock-screen / watchdog dropped the
+  // live-view notification: immediately re-acquire a fresh notification id and
+  // send it back to the extension so the status bar notification stays alive.
+  private async watchNeedTaskId(): Promise<void> {
+    if (this.needTaskIdSubscriber !== null) {
+      return;
+    }
+    try {
+      const sub: commonEventManager.CommonEventSubscriber =
+        await commonEventManager.createSubscriber({ events: [appEvent('NEED_TASK_ID', this.ctx)] });
+      commonEventManager.subscribe(sub, (_error, data) => {
+        const params: Record<string, Object> = data.parameters as Record<string, Object>;
+        if (!verifyIpcParams(params, this.ctx)) {
+          return;
+        }
+        if (this.intentOn && !this.keepAliveOwnedByTemp && this.canReviveKeepAlive()) {
+          const now: number = Date.now();
+          if (this.taskAcquiring || (this.lastTaskAcquireAt > 0 && now - this.lastTaskAcquireAt < 5000)) {
+            return;
+          }
+          if (this.ctx !== null) {
+            appLog(this.ctx, 'ui', 'extension requested fresh live-view task id, reviving');
+          }
+          this.keepAliveStarted = false;
+          this.taskNotificationId = -1;
+          this.reviveTask().catch((): void => {
+          });
+        }
+      });
+      this.needTaskIdSubscriber = sub;
+    } catch (error) {
+    }
+  }
+
+  private unwatchNeedTaskId(): void {
+    const sub = this.needTaskIdSubscriber;
+    this.needTaskIdSubscriber = null;
+    if (sub !== null) {
+      try {
+        commonEventManager.unsubscribe(sub);
+      } catch (error) {
+      }
+    }
+  }
+
   // Subscription channel: the VPN extension publishes counters once per second
   // (sing-box streams the same over the Clash API /traffic endpoint), so the
   // dashboard does not have to poll the status file.
@@ -323,12 +846,15 @@ struct Index {
     }
     try {
       const subscriber: commonEventManager.CommonEventSubscriber =
-        await commonEventManager.createSubscriber({ events: ['com.way.app.TRAFFIC'] });
+        await commonEventManager.createSubscriber({ events: [appEvent('TRAFFIC', this.ctx)] });
       commonEventManager.subscribe(subscriber, (error, data) => {
         if (error !== undefined && error !== null && error.code !== 0) {
           return;
         }
         const params: Record<string, Object> = data.parameters as Record<string, Object>;
+        if (!verifyIpcParams(params, this.ctx)) {
+          return;
+        }
         this.up = (params['up'] as number) ?? this.up;
         this.down = (params['down'] as number) ?? this.down;
         this.upSpeed = (params['upSpeed'] as number) ?? 0;
@@ -454,12 +980,35 @@ struct Index {
     if (context === null) {
       return;
     }
+    const store = readStore(context);
+    this.nodeList = store.items;
+    this.subs = readSubs(context);
     const entry: ConfigEntry | null = selectedEntry(context);
     this.hasEntry = entry !== null;
+    this.selectedId = entry === null ? '' : entry.id;
     this.entryName = entry === null ? '' : entry.name;
     this.entryType = entry === null ? '' : entry.type;
     this.entryServer = entry === null ? '' : entry.server;
+    if (!this.initialSubExpanded) {
+      this.autoExpandSelectedSub();
+    }
     this.refreshGeodataStatus();
+  }
+
+  private autoExpandSelectedSub(): void {
+    this.initialSubExpanded = true;
+    const selected: ConfigEntry | null = findById(this.nodeList, this.selectedId);
+    if (selected !== null) {
+      const sid: string = subIdOf(selected);
+      if (sid.length > 0) {
+        this.expandedSubId = sid;
+        return;
+      }
+    }
+    if (manualEntries(this.nodeList).length === 0 && this.subs.length > 0 &&
+      this.expandedSubId.length === 0) {
+      this.expandedSubId = this.subs[0].id;
+    }
   }
 
   private refreshGeodataStatus(): void {
@@ -495,9 +1044,15 @@ struct Index {
     const wayStore = await preferences.getPreferences(context, 'way');
     this.intentOn = (wayStore.getSync('vpnActive', false) as boolean) &&
       !(wayStore.getSync('userOff', false) as boolean);
-    // If the widget-preview TempAbility owns the task, the UI must not request
-    // another one (that was the source of the duplicate notification).
-    this.keepAliveOwnedByTemp = wayStore.getSync('tempKeepAlive', false) as boolean;
+    const rawTemp: boolean = wayStore.getSync('tempKeepAlive', false) as boolean;
+    const tempBeat: number = wayStore.getSync('tempHeartbeat', 0) as number;
+    const tempAlive: boolean = rawTemp && tempBeat > 0 && (Date.now() - tempBeat < 15000);
+    this.keepAliveOwnedByTemp = tempAlive;
+    if (rawTemp && !tempAlive) {
+      wayStore.putSync('tempKeepAlive', false);
+      wayStore.putSync('tempHeartbeat', 0);
+      wayStore.flush();
+    }
     this.keepAliveOnRemove = wayStore.getSync('keepAliveOnRemove', false) as boolean;
     // Routing is controlled by the mode buttons alone: a stale false here used
     // to disable every rule silently, which sent domestic apps through the node.
@@ -510,13 +1065,15 @@ struct Index {
     this.rules = ssidRules(context);
     this.useRuleSet = store.getSync('useRuleSet', false) as boolean;
     this.fakeDns = store.getSync('fakeDns', true) as boolean;
-    this.blockAds = store.getSync('blockAds', true) as boolean;
+    this.blockAds = false;
     this.dohDns = store.getSync('dohDns', true) as boolean;
+    this.dnsLeakProtect = store.getSync('dnsLeakProtect', true) as boolean;
+    this.webrtcLeakProtect = store.getSync('webrtcLeakProtect', true) as boolean;
     this.autoConnect = store.getSync('autoConnect', true) as boolean;
-    // The converted ACL4SSR set ships in the HAP: seed it on first launch so the
-    // feature works before the tunnel (and therefore the download) can.
+    // Remove legacy bundled ACL4SSR rules if upgraded from an older build so
+    // only minimal built-in rules (or user-added custom rules) remain active.
     if (seedRuleSet(context)) {
-      appLog(context, 'ui', 'rule set seeded from the bundled rawfile');
+      appLog(context, 'ui', 'legacy bundled ACL rule set purged');
     }
     this.refreshRuleSetStatus();
     this.refreshSsid();
@@ -567,6 +1124,8 @@ struct Index {
     store.putSync('fakeDns', this.fakeDns);
     store.putSync('blockAds', this.blockAds);
     store.putSync('dohDns', this.dohDns);
+    store.putSync('dnsLeakProtect', this.dnsLeakProtect);
+    store.putSync('webrtcLeakProtect', this.webrtcLeakProtect);
     store.putSync('autoConnect', this.autoConnect);
     await store.flush();
   }
@@ -764,6 +1323,8 @@ struct Index {
       geodata: geodataReady(context),
       mode: this.routeMode,
       blockQuic: this.blockQuic,
+      dnsLeakProtect: this.dnsLeakProtect,
+      webrtcLeakProtect: this.webrtcLeakProtect,
       debugLog: this.debugLog,
       // Gate on the in-memory switch: the pref write is asynchronous and a live
       // apply right after a toggle would otherwise read the previous value.
@@ -835,10 +1396,17 @@ struct Index {
 
   private async resolveOneHost(domain: string, hosts: Record<string, string[]>): Promise<void> {
     // Plain UDP first (what the user asked for: the speed test must not depend
-    // on DoH), then the platform resolver as a fallback.
+    // on DoH), then the platform resolver as a fallback. Always reject FakeIP
+    // (198.18.0.0/15) so bootstrap hosts can never be poisoned.
     const udp: string[] = await resolveUdp(domain, 700);
-    if (udp.length > 0) {
-      hosts[domain] = udp;
+    const cleanUdp: string[] = [];
+    for (const ip of udp) {
+      if (!isFakeOrReservedIp(ip) && cleanUdp.indexOf(ip) < 0) {
+        cleanUdp.push(ip);
+      }
+    }
+    if (cleanUdp.length > 0) {
+      hosts[domain] = cleanUdp;
       return;
     }
     const timeout: Promise<connection.NetAddress[]> = new Promise((resolve) => {
@@ -852,7 +1420,7 @@ struct Index {
       ]);
       const ips: string[] = [];
       for (const entry of list) {
-        if (entry.address.length > 0 && ips.indexOf(entry.address) < 0) {
+        if (!isFakeOrReservedIp(entry.address) && ips.indexOf(entry.address) < 0) {
           ips.push(entry.address);
         }
       }
@@ -864,13 +1432,13 @@ struct Index {
   }
 
   // GFW / 绕过大陆 / 全局: rewrite config.json, then ask the extension to swap the
-  // routing table of the running core. That keeps the tunnel up (no re-dial, no
-  // notification flicker); if the swap is refused (old single-node config) the
-  // tunnel is restarted instead.
+  // routing table of the running core. When entering/leaving Global mode with DNS
+  // leak protection enabled, restart so remote-only DNS policy takes effect too.
   private async selectMode(mode: string): Promise<void> {
     if (this.routeMode === mode) {
       return;
     }
+    const prevMode: string = this.routeMode;
     this.routeMode = mode;
     this.persist();
     const context = this.ctx;
@@ -883,6 +1451,10 @@ struct Index {
     }
     buildAndSaveTunnel(context, entry, this.buildOptions(context));
     if (!this.isTunnelRunning()) {
+      return;
+    }
+    if (this.dnsLeakProtect && (prevMode === MODE_GLOBAL || mode === MODE_GLOBAL)) {
+      await this.restartTunnel(context, entry);
       return;
     }
     let result: ReloadResult = { ok: false, reason: 'not attempted' };
@@ -899,6 +1471,15 @@ struct Index {
     await this.restartTunnel(context, entry);
   }
 
+  private toggleBlockQuic(value: boolean): void {
+    this.blockQuic = value;
+    this.persist();
+    const context = this.ctx;
+    if (context !== null) {
+      this.applyRoutingChange(context, value ? '已屏蔽 QUIC' : '已允许 QUIC');
+    }
+  }
+
   // DNS lives in the config, not in the routing table, so a DoH switch needs a
   // real restart (the core loads DNS once per handle).
   private async toggleDoh(value: boolean): Promise<void> {
@@ -913,6 +1494,34 @@ struct Index {
       return;
     }
     await this.restartTunnel(context, entry);
+  }
+
+  // 防 DNS 泄露同时涉及 dns 服务器列表与 53/853 路由规则：运行中自动重启隧道生效。
+  private async toggleDnsLeakProtect(value: boolean): Promise<void> {
+    this.dnsLeakProtect = value;
+    this.persist();
+    const context = this.ctx;
+    if (context === null) {
+      return;
+    }
+    const entry: ConfigEntry | null = selectedEntry(context);
+    if (entry !== null) {
+      buildAndSaveTunnel(context, entry, this.buildOptions(context));
+      if (this.isTunnelRunning()) {
+        await this.restartTunnel(context, entry);
+        return;
+      }
+    }
+  }
+
+  // 防 WebRTC 泄露纯属路由规则，可在运行中热更新生效。
+  private toggleWebrtcLeakProtect(value: boolean): void {
+    this.webrtcLeakProtect = value;
+    this.persist();
+    const context = this.ctx;
+    if (context !== null) {
+      this.applyRoutingChange(context, value ? '已启用防 WebRTC 泄露' : '已关闭防 WebRTC 泄露');
+    }
   }
 
   private isTunnelRunning(): boolean {
@@ -979,21 +1588,64 @@ struct Index {
         this.downSpeed = 0;
         return;
       }
-      this.lastBeatAt = Math.max(this.lastBeatAt, status.updatedAt);
-      const stale: boolean = now - status.updatedAt > HEARTBEAT_STALE_MS;
-      if (!stale) {
-        // A fresh beat means the extension is alive: reset the relaunch budget.
+      if (!this.busy && status.state === 'error') {
+        this.intentOn = false;
+        this.startingSince = 0;
         this.recoveryAttempts = 0;
         this.nextRecoveryAt = 0;
         this.reviveFailures = 0;
+        this.state = 'error';
+        this.message = status.message.length > 0 ? status.message : '连接失败';
+        this.seconds = 0;
+        this.upSpeed = 0;
+        this.downSpeed = 0;
+        this.setSwitch(false);
+        this.stopKeepAliveTask();
+        return;
+      }
+      this.lastBeatAt = Math.max(this.lastBeatAt, status.updatedAt);
+      const justResumed: boolean = this.resumedAt > 0 && now - this.resumedAt < 5000;
+      const stale: boolean = !justResumed && (now - status.updatedAt > HEARTBEAT_STALE_MS);
+      if (!stale && status.state === 'running') {
+        // Only a confirmed running tunnel resets the recovery budget; resetting
+        // on "starting" caused an infinite relaunch loop when core crashed on boot.
+        this.recoveryAttempts = 0;
+        this.nextRecoveryAt = 0;
+        this.reviveFailures = 0;
+        this.startingSince = 0;
         // A running tunnel with no stored intent (e.g. the app died between
         // startVpn and the markActive flush) must still be supervised.
-        if (!this.busy && !this.intentOn && status.state === 'running') {
+        if (!this.busy && !this.intentOn) {
           this.intentOn = true;
           appLog(context, 'ui', 'intent inferred from a running tunnel');
         }
+      } else if (status.state === 'stopped') {
+        this.startingSince = 0;
       }
       const recovering: boolean = stale && this.intentOn;
+      if (!this.busy && (status.state === 'starting' || recovering)) {
+        if (this.startingSince === 0) {
+          this.startingSince = now;
+        } else if (now - this.startingSince > 22000) {
+          const stuckPhase: string = status.message.length > 0 ? status.message : '初始化';
+          this.intentOn = false;
+          this.startingSince = 0;
+          this.recoveryAttempts = 0;
+          this.nextRecoveryAt = 0;
+          this.state = 'error';
+          this.message = '连接超时，卡在：' + stuckPhase;
+          this.seconds = 0;
+          this.upSpeed = 0;
+          this.downSpeed = 0;
+          this.setSwitch(false);
+          this.stopKeepAliveTask();
+          appLog(context, 'ui', 'starting watchdog aborted: ' + this.message);
+          stopVpn(vpnWant(context, this.notifyMe, this.rebindOnNetChange)).catch(() => {
+          });
+          promptAction.showToast({ message: this.message });
+          return;
+        }
+      }
       const switching: boolean = stale && this.intentOn &&
         now - this.networkSwitchAt < NETWORK_GRACE_MS;
       this.state = recovering ? 'starting' : (stale ? 'unknown' : status.state);
@@ -1010,14 +1662,6 @@ struct Index {
       this.cpuPercent = status.cpuPercent ?? 0;
       if (status.state === 'running' && status.startedAt !== this.lastStartedAt) {
         this.lastStartedAt = status.startedAt;
-      }
-      // An SSID suspension stops the task; a resumed tunnel needs its single
-      // live-view card back (the extension cannot request it on its own).
-      if (status.state === 'running' && !stale && !this.keepAliveStarted &&
-        !this.keepAliveOwnedByTemp && now - this.lastNotifRefreshAt > 3000) {
-        this.lastNotifRefreshAt = now;
-        this.reviveTask().catch(() => {
-        });
       }
       // Fallback speed when the push channel is unavailable: derive it from
       // consecutive polls instead of leaving the gauges at zero.
@@ -1052,12 +1696,25 @@ struct Index {
         this.setSwitch(true);
         this.statusAge = -1;
       } else if (this.intentOn) {
+        if (this.startingSince === 0) {
+          this.startingSince = now;
+        } else if (now - this.startingSince > 22000) {
+          this.intentOn = false;
+          this.startingSince = 0;
+          this.state = 'error';
+          this.message = '连接超时，VPN 扩展未能启动';
+          this.setSwitch(false);
+          this.stopKeepAliveTask();
+          promptAction.showToast({ message: this.message });
+          return;
+        }
         this.state = 'starting';
         this.message = '扩展未运行，正在拉起';
         this.setSwitch(true);
         this.statusAge = -1;
         this.supervise(context);
       } else {
+        this.startingSince = 0;
         this.state = 'stopped';
         this.message = '断开';
         this.seconds = 0;
@@ -1085,6 +1742,9 @@ struct Index {
     // for seconds. Give it the same grace the network event started; never
     // relaunch (or stop) a possibly-live extension during that window.
     if (now - this.networkSwitchAt < NETWORK_GRACE_MS) {
+      return;
+    }
+    if (this.resumedAt > 0 && now - this.resumedAt < 5000) {
       return;
     }
     const since: number = Math.max(this.lastBeatAt, this.lastStartRequestAt);
@@ -1182,6 +1842,12 @@ struct Index {
     });
   }
 
+  private openAddConfig(): void {
+    router.pushUrl({ url: 'pages/AddConfig' }).catch((error: BusinessError) => {
+      promptAction.showToast({ message: '打开添加节点页失败: ' + error.message });
+    });
+  }
+
   // Node list inside the node card: pick a row to switch the tunnel to it.
   private loadNodeList(): void {
     const context = this.ctx;
@@ -1212,64 +1878,121 @@ struct Index {
   }
 
   private async probeNodes(): Promise<void> {
+    await this.probeScope(this.visibleTestTargets());
+  }
+
+  private visibleTestTargets(): ConfigEntry[] {
+    const targets: ConfigEntry[] = [];
+    for (const item of manualEntries(this.nodeList)) {
+      targets.push(item);
+    }
+    if (this.expandedSubId.length > 0) {
+      for (const item of entriesOfSub(this.nodeList, this.expandedSubId)) {
+        targets.push(item);
+      }
+    }
+    if (targets.length === 0) {
+      return this.nodeList.slice();
+    }
+    return targets;
+  }
+
+  private isTestingNode(id: string): boolean {
+    return this.testingIds.indexOf(id) >= 0;
+  }
+
+  private markTestingNodes(ids: string[], active: boolean): void {
+    const set: Set<string> = new Set(this.testingIds);
+    for (const id of ids) {
+      if (active) {
+        set.add(id);
+      } else {
+        set.delete(id);
+      }
+    }
+    const next: string[] = [];
+    set.forEach((id: string) => {
+      next.push(id);
+    });
+    this.testingIds = next;
+  }
+
+  private async probeScope(scope: ConfigEntry[]): Promise<void> {
     if (this.nodeProbing) {
       return;
     }
-    this.nodeProbing = true;
-    const entries: ConfigEntry[] = this.nodeList.slice();
-    const measured: Map<string, number> = new Map<string, number>();
     const context = this.ctx;
     if (context === null) {
-      this.nodeProbing = false;
       return;
     }
-    // Same path as the node page: when the tunnel is up the core performs a
-    // real HTTP probe through each node's outbound; only when it is down do we
-    // fall back to a direct TCP/UDP handshake (a network RTT, not proxy delay).
-    // Temp TUN-less core, all nodes probed concurrently; fallback to the live
-    // core / direct TCP only if the temporary core cannot start.
-    const viaTunnel: boolean = tunnelUp(context);
-    const tags: string[] = viaTunnel ? tunnelOutboundTags(context) : [];
-    const entry: ConfigEntry | null = selectedEntry(context);
-    let usedTemp: boolean = false;
-    if (entry !== null) {
-      try {
-        buildAndSaveTunnel(context, entry, this.buildOptions(context));
-        const raw: string = loadConfig(context);
-        const doc: Record<string, Object> = JSON.parse(raw) as Record<string, Object>;
-        doc['inbounds'] = [];
-        const tempConfig: string = JSON.stringify(doc);
-        if (tempConfig.length > 0) {
-          usedTemp = true;
-          await testAllConfig(entries, tempConfig, xrayDir(context) + '/geodata',
-            (result: LatencyResult) => {
-              measured.set(result.id, result.ms);
-              recordLatency(context, result.id, result.ms, result.via);
-              this.nodeLatency = new Map<string, number>(measured);
-            });
+    const entries: ConfigEntry[] = scope.length > 0 ? scope.slice() : readStore(context).items.slice();
+    if (entries.length === 0) {
+      promptAction.showToast({ message: '没有可测速的节点' });
+      return;
+    }
+    this.nodeProbing = true;
+    this.testTotal = entries.length;
+    this.testDone = 0;
+    const ids: string[] = [];
+    for (const item of entries) {
+      ids.push(item.id);
+    }
+    this.markTestingNodes(ids, true);
+    const measured: Map<string, number> = new Map<string, number>(this.nodeLatency);
+    try {
+      const viaTunnel: boolean = tunnelUp(context);
+      const tags: string[] = viaTunnel ? tunnelOutboundTags(context) : [];
+      // When VPN is connected, never resolve in the UI process (FakeIP 198.19.x.x
+      // would poison bootstrapHosts); let the protected extension core resolve.
+      let hosts: Record<string, string[]> | null = this.bootstrapHosts;
+      if (!viaTunnel && hosts === null) {
+        hosts = await this.resolveNodeHosts(context);
+        if (hosts !== null) {
+          this.bootstrapHosts = hosts;
         }
-      } catch (error) {
-        usedTemp = false;
       }
+      await testNodesRealDelay(entries, viaTunnel, tags, hosts, (result: LatencyResult) => {
+        measured.set(result.id, result.ms);
+        recordLatency(context, result.id, result.ms, result.via);
+        this.markTestingNodes([result.id], false);
+        this.nodeLatency = new Map<string, number>(measured);
+        this.testDone++;
+      }, context);
+    } catch (error) {
+    } finally {
+      this.markTestingNodes(ids, false);
+      this.nodeLatency = new Map<string, number>(measured);
+      this.nodeProbing = false;
     }
-    if (!usedTemp) {
-      try {
-        await testAll(entries, viaTunnel, tags, (result: LatencyResult) => {
-          measured.set(result.id, result.ms);
-          recordLatency(context, result.id, result.ms, result.via);
-          this.nodeLatency = new Map<string, number>(measured);
-        });
-      } catch (error) {
-      }
+  }
+
+  private async probeSingleNode(entry: ConfigEntry): Promise<void> {
+    const context = this.ctx;
+    if (context === null || this.isTestingNode(entry.id)) {
+      return;
     }
-    this.nodeLatency = new Map<string, number>(measured);
-    this.nodeProbing = false;
+    this.markTestingNodes([entry.id], true);
+    try {
+      const viaTunnel: boolean = tunnelUp(context);
+      const tags: string[] = viaTunnel ? tunnelOutboundTags(context) : [];
+      const liveTag: string = tags.indexOf(entry.id) >= 0 ? entry.id : '';
+      const result: LatencyResult = await testOne(entry, viaTunnel, liveTag, this.bootstrapHosts, context);
+      const next: Map<string, number> = new Map<string, number>(this.nodeLatency);
+      next.set(result.id, result.ms);
+      this.nodeLatency = next;
+      recordLatency(context, result.id, result.ms, result.via);
+    } finally {
+      this.markTestingNodes([entry.id], false);
+    }
   }
 
   private latencyText(id: string): string {
+    if (this.isTestingNode(id)) {
+      return '…';
+    }
     const value: number | undefined = this.nodeLatency.get(id);
     if (value === undefined) {
-      return this.nodeProbing ? '…' : '';
+      return '测速';
     }
     if (value < 0) {
       return '超时';
@@ -1281,17 +2004,20 @@ struct Index {
   }
 
   private latencyColor(id: string): string {
+    if (this.isTestingNode(id)) {
+      return '#54C4FF';
+    }
     const value: number | undefined = this.nodeLatency.get(id);
     if (value === undefined) {
       return '#4C5D77';
     }
     if (value < 0) {
-      return '#FF5C7A';
+      return '#5C7192';
     }
     if (value < 300) {
       return '#3DDC97';
     }
-    return value < 800 ? '#FFC857' : '#FF8A5B';
+    return value < 500 ? '#FFC857' : '#FF5C7A';
   }
 
   private async pickNode(item: ConfigEntry): Promise<void> {
@@ -1302,13 +2028,312 @@ struct Index {
     if (item.id !== this.selectedId) {
       selectEntry(context, item.id);
       this.selectedId = item.id;
+      this.activeNodeId = item.id;
       this.entryName = item.name;
+      this.entryType = item.type;
+      this.entryServer = item.server;
       this.hasEntry = true;
       if (this.isTunnelRunning()) {
-        await this.applyRoutingChange(context, '已切换到 ' + item.name);
+        promptAction.showToast({ message: '已切换节点：' + item.name });
+        await this.restartTunnel(context, item);
+      } else {
+        promptAction.showToast({ message: '已选择：' + item.name });
       }
     }
     this.nodeExpanded = false;
+  }
+
+  private selectedNodeEntry(): ConfigEntry | null {
+    return findById(this.nodeList, this.selectedId);
+  }
+
+  private sortEntriesByDelay(raw: ConfigEntry[]): ConfigEntry[] {
+    if (!this.sortByDelay) {
+      return raw;
+    }
+    const results: LatencyResult[] = [];
+    this.nodeLatency.forEach((ms: number, id: string) => {
+      results.push({ id: id, ms: ms, via: 'http', at: 0 });
+    });
+    return sortByLatency(raw, results);
+  }
+
+  private manualNodeList(): ConfigEntry[] {
+    return this.sortEntriesByDelay(manualEntries(this.nodeList));
+  }
+
+  private subNodeList(subId: string): ConfigEntry[] {
+    return this.sortEntriesByDelay(entriesOfSub(this.nodeList, subId));
+  }
+
+  private findSub(id: string): SubscriptionRecord | null {
+    for (const s of this.subs) {
+      if (s.id === id) {
+        return s;
+      }
+    }
+    return null;
+  }
+
+  private isUpdatingSub(id: string): boolean {
+    return this.updatingSubIds.indexOf(id) >= 0;
+  }
+
+  private setUpdatingSub(id: string, active: boolean): void {
+    const next: string[] = [];
+    for (const item of this.updatingSubIds) {
+      if (item !== id) {
+        next.push(item);
+      }
+    }
+    if (active) {
+      next.push(id);
+    }
+    this.updatingSubIds = next;
+  }
+
+  private subContainsSelected(subId: string): boolean {
+    const selected: ConfigEntry | null = this.selectedNodeEntry();
+    return selected !== null && subIdOf(selected) === subId;
+  }
+
+  private openAddMode(mode: number, autoScan: boolean = false): void {
+    const params: Record<string, Object> = { 'mode': mode, 'autoScan': autoScan };
+    router.pushUrl({ url: 'pages/AddConfig', params: params }).catch((error: BusinessError) => {
+      promptAction.showToast({ message: '打开添加页失败: ' + error.message });
+    });
+  }
+
+  private addNodeMenu(): MenuElement[] {
+    const items: MenuElement[] = [];
+    items.push({
+      value: '扫描二维码（节点 / 订阅）',
+      action: () => {
+        this.openAddMode(0, true);
+      }
+    });
+    items.push({
+      value: '粘贴链接或订阅地址',
+      action: () => {
+        this.openAddMode(0, false);
+      }
+    });
+    items.push({
+      value: '添加订阅',
+      action: () => {
+        this.openAddMode(1, false);
+      }
+    });
+    items.push({
+      value: '导入 JSON 配置',
+      action: () => {
+        this.openAddMode(2, false);
+      }
+    });
+    return items;
+  }
+
+  private copyPlainText(text: string, label: string): void {
+    if (text.length === 0) {
+      return;
+    }
+    try {
+      const data: pasteboard.PasteData = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, text);
+      pasteboard.getSystemPasteboard().setData(data).then(() => {
+        promptAction.showToast({ message: '已复制' + label });
+      }).catch(() => {
+        promptAction.showToast({ message: '复制失败' });
+      });
+    } catch (error) {
+      promptAction.showToast({ message: '复制失败' });
+    }
+  }
+
+  private confirmDeleteNode(entry: ConfigEntry): void {
+    AlertDialog.show({
+      title: '删除节点',
+      message: '确定删除「' + entry.name + '」吗？',
+      primaryButton: { value: '取消', action: () => {} },
+      secondaryButton: {
+        value: '删除',
+        fontColor: '#FF5C7A',
+        action: () => {
+          const context = this.ctx;
+          if (context !== null) {
+            removeEntry(context, entry.id);
+            this.refreshEntry();
+          }
+        }
+      }
+    });
+  }
+
+  private confirmDeleteSub(id: string): void {
+    const rec: SubscriptionRecord | null = this.findSub(id);
+    const name: string = rec === null ? '' : rec.name;
+    const cnt: number = entriesOfSub(this.nodeList, id).length;
+    AlertDialog.show({
+      title: '删除订阅',
+      message: '删除「' + name + '」及其 ' + cnt + ' 个节点？',
+      primaryButton: { value: '取消', action: () => {} },
+      secondaryButton: {
+        value: '删除',
+        fontColor: '#FF5C7A',
+        action: () => {
+          const context = this.ctx;
+          if (context !== null) {
+            this.subs = removeSub(context, id);
+            if (this.expandedSubId === id) {
+              this.expandedSubId = '';
+            }
+            this.refreshEntry();
+            promptAction.showToast({ message: '订阅已删除' });
+          }
+        }
+      }
+    });
+  }
+
+  private beginEditSub(id: string): void {
+    const rec: SubscriptionRecord | null = this.findSub(id);
+    if (rec === null) {
+      return;
+    }
+    this.editingSubId = id;
+    this.editSubName = rec.name;
+    this.editSubUrl = rec.url;
+  }
+
+  private async commitEditSub(id: string): Promise<void> {
+    const context = this.ctx;
+    const rec: SubscriptionRecord | null = this.findSub(id);
+    if (context === null || rec === null) {
+      return;
+    }
+    const url: string = this.editSubUrl.trim();
+    const name: string = this.editSubName.trim();
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      promptAction.showToast({ message: '订阅地址必须是 http(s) 链接' });
+      return;
+    }
+    const moved: boolean = url !== rec.url;
+    updateSub(context, id, url, name);
+    this.editingSubId = '';
+    this.refreshEntry();
+    if (moved) {
+      await this.refreshOneSub(id);
+    } else {
+      promptAction.showToast({ message: '订阅已保存' });
+    }
+  }
+
+  private async refreshOneSub(id: string): Promise<void> {
+    const context = this.ctx;
+    const rec: SubscriptionRecord | null = this.findSub(id);
+    if (context === null || rec === null || this.isUpdatingSub(id)) {
+      return;
+    }
+    this.setUpdatingSub(id, true);
+    try {
+      const next: SubscriptionRecord = await refreshSubscription(context, rec);
+      this.refreshEntry();
+      promptAction.showToast({ message: '已更新 ' + next.count + ' 个节点' });
+    } catch (error) {
+      const err = error as BusinessError;
+      promptAction.showToast({ message: '更新失败: ' + (err.message ?? '网络错误') });
+    } finally {
+      this.setUpdatingSub(id, false);
+    }
+  }
+
+  private async refreshAllSubs(): Promise<void> {
+    const context = this.ctx;
+    if (context === null || this.subs.length === 0) {
+      promptAction.showToast({ message: '还没有订阅' });
+      return;
+    }
+    let okCount: number = 0;
+    let failCount: number = 0;
+    const snapshot: SubscriptionRecord[] = this.subs.slice();
+    for (const sub of snapshot) {
+      if (this.isUpdatingSub(sub.id)) {
+        continue;
+      }
+      this.setUpdatingSub(sub.id, true);
+      try {
+        await refreshSubscription(context, sub);
+        okCount++;
+        this.refreshEntry();
+      } catch (error) {
+        failCount++;
+      } finally {
+        this.setUpdatingSub(sub.id, false);
+      }
+    }
+    promptAction.showToast({
+      message: failCount === 0
+        ? ('已更新全部 ' + okCount + ' 个订阅')
+        : ('更新完成：成功 ' + okCount + '，失败 ' + failCount)
+    });
+  }
+
+  private proxyMoreMenu(): MenuElement[] {
+    const items: MenuElement[] = [];
+    items.push({
+      value: this.sortByDelay ? '排序：按延迟（点此切回默认）' : '排序：默认顺序（点此按延迟）',
+      action: () => {
+        this.sortByDelay = !this.sortByDelay;
+      }
+    });
+    items.push({
+      value: '测速全部节点',
+      action: () => {
+        if (!this.nodeProbing) {
+          this.probeScope(this.nodeList.slice());
+        }
+      }
+    });
+    if (this.subs.length > 0) {
+      items.push({
+        value: '更新全部订阅',
+        action: () => {
+          this.refreshAllSubs();
+        }
+      });
+    }
+    items.push({
+      value: '添加订阅',
+      action: () => {
+        this.openAddMode(1);
+      }
+    });
+    items.push({
+      value: '导入 JSON 配置',
+      action: () => {
+        this.openAddMode(2);
+      }
+    });
+    return items;
+  }
+
+  private formatShortStamp(ts: number): string {
+    if (ts <= 0) {
+      return '从未';
+    }
+    const d: Date = new Date(ts);
+    const p = (n: number): string => n < 10 ? '0' + n : '' + n;
+    return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+
+  private toggleMainVpn(): void {
+    if (this.busy) {
+      return;
+    }
+    if (this.state === 'running' || this.state === 'starting' || this.state === 'suspended') {
+      this.disconnect();
+    } else {
+      this.connect();
+    }
   }
 
   private setSwitch(value: boolean): void {
@@ -1374,15 +2399,30 @@ struct Index {
     } else if (op === 'disconnect') {
       this.disconnect().catch((): void => {
       });
-    } else if (op === 'keepaliveOff') {
-      this.stopTempAbility();
-      this.keepAliveOwnedByTemp = false;
-      this.keepAliveStarted = false;
-      this.taskNotificationId = -1;
-      this.reviveTask().catch((): void => {
-      });
-      promptAction.showToast({ message: '保底测试已关闭' });
     }
+  }
+
+  private promptAddNode(reason: string): void {
+    this.setSwitch(false);
+    this.intentOn = false;
+    this.state = 'stopped';
+    this.message = '请先添加节点';
+    AlertDialog.show({
+      title: '尚未添加可用节点',
+      message: reason,
+      primaryButton: {
+        value: '取消',
+        action: () => {
+        }
+      },
+      secondaryButton: {
+        value: '去添加节点',
+        fontColor: '#54C4FF',
+        action: () => {
+          this.openAddConfig();
+        }
+      }
+    });
   }
 
   private async connect(): Promise<void> {
@@ -1392,9 +2432,37 @@ struct Index {
     }
 
     const entry: ConfigEntry | null = selectedEntry(context);
-    if (entry === null) {
-      promptAction.showToast({ message: '请先添加一个节点' });
-      this.openNodes();
+    if (entry === null || entry.json.trim().length === 0 || proxyOutbound(entry.json) === null) {
+      this.promptAddNode(entry === null
+        ? '当前还没有任何节点，请先导入订阅、粘贴链接或 JSON 配置后再开启 VPN。'
+        : '当前选中的节点配置无效或缺少服务器信息，请重新添加或切换可用节点。');
+      return;
+    }
+    // HarmonyOS background VPN keepalive requires notification permission for
+    // the DATA_TRANSFER live-view task. Gate VPN start on notification approval.
+    const notifyReady: boolean = await this.requireNotifyPermission(context);
+    if (!notifyReady) {
+      this.setSwitch(false);
+      this.intentOn = false;
+      this.state = 'stopped';
+      this.message = '需要开启通知权限';
+      AlertDialog.show({
+        title: '请先开启通知权限',
+        message: '鸿蒙后台运行 VPN 需要通知栏流量实况窗权限。请允许通知后再开启 VPN（若未弹出系统授权框，请前往系统设置 → 通知与状态栏中打开 way 的通知）。',
+        primaryButton: {
+          value: '取消',
+          action: () => {
+          }
+        },
+        secondaryButton: {
+          value: '重新授权',
+          fontColor: '#54C4FF',
+          action: () => {
+            this.connect().catch((): void => {
+            });
+          }
+        }
+      });
       return;
     }
     // On a suspend-SSID Wi-Fi the switch only reflects the suspended state:
@@ -1445,29 +2513,25 @@ struct Index {
       this.state = 'starting';
       this.message = '正在创建 VPN';
       this.setSwitch(true);
-      // 1) Notification/task first. The extension draws its live view on the
-      // notification id returned by startBackgroundRunning; starting the VPN
-      // before that id exists (or before the permission dialog settles) is what
-      // made the first taps fail. Wait for readiness, then register the task.
-      if (this.notifyMe) {
-        await this.ensureNotifyReady(2500);
-      }
-      notifId = await this.startKeepAliveTask();
-      for (let attempt: number = 0; notifId < 0 && attempt < 2; attempt++) {
-        appLog(context, 'ui', 'continuous task not ready, retrying ' + (attempt + 1));
-        await this.delay(400 * (attempt + 1));
-        this.keepAliveStarted = false;
+      if (!this.keepAliveOwnedByTemp) {
         notifId = await this.startKeepAliveTask();
-      }
-      if (notifId >= 0) {
-        // Give the system a beat to publish the task notification before the
-        // extension publishes the first live view on that id.
-        await this.delay(300);
+        for (let attempt: number = 0; notifId < 0 && attempt < 2; attempt++) {
+          appLog(context, 'ui', 'continuous task not ready, retrying ' + (attempt + 1));
+          await this.delay(400 * (attempt + 1));
+          this.keepAliveStarted = false;
+          notifId = await this.startKeepAliveTask();
+        }
+        if (notifId >= 0) {
+          // Give the system a beat to publish the task notification before the
+          // extension publishes the first live view on that id.
+          await this.delay(300);
+        }
       }
       // 2) Start the VPN, then verify status.json. This is the "connects only
       // on the third tap" fix: each attempt waits for a fresh heartbeat, and a
       // failed attempt clears the half-created VPN before the next one.
-      for (let attempt: number = 0; attempt < CONNECT_ATTEMPTS && !started; attempt++) {
+      const maxAttempts: number = 2;
+      for (let attempt: number = 0; attempt < maxAttempts && !started; attempt++) {
         this.lastStartRequestAt = Date.now();
         try {
           await startVpn(vpnWant(context, this.notifyMe, this.rebindOnNetChange, notifId, entry.name));
@@ -1477,26 +2541,42 @@ struct Index {
           lastError = err.message ?? JSON.stringify(error);
           appLog(context, 'ui', 'vpn start attempt ' + (attempt + 1) + ' failed: ' + lastError);
         }
-        started = await this.waitTunnelReady(context, 3200);
-        if (!started && attempt < CONNECT_ATTEMPTS - 1) {
-          const backoff: number = 500 * Math.pow(2, attempt);
-          appLog(context, 'ui', 'tunnel not ready, retry in ' + backoff + 'ms');
-          await this.delay(backoff);
-          try {
-            await stopVpn(vpnWant(context, this.notifyMe, this.rebindOnNetChange));
-          } catch (stopError) {
+        started = await this.waitTunnelReady(context, 4500, 10000);
+        if (!started) {
+          const failedNow: TunnelStatus | null = readStatus(context);
+          if (failedNow !== null && failedNow.state === 'error') {
+            break;
           }
-          clearStatus(context);
+          if (attempt < maxAttempts - 1) {
+            const backoff: number = 500 * Math.pow(2, attempt);
+            appLog(context, 'ui', 'tunnel not ready, retry in ' + backoff + 'ms');
+            await this.delay(backoff);
+            try {
+              await stopVpn(vpnWant(context, this.notifyMe, this.rebindOnNetChange));
+            } catch (stopError) {
+            }
+            clearStatus(context);
+          }
         }
       }
       if (!started) {
-        throw new Error(lastError.length > 0 ? lastError : '扩展未在限定时间内就绪');
+        const failedStatus: TunnelStatus | null = readStatus(context);
+        const extMsg: string = (failedStatus !== null && failedStatus.state === 'error' && failedStatus.message.length > 0)
+          ? failedStatus.message : '';
+        const phaseMsg: string = this.lastWaitPhase.length > 0
+          ? ('连接超时（卡在：' + this.lastWaitPhase + '）') : '';
+        throw new Error(extMsg.length > 0 ? extMsg : (phaseMsg.length > 0 ? phaseMsg :
+          (lastError.length > 0 ? lastError : '扩展未在限定时间内就绪（请确认已在系统弹窗允许创建 VPN）')));
       }
       this.markActive(true);
+      this.activeNodeId = entry.id;
       this.intentOn = true;
       this.recoveryAttempts = 0;
       this.nextRecoveryAt = 0;
       this.lastBeatAt = Date.now();
+      if (this.keepAliveOwnedByTemp) {
+        publishScopedEvent(appEvent('REQUEST_TASK_ID', context), {}, context);
+      }
       if (tunnel.multi) {
         this.watchMultiNodeStart(tunnel.single, entry.name, notifId, 0);
       }
@@ -1526,30 +2606,73 @@ struct Index {
     }
   }
 
-  // Wait until the extension has written a fresh status.json. A tunnel that is
-  // still booting (fresh "starting" heartbeat) is accepted rather than stopped:
-  // killing a healthy boot is exactly the failure this retry loop must avoid.
+  // Wait until the extension actually reaches "running". While a fresh
+  // "starting" heartbeat arrives, allow up to maxWaitMs; never treat a stuck
+  // or crashed "starting" state as ready.
   private async waitTunnelReady(context: common.UIAbilityContext,
-    timeoutMs: number): Promise<boolean> {
-    const deadline: number = Date.now() + timeoutMs;
+    minWaitMs: number, maxWaitMs: number): Promise<boolean> {
+    const startedAt: number = Date.now();
+    const baseDeadline: number = startedAt + minWaitMs;
+    const hardDeadline: number = startedAt + maxWaitMs;
     let sawStarting: boolean = false;
-    while (Date.now() < deadline) {
+    this.lastWaitPhase = '';
+    while (Date.now() < hardDeadline) {
       const status: TunnelStatus | null = readStatus(context);
+      const now: number = Date.now();
       if (status !== null) {
-        const fresh: boolean = Date.now() - status.updatedAt < 4000;
+        const fresh: boolean = now - status.updatedAt < 4500;
         if (status.state === 'running' && fresh) {
           return true;
         }
         if (status.state === 'error') {
+          if (status.message.length > 0) {
+            this.lastWaitPhase = status.message;
+          }
           return false;
         }
-        if (status.state === 'starting' && fresh) {
-          sawStarting = true;
+        if (status.state === 'starting') {
+          if (status.message.length > 0) {
+            this.lastWaitPhase = status.message;
+            this.message = status.message;
+          }
+          if (fresh) {
+            sawStarting = true;
+          } else if (sawStarting) {
+            return false;
+          }
         }
       }
-      await this.delay(250);
+      if (!sawStarting && now >= baseDeadline) {
+        return false;
+      }
+      await this.delay(200);
     }
-    return sawStarting;
+    return false;
+  }
+
+  // Strict gate: return true only when notification permission is granted.
+  private async requireNotifyPermission(context: common.UIAbilityContext): Promise<boolean> {
+    try {
+      if (await notificationManager.isNotificationEnabled()) {
+        return true;
+      }
+      try {
+        await notificationManager.requestEnableNotification(context);
+      } catch (error) {
+        const err = error as BusinessError;
+        appLog(context, 'ui', 'notification permission request: ' + (err.message ?? 'denied'));
+      }
+      const deadline: number = Date.now() + 2500;
+      while (Date.now() < deadline) {
+        if (await notificationManager.isNotificationEnabled()) {
+          return true;
+        }
+        await this.delay(250);
+      }
+      return await notificationManager.isNotificationEnabled();
+    } catch (error) {
+      return false;
+    }
   }
 
   // Ask for notification permission and wait a bounded time for it. The old
@@ -1613,39 +2736,46 @@ struct Index {
   }
 
 
-  // The continuous task is owned by the visible main ability: launching the
-  // windowless TempAbility used to swap the foreground window to its splash
-  // screen, which looked like the UI freezing right after enabling the proxy.
+  private canReviveKeepAlive(): boolean {
+    const context = this.ctx;
+    if (context === null || !this.intentOn || ssidSuspended(context)) {
+      return false;
+    }
+    const status: TunnelStatus | null = readStatus(context);
+    if (status !== null && (status.state === 'stopped' || status.state === 'error' ||
+      status.state === 'suspended')) {
+      return false;
+    }
+    return true;
+  }
+
   private async startKeepAliveTask(): Promise<number> {
-    // Per docs/keepalive-harmony.md: the main ability owns the DATA_TRANSFER
-    // task (a windowless UIAbility steals the foreground and shows its splash,
-    // which is the "two cards / stuck UI" bug). Request the task FIRST, then
-    // start the VPN with the returned notification id.
     const context = this.ctx;
     if (context === null) {
       return -1;
     }
-    // The widget-preview TempAbility owns the single continuous task; asking
-    // for another one is what produced two notifications.
     if (this.keepAliveOwnedByTemp) {
       return -1;
     }
     if (this.keepAliveStarted && this.taskNotificationId >= 0) {
       return this.taskNotificationId;
     }
-    // A previous request may have set the flag without a usable id; force a
-    // fresh request instead of returning -1 forever.
+    if (this.taskAcquiring) {
+      return this.taskNotificationId;
+    }
+    this.taskAcquiring = true;
     this.keepAliveStarted = false;
     try {
       const info: wantAgent.WantAgentInfo = {
         wants: [
           {
-            bundleName: 'com.way.app',
+            bundleName: appBundleName(context),
             abilityName: 'EntryAbility'
           }
         ],
         actionType: wantAgent.OperationType.START_ABILITY,
-        requestCode: 0
+        requestCode: 0,
+        actionFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
       };
       const agent: WantAgent = await wantAgent.getWantAgent(info);
       this.registerTaskWatch();
@@ -1658,6 +2788,10 @@ struct Index {
       this.taskId = taskInfo.continuousTaskId ?? -1;
       this.taskNotificationId = taskInfo.notificationId;
       this.keepAliveStarted = true;
+      this.keepAliveTaskCanceled = false;
+      this.lastTaskAcquireAt = Date.now();
+      this.taskStableSince = this.lastTaskAcquireAt;
+      saveTaskNotificationId(context, this.taskNotificationId);
       appLog(context, 'ui', 'continuous task started (dataTransfer live view) id=' + this.taskId +
         ' notification=' + this.taskNotificationId);
       return this.taskNotificationId;
@@ -1665,45 +2799,90 @@ struct Index {
       const err = error as BusinessError;
       appLog(context, 'ui', 'continuous task failed: ' + (err.message ?? 'unknown'));
       return -1;
+    } finally {
+      this.taskAcquiring = false;
     }
   }
 
   private stopKeepAliveTask(): void {
     const context = this.ctx;
-    if (context === null || !this.keepAliveStarted) {
+    if (context === null) {
+      return;
+    }
+    this.taskReviveAttempts = 0;
+    this.taskStableSince = 0;
+    saveTaskNotificationId(context, -1);
+    if (!this.keepAliveStarted && this.taskId < 0) {
       return;
     }
     this.keepAliveStarted = false;
+    this.keepAliveTaskCanceled = false;
+    this.taskId = -1;
     this.taskNotificationId = -1;
     backgroundTaskManager.stopBackgroundRunning(context).catch(() => {
     });
   }
 
-  // Swiping the task card cancels the continuous task; re-request it so the
-  // tunnel keeps its single live-view card (docs/keepalive-harmony.md).
+  // Filter cancellation strictly by matching taskId so late callbacks for an
+  // already-replaced task never wipe out the active live-view notification, and
+  // reset backoff automatically once a task stays stable for >= 30 s.
   private registerTaskWatch(): void {
     if (this.taskWatchRegistered) {
       return;
     }
     this.taskWatchRegistered = true;
-    backgroundTaskManager.on('continuousTaskCancel',
-      (cancelInfo: backgroundTaskManager.ContinuousTaskCancelInfo) => {
-        const context = this.ctx;
-        if (context === null) {
-          return;
-        }
-        if (this.keepAliveOwnedByTemp) {
-          // Expected: we released our task on purpose for the TempAbility.
-          appLog(context, 'ui', 'continuous task canceled (owned by TempAbility)');
-          return;
-        }
-        appLog(context, 'ui', 'continuous task canceled, reviving');
-        this.keepAliveStarted = false;
+    const handler = (cancelInfo: backgroundTaskManager.ContinuousTaskCancelInfo): void => {
+      if (this.taskId < 0 || (cancelInfo !== undefined && cancelInfo !== null &&
+        cancelInfo.id !== undefined && cancelInfo.id !== this.taskId)) {
+        return;
+      }
+      const context = this.ctx;
+      const now: number = Date.now();
+      if (this.taskStableSince > 0 && now - this.taskStableSince >= 30000) {
+        this.taskReviveAttempts = 0;
+      }
+      this.keepAliveStarted = false;
+      this.taskId = -1;
+      this.taskNotificationId = -1;
+      this.keepAliveTaskCanceled = this.intentOn;
+      if (context !== null) {
+        saveTaskNotificationId(context, -1);
+        appLog(context, 'ui', 'continuous task canceled (attempt ' + (this.taskReviveAttempts + 1) + ')');
+      }
+      if (this.intentOn && !this.keepAliveOwnedByTemp && this.canReviveKeepAlive()) {
+        const delays: number[] = [1500, 3000, 6000, 12000, 20000, 30000, 60000];
+        const delayMs: number = delays[Math.min(this.taskReviveAttempts, delays.length - 1)];
+        this.taskReviveAttempts = Math.min(this.taskReviveAttempts + 1, delays.length - 1);
         setTimeout(() => {
-          this.reviveTask().catch(() => {
-          });
-        }, 800);
-      });
+          if (this.intentOn && !this.keepAliveOwnedByTemp && !this.keepAliveStarted &&
+            !this.taskAcquiring && this.canReviveKeepAlive()) {
+            this.reviveTask().catch((): void => {
+            });
+          }
+        }, delayMs);
+      }
+    };
+    this.taskCancelHandler = handler;
+    try {
+      backgroundTaskManager.on('continuousTaskCancel', handler);
+    } catch (error) {
+    }
+  }
+
+  private unregisterTaskWatch(): void {
+    if (!this.taskWatchRegistered) {
+      return;
+    }
+    this.taskWatchRegistered = false;
+    try {
+      if (this.taskCancelHandler !== null) {
+        backgroundTaskManager.off('continuousTaskCancel', this.taskCancelHandler);
+      } else {
+        backgroundTaskManager.off('continuousTaskCancel');
+      }
+    } catch (error) {
+    }
+    this.taskCancelHandler = null;
   }
 
   private async reviveTask(): Promise<void> {
@@ -1715,14 +2894,7 @@ struct Index {
     if (id < 0) {
       return;
     }
-    try {
-      const data: commonEventManager.CommonEventPublishData = {
-        parameters: { 'taskNotificationId': id }
-      };
-      commonEventManager.publish('com.way.app.TASK_ID', data, () => {
-      });
-    } catch (error) {
-    }
+    publishScopedEvent(appEvent('TASK_ID', context), { 'taskNotificationId': id }, context);
   }
 
 
@@ -1754,10 +2926,9 @@ struct Index {
     }
   }
 
-  // FlClash's "remove from recents" switch. ON = keep the VPN service alive
-  // when the main task is removed, and allow the widget/negatives-screen card
-  // to wake the hidden TempAbility. OFF = stop TempAbility and let onDestroy
-  // perform the normal full stop.
+  // Background VPN toggle: persists preference so EntryAbility.onDestroy leaves
+  // the VpnExtensionAbility and live-view task alive when the main card is swiped
+  // away — strictly zero automatic widget/card popups on toggle or app upgrade.
   private async toggleKeepAliveOnRemove(value: boolean): Promise<void> {
     this.keepAliveOnRemove = value;
     const context = this.ctx;
@@ -1771,27 +2942,54 @@ struct Index {
     } catch (error) {
     }
     if (value) {
-      appLog(context, 'lifecycle', 'background-vpn ON: VPN kept after task removal');
-      // The switch itself enables background VPN. Adding the widget card is
-      // optional; do not depend on the preview page or any dialog.
-      promptAction.showToast({ message: '后台运行 VPN 已开启（无需添加卡片）', duration: 4000 });
-      this.startTempAbility().catch((): void => {
-      });
+      appLog(context, 'lifecycle', 'background-vpn ON (silent, no card popup)');
+      promptAction.showToast({ message: '已开启：划掉主窗口后 VPN 将继续后台运行', duration: 2500 });
     } else {
-      appLog(context, 'lifecycle', 'remove-from-recents OFF: stopping TempAbility');
-      this.stopTempAbility();
+      appLog(context, 'lifecycle', 'background-vpn OFF: stopping TempAbility');
+      publishScopedEvent(appEvent('STOP_KEEPALIVE', context), {}, context);
       this.keepAliveOwnedByTemp = false;
       this.keepAliveStarted = false;
       this.taskNotificationId = -1;
-      this.reviveTask().catch((): void => {
-      });
-      promptAction.showToast({ message: '已关闭：后台运行 VPN 将停止' });
+      if (this.isTunnelRunning()) {
+        this.reviveTask().catch((): void => {
+        });
+      }
+      promptAction.showToast({ message: '已关闭：清后台将停止 VPN', duration: 2500 });
     }
   }
 
-  // Start the hidden keepalive owner directly. The "后台运行 VPN" switch must
-  // work without adding the widget/card; the card preview is only an optional
-  // second trigger.
+  // FlClash-ohos / way-1000020 headless keepalive entry:
+  // Opening the system widget preview causes the launcher (a system process) to
+  // render WidgetCard, whose onAppear fires postCardAction(action:'call') to
+  // TempAbility. That launches TempAbility completely windowless (no blank
+  // window and no mission card in recents), so swiping away all cards cannot
+  // destroy TempAbility or kill the VPN. The user just cancels the preview.
+  private openKeepAliveForm(): void {
+    const context = this.ctx;
+    const want: Want = {
+      bundleName: appBundleName(context),
+      abilityName: 'WayFormAbility',
+      parameters: {
+        'ohos.extra.param.key.form_name': 'way_widget',
+        'ohos.extra.param.key.module_name': 'entry',
+        'ohos.extra.param.key.form_dimension': formInfo.FormDimension.Dimension_2_2
+      }
+    };
+    try {
+      formProvider.openFormManager(want);
+      if (context !== null) {
+        appLog(context, 'keepalive', 'opened widget preview for headless TempAbility call');
+      }
+    } catch (error) {
+      const err = error as BusinessError;
+      if (context !== null) {
+        appLog(context, 'keepalive', 'openFormManager failed, falling back: ' + (err.message ?? 'unknown'));
+      }
+      this.startTempAbility().catch((): void => {
+      });
+    }
+  }
+
   private async startTempAbility(): Promise<void> {
     const context = this.ctx;
     if (context === null) {
@@ -1799,30 +2997,15 @@ struct Index {
     }
     try {
       const want: Want = {
-        bundleName: 'com.way.app',
+        bundleName: appBundleName(context),
         abilityName: 'TempAbility'
       };
       await context.startAbility(want);
-      appLog(context, 'keepalive', 'temp ability started (no card needed)');
+      appLog(context, 'keepalive', 'transparent TempAbility started once');
     } catch (error) {
       const err = error as BusinessError;
-      appLog(context, 'keepalive', 'temp ability start failed: ' + (err.message ?? 'unknown'));
+      appLog(context, 'keepalive', 'TempAbility start failed: ' + (err.message ?? 'unknown'));
       promptAction.showToast({ message: '后台保活启动失败，请看日志' });
-    }
-  }
-
-  private stopTempAbility(): void {
-    const context = this.ctx;
-    if (context === null) {
-      return;
-    }
-    // UIAbilityContext has no stopAbility(); TempAbility exits itself on this
-    // event and releases the continuous task first.
-    try {
-      const data: commonEventManager.CommonEventPublishData = { parameters: {} };
-      commonEventManager.publish('com.way.app.STOP_KEEPALIVE', data, () => {
-      });
-    } catch (error) {
     }
   }
 
@@ -1837,7 +3020,7 @@ struct Index {
       const info: wantAgent.WantAgentInfo = {
         wants: [
           {
-            bundleName: 'com.way.app',
+            bundleName: appBundleName(context),
             abilityName: 'EntryAbility'
           }
         ],
@@ -1909,7 +3092,12 @@ struct Index {
     }
     this.stopKeepAliveTask();
     this.markActive(false);
-    this.stopTempAbility();
+    if (this.keepAliveOnRemove) {
+      // Keep transparent TempAbility in standby so next connect needs zero popups.
+      publishScopedEvent(appEvent('PAUSE_KEEPALIVE', context), {}, context);
+    } else {
+      publishScopedEvent(appEvent('STOP_KEEPALIVE', context), {}, context);
+    }
     this.keepAliveOwnedByTemp = false;
     // Turning the switch off on a suspended Wi-Fi means "off", not "suspend
     // again": clear the policy markers so the watcher leaves it alone until the
@@ -2076,43 +3264,25 @@ struct Index {
     }
   }
 
-  // Green while connected, amber while suspended, red for every disconnected
-  // state; the header pill and the light bloom both read this.
   private statusColor(): string {
     if (this.state === 'running') {
-      return '#3DDC97';
+      return this.theme.success;
     }
     if (this.state === 'starting' || this.state === 'suspended') {
-      return '#FFC857';
+      return this.theme.warning;
     }
-    return '#FF5C7A';
+    if (this.state === 'error') {
+      return this.theme.danger;
+    }
+    return this.theme.textSecondary;
   }
 
-  // Same colour at the given alpha, in ArkUI's #AARRGGBB order.
-  private statusGlow(alpha: string): string {
-    return '#' + alpha + this.statusColor().substring(1);
-  }
-
-  // Light strength 0..1 driven by the live throughput: idle keeps the glow faint,
-  // a busy tunnel pushes it up (log scale so 4 KB/s already shows).
-  private glowLevel(): number {
-    const speed: number = this.upSpeed + this.downSpeed;
-    const ramp: number = Math.log10(1 + speed / 512) / 2.6;
-    return 0.18 + 0.82 * Math.min(1, ramp);
-  }
-
-  private alphaHex(ratio: number): string {
-    const clamped: number = Math.max(0, Math.min(1, ratio));
-    const value: number = Math.round(clamped * 255);
-    const text: string = value.toString(16).toUpperCase();
-    return text.length === 1 ? '0' + text : text;
-  }
-
-  // Card headline: same words as the pill, but real error text still wins.
   private stateTitle(): string {
-    if (this.state === 'running' || this.state === 'suspended' ||
-      this.state === 'starting') {
+    if (this.state === 'running' || this.state === 'suspended') {
       return this.statusLabel();
+    }
+    if (this.state === 'starting') {
+      return (this.message.length > 0 && this.message !== '连接中') ? this.message : '正在连接…';
     }
     if (this.message.length === 0 || this.message === '断开') {
       return '未连接';
@@ -2145,135 +3315,165 @@ struct Index {
     if (this.state === 'starting') {
       return '连接中';
     }
+    if (this.state === 'error') {
+      return '连接失败';
+    }
     return '未连接';
   }
 
   build() {
-    // Full-bleed background: painted under the status and navigation bars.
-    // The title bar floats over the scroll content with a frosted (blurred)
-    // backdrop, so cards slide underneath it instead of pushing it down.
+    // Clean, pure, understated canvas supporting Light / Dark / OLED / Sage / Slate themes,
+    // plus sing-box-for-harmonyos style floating frosted glass navigation bar with drag highlight.
     Stack({ alignContent: Alignment.Top }) {
       Column()
         .width('100%')
         .height('100%')
-        .linearGradient({
-          angle: 180,
-          colors: [['#101A2E', 0.0], ['#0B1020', 0.42], ['#090E1A', 1.0]]
-        })
+        .backgroundColor(this.theme.bg)
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
 
-      // Ambient status light *behind* the cards, painted on the page background
-      // itself. It is fixed here (not inside a card), so scrolling the list does
-      // not drag the glow along with the cards; the translucent card surfaces
-      // let it bleed through.
-      Column()
-        .width('100%')
-        .height(460)
-        .radialGradient({
-          center: ['78%', '0%'],
-          radius: 380,
-          colors: [
-            [this.statusGlow(this.alphaHex(0.05 + 0.34 * this.glowLevel())), 0.0],
-            [this.statusGlow(this.alphaHex(0.02 + 0.14 * this.glowLevel())), 0.5],
-            [this.statusGlow('00'), 1.0]
-          ]
-        })
-        .hitTestBehavior(HitTestMode.Transparent)
-        .align(Alignment.Top)
-        .margin({ top: -20 })
-
       Column() {
-        Scroll() {
-          Column({ space: 12 }) {
-            this.statusCard()
-            this.nodeCard()
-            this.rulesCard()
-            this.ssidCard()
-            this.logCard()
-            Column({ space: 2 }) {
-              Text('HarmonyOS 代理客户端')
-                .fontSize(12)
-                .fontColor('#5C7192')
-              Text('xray-rust 0.10.1 · ABI ' + this.coreInfo + ' · com.way.app')
-                .fontSize(10)
-                .fontColor('#44536B')
-            }
-            .width('100%')
-            .margin({ top: 10, bottom: 16 })
-          }
-          .width('100%')
-          .padding({
-            left: 16,
-            right: 16,
-            top: this.headerHeight,
-            bottom: this.insets.bottom + 12
-          })
+        if (this.activeTab === 0) {
+          this.homeTab()
+        } else if (this.activeTab === 1) {
+          this.proxiesTab()
+        } else {
+          this.settingsTab()
         }
-        .layoutWeight(1)
-        .scrollBar(BarState.Off)
-        .align(Alignment.Top)
       }
       .width('100%')
       .height('100%')
       .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
 
-      // Very soft wash behind the title bar: no bar edge and no solid colour, it
-      // only keeps the status-bar icons and the capsules readable when cards
-      // scroll underneath. Touches pass through to the list.
-      Column()
-        .width('100%')
-        .height(this.headerHeight + 10)
-        .linearGradient({
-          angle: 180,
-          colors: [['#A60B1020', 0.0], ['#660B1020', 0.62], ['#000B1020', 1.0]]
-        })
-        .hitTestBehavior(HitTestMode.Transparent)
-        .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP])
-
       this.header()
+
+      // Floating frosted glass navigation bar (sing-box style) with touch-drag highlight.
+      Column() {
+        this.floatingNavBar()
+      }
+      .width('100%')
+      .position({ x: 0, y: '100%' })
+      .markAnchor({ x: 0, y: '100%' })
+      .padding({ left: 20, right: 20, bottom: this.insets.bottom + 10 })
+      .hitTestBehavior(HitTestMode.Transparent)
     }
     .width('100%')
     .height('100%')
-    .backgroundColor('#0B1020')
+    .backgroundColor(this.theme.bg)
   }
 
   @Builder
   header() {
-    // No bar surface at all: the page shows through between the two capsules.
-    Row() {
-      Row() {
-          Text('way')
-          .fontSize(24)
+    Row({ space: 10 }) {
+      if (this.activeTab === 0) {
+        // Pure minimal brand wordmark only — no status badge on the top-right.
+        Text('way')
+          .fontSize(26)
           .fontWeight(FontWeight.Bold)
-          .fontColor('#E8F1FF')
-      }
-      .padding({ left: 16, right: 16, top: 5, bottom: 6 })
-      .borderRadius(22)
-      .backgroundColor('#1AFFFFFF')
-      // The left capsule picks up the status light as a tinted hairline, and the
-      // tint breathes with the traffic like the bloom does.
-      .border({ width: 1, color: this.statusGlow(this.alphaHex(0.08 + 0.32 * this.glowLevel())) })
-      .backdropBlur(24)
+          .fontColor(this.theme.textPrimary)
+          .letterSpacing(0.3)
 
-      Blank()
+        Blank()
+      } else if (this.activeTab === 1) {
+        Row({ space: 8 }) {
+          Text('节点')
+            .fontSize(24)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(this.theme.textPrimary)
+          Text('' + this.nodeList.length)
+            .fontSize(12)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.theme.accent)
+            .padding({ left: 8, right: 8, top: 2, bottom: 2 })
+            .borderRadius(10)
+            .backgroundColor(this.theme.accentSoft)
+        }
 
-      Text(this.statusLabel())
-        .fontSize(13)
-        .fontColor(this.statusColor())
-        .padding({ left: 14, right: 14, top: 7, bottom: 7 })
-        .borderRadius(20)
-        .backgroundColor(this.statusGlow(this.alphaHex(0.10 + 0.22 * this.glowLevel())))
-        .border({ width: 1, color: this.statusGlow(this.alphaHex(0.28 + 0.35 * this.glowLevel())) })
-        .shadow({
-          radius: 12 + 24 * this.glowLevel(),
-          color: this.statusGlow(this.alphaHex(0.14 + 0.55 * this.glowLevel())),
-          offsetY: 0
+        Blank()
+
+        Row({ space: 5 }) {
+          SymbolGlyph($r('sys.symbol.bolt_1'))
+            .fontSize(14)
+            .fontColor([this.nodeProbing ? this.theme.textTertiary : this.theme.accent])
+          Text(this.nodeProbing ? (this.testDone + '/' + this.testTotal) : '测速')
+            .fontSize(12)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.nodeProbing ? this.theme.textTertiary : this.theme.accent)
+        }
+        .height(34)
+        .padding({ left: 11, right: 11 })
+        .borderRadius(17)
+        .backgroundColor(this.theme.surface)
+        .border({ width: 0.5, color: this.theme.border })
+        .onClick(() => {
+          if (!this.nodeProbing) {
+            this.probeNodes();
+          }
         })
-        .backdropBlur(24)
+
+        Stack({ alignContent: Alignment.Center }) {
+          SymbolGlyph($r('sys.symbol.plus'))
+            .fontSize(18)
+            .fontWeight(FontWeight.Medium)
+            .fontColor([this.theme.accent])
+        }
+        .width(34)
+        .height(34)
+        .borderRadius(17)
+        .backgroundColor(this.theme.surface)
+        .border({ width: 0.5, color: this.theme.border })
+        .onClick(() => {
+          this.openAddMode(0, false);
+        })
+
+        Stack({ alignContent: Alignment.Center }) {
+          SymbolGlyph($r('sys.symbol.ellipsis_circle'))
+            .fontSize(18)
+            .fontColor([this.theme.textSecondary])
+        }
+        .width(34)
+        .height(34)
+        .borderRadius(17)
+        .backgroundColor(this.theme.surface)
+        .border({ width: 0.5, color: this.theme.border })
+        .bindMenu(this.proxyMoreMenu())
+      } else {
+        if (this.settingsSubPage.length > 0) {
+          Row({ space: 6 }) {
+            Stack({ alignContent: Alignment.Center }) {
+              SymbolGlyph($r('sys.symbol.chevron_left'))
+                .fontSize(18)
+                .fontColor([this.theme.accent])
+            }
+            .width(32)
+            .height(32)
+            .borderRadius(16)
+            .backgroundColor(this.theme.surface)
+            .border({ width: 0.5, color: this.theme.border })
+            Text(this.settingsSubTitle())
+              .fontSize(20)
+              .fontWeight(FontWeight.Bold)
+              .fontColor(this.theme.textPrimary)
+              .margin({ left: 4 })
+          }
+          .onClick(() => {
+            this.closeSettingsSubPage();
+          })
+
+          Blank()
+        } else {
+          Text('设置')
+            .fontSize(24)
+            .fontWeight(FontWeight.Bold)
+            .fontColor(this.theme.textPrimary)
+
+          Blank()
+        }
+      }
     }
     .width('100%')
-    .padding({ left: 18, right: 18, top: this.insets.top + 10, bottom: 10 })
-    .onAreaChange((oldArea: Area, newArea: Area) => {
+    .padding({ left: 20, right: 18, top: this.insets.top + 10, bottom: 10 })
+    .backgroundColor(this.theme.bg)
+    .onAreaChange((_oldArea: Area, newArea: Area) => {
       const measured: number = Number(newArea.height);
       if (measured > 0 && measured !== this.headerHeight) {
         this.headerHeight = measured;
@@ -2282,368 +3482,1235 @@ struct Index {
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP])
   }
 
+  // Sing-box style floating frosted pill navigation bar with live touch-drag highlight capsule.
   @Builder
-  statusCard() {
-    Column() {
+  floatingNavBar() {
+    Stack({ alignContent: Alignment.TopStart }) {
+      // Frosted glass backdrop layer
+      Column()
+        .width('100%')
+        .height(60)
+        .borderRadius(30)
+        .backgroundColor(this.nativeGlassAvailable() ? this.theme.navBgGlass : this.theme.navBg)
+        .backdropBlur(this.nativeGlassAvailable() ? 0 : 28)
+        .backgroundEffect({
+          radius: this.nativeGlassAvailable() ? 0 : 14,
+          saturation: 1.15,
+          brightness: this.theme.isDark ? 1.02 : 1.03,
+          color: Color.Transparent
+        })
+        .border({ width: 0.7, color: this.theme.navBorder })
+        .shadow({ radius: this.nativeGlassAvailable() ? 0 : 12, color: this.theme.shadow, offsetY: 4 })
+        .hitTestBehavior(HitTestMode.None)
+
+      // Sliding highlight capsule following pointer during press/drag and snapping on release.
+      if (this.navBarWidth > 0) {
+        Column()
+          .width(this.navCapsuleWidth())
+          .height(52)
+          .borderRadius(26)
+          .backgroundColor(this.theme.navHighlight)
+          .border({ width: 0.5, color: this.theme.navHighlightBorder })
+          .position({ x: this.navGlowLeft(), y: 4 })
+          .hitTestBehavior(HitTestMode.None)
+          .animation({ duration: this.navDragging ? 0 : 160, curve: Curve.EaseOut })
+      }
+
       Row() {
+        this.navItem(0, $r('sys.symbol.house_fill'), $r('sys.symbol.house'), '主页')
+        this.navItem(1, $r('sys.symbol.paperplane_fill'), $r('sys.symbol.paperplane'), '节点')
+        this.navItem(2, $r('sys.symbol.gearshape_fill'), $r('sys.symbol.gearshape'), '设置')
+      }
+      .width('100%')
+      .height(60)
+    }
+    .width('100%')
+    .height(60)
+    .borderRadius(30)
+    .clip(true)
+    .attributeModifier(this.glassModifier(true))
+    .onAreaChange((_old: Area, area: Area) => {
+      const w: number = Number(area.width);
+      if (w > 0 && w !== this.navBarWidth) {
+        this.navBarWidth = w;
+      }
+    })
+    .onTouch((event: TouchEvent) => {
+      this.handleNavTouch(event);
+    })
+  }
+
+  @Builder
+  navItem(index: number, activeIcon: Resource, inactiveIcon: Resource, label: string) {
+    Column({ space: 3 }) {
+      SymbolGlyph(this.highlightedNavIndex() === index ? activeIcon : inactiveIcon)
+        .fontSize(20)
+        .fontColor([this.highlightedNavIndex() === index ? this.theme.accent : this.theme.textSecondary])
+        .animation({ duration: 140, curve: Curve.EaseOut })
+      Text(label)
+        .fontSize(10)
+        .fontWeight(this.highlightedNavIndex() === index ? FontWeight.Medium : FontWeight.Regular)
+        .fontColor(this.highlightedNavIndex() === index ? this.theme.accent : this.theme.textSecondary)
+        .animation({ duration: 140, curve: Curve.EaseOut })
+    }
+    .layoutWeight(1)
+    .height(60)
+    .justifyContent(FlexAlign.Center)
+    .onClick(() => {
+      if (Date.now() >= this.navIgnoreClickUntil) {
+        this.selectMainTab(index);
+      }
+    })
+  }
+
+  // ==================== TAB 0: HOME (Pure, Understated, Unboxed Power Circle) ====================
+
+  @Builder
+  homeTab() {
+    Scroll() {
+      Column({ space: 18 }) {
+        this.powerOrbSection()
+        this.activeProxyCapsule()
+        this.quickModeBar()
+        if (this.state === 'running' || this.state === 'starting') {
+          this.liveTelemetryCard()
+        }
+      }
+      .width('100%')
+      .padding({
+        left: 20,
+        right: 20,
+        top: this.headerHeight + (this.state === 'running' ? 18 : 52),
+        bottom: this.insets.bottom + 96
+      })
+    }
+    .layoutWeight(1)
+    .scrollBar(BarState.Off)
+    .align(Alignment.Top)
+  }
+
+  @Builder
+  powerOrbSection() {
+    Column({ space: 18 }) {
+      // Anywhere-style minimalist power button: pure neutral circle, border, and
+      // power glyph — ONLY the single bottom indicator dot lights up by state.
+      Stack({ alignContent: Alignment.Center }) {
+        if (this.state === 'starting') {
+          LoadingProgress()
+            .width(40)
+            .height(40)
+            .color(this.theme.textSecondary)
+        } else {
+          SymbolGlyph($r('sys.symbol.power'))
+            .fontSize(42)
+            .fontWeight(FontWeight.Medium)
+            .fontColor([this.theme.powerIdleIcon])
+        }
+
         Circle()
-          .width(10)
-          .height(10)
-          .fill(this.statusColor())
+          .width(7)
+          .height(7)
+          .fill(this.state === 'running' ? this.theme.success
+            : (this.state === 'starting' || this.state === 'suspended' ? this.theme.warning
+              : (this.state === 'error' ? this.theme.danger : this.theme.textTertiary)))
+          .shadow(this.state === 'running' || this.state === 'starting' ||
+            this.state === 'suspended' || this.state === 'error'
+            ? {
+                radius: 8,
+                color: this.state === 'running' ? this.theme.success
+                  : (this.state === 'error' ? this.theme.danger : this.theme.warning),
+                offsetX: 0,
+                offsetY: 0
+              }
+            : { radius: 0, color: Color.Transparent })
+          .offset({ y: 40 })
+      }
+      .width(136)
+      .height(136)
+      .borderRadius(68)
+      .clip(true)
+      .backgroundColor(this.theme.powerIdleBg)
+      .border({
+        width: 1.2,
+        color: this.theme.powerIdleBorder
+      })
+      .onClick(() => {
+        this.toggleMainVpn();
+      })
+
+      Column({ space: 6 }) {
         Text(this.stateTitle())
+          .fontSize(18)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.state === 'error' ? this.theme.danger
+            : (this.state === 'suspended' ? this.theme.warning : this.theme.textPrimary))
+          .textAlign(TextAlign.Center)
+          .maxLines(2)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+
+        Row({ space: 8 }) {
+          Text(this.state === 'running'
+            ? ('已运行 ' + formatDuration(this.seconds))
+            : (this.hasEntry ? '轻触按钮切换连接' : '请先添加节点或订阅'))
+            .fontSize(13)
+            .fontColor(this.theme.textSecondary)
+          if (this.probeMs > 0 && this.state === 'running') {
+            Text(this.probeMs + ' ms')
+              .fontSize(11)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(this.probeMs < 300 ? this.theme.success : (this.probeMs < 500 ? this.theme.warning : this.theme.danger))
+              .padding({ left: 8, right: 8, top: 2, bottom: 2 })
+              .borderRadius(8)
+              .backgroundColor(this.theme.surface)
+              .border({ width: 0.5, color: this.theme.border })
+          }
+        }
+        .justifyContent(FlexAlign.Center)
+      }
+      .width('100%')
+      .alignItems(HorizontalAlign.Center)
+    }
+    .width('100%')
+    .padding({ top: 4, bottom: 10 })
+    .alignItems(HorizontalAlign.Center)
+  }
+
+  @Builder
+  activeProxyCapsule() {
+    Row({ space: 12 }) {
+      Stack({ alignContent: Alignment.Center }) {
+        SymbolGlyph(this.hasEntry ? $r('sys.symbol.paperplane_fill') : $r('sys.symbol.plus_circle_fill'))
+          .fontSize(17)
+          .fontColor([this.hasEntry ? this.theme.accent : this.theme.success])
+      }
+      .width(38)
+      .height(38)
+      .borderRadius(12)
+      .backgroundColor(this.hasEntry ? this.theme.accentSoft : this.theme.successSoft)
+
+      Column({ space: 5 }) {
+        Text(this.hasEntry ? this.entryName : '添加节点或订阅')
           .fontSize(15)
-          .fontColor(this.state === 'suspended' ? '#FFC857' : '#C7D6EC')
-          .margin({ left: 10 })
-          .layoutWeight(1)
-        Toggle({ type: ToggleType.Switch, isOn: this.isOn })
-          .selectedColor(this.state === 'suspended' ? '#F2B33D' : '#54C4FF')
-          .onChange((value: boolean) => {
-            if (this.switchProgrammatic) {
-              this.switchProgrammatic = false;
-              return;
-            }
-            if (this.busy) {
-              return;
-            }
-            if (value) {
-              this.connect();
-            } else {
-              this.disconnect();
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.theme.textPrimary)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .width('100%')
+
+        if (this.hasEntry && this.selectedNodeEntry() !== null) {
+          Row({ space: 5 }) {
+            ForEach(extractNodeBadges(this.entryType, this.selectedNodeEntry()!.json), (badge: NodeBadge) => {
+              Text(badge.text)
+                .fontSize(9)
+                .fontWeight(FontWeight.Medium)
+                .fontColor(badge.fg)
+                .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+                .borderRadius(5)
+                .backgroundColor(badge.bg)
+            }, (badge: NodeBadge) => badge.text)
+          }
+          .width('100%')
+        } else {
+          Text('支持二维码扫码、分享链接、订阅与 JSON')
+            .fontSize(12)
+            .fontColor(this.theme.textSecondary)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+      .onClick(() => {
+        if (this.hasEntry) {
+          this.activeTab = 1;
+          this.refreshEntry();
+          this.loadLatencyCache();
+        } else {
+          this.openAddMode(0, false);
+        }
+      })
+
+      if (this.hasEntry && this.selectedNodeEntry() !== null) {
+        Text(this.latencyText(this.selectedId))
+          .fontSize(12)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.latencyColor(this.selectedId))
+          .padding({ left: 10, right: 10, top: 6, bottom: 6 })
+          .borderRadius(12)
+          .backgroundColor(this.theme.surfaceMuted)
+          .onClick(() => {
+            const current: ConfigEntry | null = this.selectedNodeEntry();
+            if (current !== null) {
+              this.probeSingleNode(current);
             }
           })
       }
-      .width('100%')
 
-      Divider().color('#1C2740').margin({ top: 12, bottom: 12 })
+      SymbolGlyph($r('sys.symbol.chevron_right'))
+        .fontSize(14)
+        .fontColor([this.theme.textTertiary])
+        .onClick(() => {
+          if (this.hasEntry) {
+            this.activeTab = 1;
+            this.refreshEntry();
+            this.loadLatencyCache();
+          } else {
+            this.openAddMode(0, false);
+          }
+        })
+    }
+    .width('100%')
+    .padding({ left: 14, right: 14, top: 14, bottom: 14 })
+    .backgroundColor(this.theme.surface)
+    .border({ width: 0.5, color: this.theme.border })
+    .borderRadius(20)
+  }
 
-      // Inline rather than a parameterised @Builder: ArkUI does not refresh a
-      // @Builder whose arguments are passed by value, which left these metrics
-      // frozen at the values of the first frame.
+  @Builder
+  quickModeBar() {
+    Row({ space: 4 }) {
+      this.modeSegment(MODE_GFW, 'GFW')
+      this.modeSegment(MODE_BYPASS, '绕过大陆')
+      this.modeSegment(MODE_GLOBAL, '全局')
+    }
+    .width('100%')
+    .padding(4)
+    .backgroundColor(this.theme.surface)
+    .border({ width: 0.5, color: this.theme.border })
+    .borderRadius(16)
+  }
+
+  @Builder
+  modeSegment(mode: string, label: string) {
+    Text(label)
+      .fontSize(13)
+      .fontWeight(this.routeMode === mode ? FontWeight.Medium : FontWeight.Regular)
+      .fontColor(this.routeMode === mode ? this.theme.accentOn : this.theme.textSecondary)
+      .backgroundColor(this.routeMode === mode ? this.theme.accent : Color.Transparent)
+      .textAlign(TextAlign.Center)
+      .layoutWeight(1)
+      .height(36)
+      .borderRadius(12)
+      .onClick(() => {
+        this.selectMode(mode);
+      })
+  }
+
+  @Builder
+  liveTelemetryCard() {
+    Column({ space: 12 }) {
       Row() {
-        Column() {
+        Column({ space: 3 }) {
+          Row({ space: 4 }) {
+            SymbolGlyph($r('sys.symbol.arrow_down'))
+              .fontSize(11)
+              .fontColor([this.theme.success])
+            Text('下载')
+              .fontSize(11)
+              .fontColor(this.theme.textSecondary)
+          }
           Text(formatSpeed(this.downSpeed))
             .fontSize(16)
-            .fontColor('#E4EEFF')
             .fontWeight(FontWeight.Medium)
-          Text('↓ 累计 ' + formatBytes(this.down))
-            .fontSize(10)
-            .fontColor('#4C5D77')
-            .margin({ top: 2 })
-          Text('下载')
+            .fontColor(this.theme.textPrimary)
+          Text(formatBytes(this.down))
             .fontSize(11)
-            .fontColor('#5C7192')
-            .margin({ top: 2 })
+            .fontColor(this.theme.textTertiary)
         }
         .layoutWeight(1)
 
-        Column() {
+        Column({ space: 3 }) {
+          Row({ space: 4 }) {
+            SymbolGlyph($r('sys.symbol.arrow_up'))
+              .fontSize(11)
+              .fontColor([this.theme.accent])
+            Text('上传')
+              .fontSize(11)
+              .fontColor(this.theme.textSecondary)
+          }
           Text(formatSpeed(this.upSpeed))
             .fontSize(16)
-            .fontColor('#E4EEFF')
             .fontWeight(FontWeight.Medium)
-          Text('↑ 累计 ' + formatBytes(this.up))
-            .fontSize(10)
-            .fontColor('#4C5D77')
-            .margin({ top: 2 })
-          Text('上传')
+            .fontColor(this.theme.textPrimary)
+          Text(formatBytes(this.up))
             .fontSize(11)
-            .fontColor('#5C7192')
-            .margin({ top: 2 })
+            .fontColor(this.theme.textTertiary)
         }
         .layoutWeight(1)
 
-        Column() {
+        Column({ space: 3 }) {
+          Row({ space: 3 }) {
+            Text('活跃连接')
+              .fontSize(11)
+              .fontColor(this.theme.textSecondary)
+            SymbolGlyph($r('sys.symbol.chevron_right'))
+              .fontSize(10)
+              .fontColor([this.theme.accent])
+          }
           Text(this.flows.toString())
             .fontSize(16)
-            .fontColor('#E4EEFF')
             .fontWeight(FontWeight.Medium)
-          Text('连接 ›')
+            .fontColor(this.theme.textPrimary)
+          Text('点击查看')
             .fontSize(11)
-            .fontColor('#54C4FF')
-            .margin({ top: 2 })
-          Text('点开查看')
-            .fontSize(10)
-            .fontColor('#4C5D77')
-            .margin({ top: 2 })
+            .fontColor(this.theme.accent)
         }
         .layoutWeight(1)
         .onClick(() => {
           this.openConnections();
         })
-
-        Column() {
-          Text(formatDuration(this.seconds))
-            .fontSize(16)
-            .fontColor('#E4EEFF')
-            .fontWeight(FontWeight.Medium)
-          Text('时长')
-            .fontSize(11)
-            .fontColor('#5C7192')
-            .margin({ top: 2 })
-          Text('本次会话')
-            .fontSize(10)
-            .fontColor('#4C5D77')
-            .margin({ top: 2 })
-        }
-        .layoutWeight(1)
       }
       .width('100%')
 
-      Row() {
+      Divider().color(this.theme.divider)
+
+      Row({ space: 6 }) {
         Text('内存 ' + this.memoryText())
-          .fontSize(10)
-          .fontColor('#4C5D77')
+          .fontSize(11)
+          .fontColor(this.theme.textSecondary)
         Text('·')
-          .fontSize(10)
-          .fontColor('#2E3A54')
-          .margin({ left: 6, right: 6 })
+          .fontSize(11)
+          .fontColor(this.theme.textTertiary)
         Text('CPU ' + this.cpuText())
-          .fontSize(10)
-          .fontColor('#4C5D77')
+          .fontSize(11)
+          .fontColor(this.theme.textSecondary)
         Blank()
-        Text(this.isOn ? 'xray-rust 0.10.1 · ABI ' + this.coreInfo : '')
-          .fontSize(9)
-          .fontColor('#2E3A54')
-      }
-      .width('100%')
-      .margin({ top: 10 })
-    }
-    .width('100%')
-    .padding(16)
-    // Card body: translucent surface + hairline highlight. The status light is
-    // painted on the page background (the radial bloom behind the scroll
-    // content), not inside the card, so it stays put when the card scrolls.
-    .backgroundColor('#B3131A2C')
-    .border({ width: 1, color: '#12FFFFFF' })
-    .borderRadius(18)
-    .shadow({ radius: 18, color: '#4D000000', offsetY: 6 })
-    .margin({ top: 6 })
-  }
-
-  @Builder
-  metric(label: string, value: string) {
-    Column() {
-      Text(value)
-        .fontSize(15)
-        .fontColor('#E4EEFF')
-        .fontWeight(FontWeight.Medium)
-      Text(label)
-        .fontSize(11)
-        .fontColor('#5C7192')
-        .margin({ top: 3 })
-    }
-    .layoutWeight(1)
-  }
-
-  @Builder
-  nodeCard() {
-    Column() {
-      // Collapsed: 节点 + current node + 管理 (jumps to the node page) + 展开.
-      Row() {
-        Text('节点')
-          .fontSize(14)
-          .fontColor('#A9BAD1')
-        Text(this.hasEntry ? this.entryName : '还没有节点')
-          .fontSize(13)
-          .fontColor(this.hasEntry ? '#54C4FF' : '#5C7192')
-          .margin({ left: 10 })
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .layoutWeight(1)
-        if (this.probeMs > 0 && this.state === 'running' && !this.nodeExpanded) {
-          Text(this.probeMs + ' ms')
-            .fontSize(11)
-            .fontColor(this.probeMs < 300 ? '#3DDC97' : (this.probeMs < 800 ? '#FFC857' : '#FF8A5B'))
-            .margin({ right: 8 })
+        if (this.dnsLeakProtect) {
+          Text('防 DNS 泄露')
+            .fontSize(10)
+            .fontColor(this.theme.success)
+            .padding({ left: 7, right: 7, top: 2, bottom: 2 })
+            .borderRadius(6)
+            .backgroundColor(this.theme.successSoft)
         }
-        Text('管理')
-          .fontSize(12)
-          .fontColor('#54C4FF')
-          .padding({ left: 8, right: 10, top: 4, bottom: 4 })
-          .onClick(() => {
-            this.openNodes();
-          })
-        Text(this.nodeExpanded ? '⌃' : '⌄')
-          .fontSize(14)
-          .fontColor('#5C7192')
+        if (this.webrtcLeakProtect) {
+          Text('WebRTC')
+            .fontSize(10)
+            .fontColor(this.theme.accent)
+            .padding({ left: 7, right: 7, top: 2, bottom: 2 })
+            .borderRadius(6)
+            .backgroundColor(this.theme.accentSoft)
+        }
       }
       .width('100%')
       .onClick(() => {
-        if (!this.nodeExpanded) {
-          this.loadNodeList();
-        }
-        this.nodeExpanded = !this.nodeExpanded;
-        if (this.nodeExpanded) {
-          // Expanding shows the cached numbers; measuring stays a manual action.
-          this.loadLatencyCache();
-        }
+        this.activeTab = 2;
+        this.openSettingsSubPage('privacy');
       })
+    }
+    .width('100%')
+    .padding(16)
+    .backgroundColor(this.theme.surface)
+    .border({ width: 0.5, color: this.theme.border })
+    .borderRadius(20)
+  }
 
-      if (this.nodeExpanded) {
+  // ==================== TAB 1: PROXIES ====================
+
+  @Builder
+  proxiesTab() {
+    Scroll() {
+      Column({ space: 10 }) {
         Row() {
-          Text(this.nodeProbing ? '测速中…' : '测速')
-            .fontSize(11)
-            .fontColor('#54C4FF')
-            .onClick(() => {
-              this.probeNodes();
-            })
+          Text('共 ' + this.nodeList.length + ' 节点 · ' + this.subs.length + ' 订阅')
+            .fontSize(12)
+            .fontColor(this.theme.textSecondary)
           Blank()
-          Text(this.nodeLatency.size + '/' + this.nodeList.length + ' 已测')
-            .fontSize(10)
-            .fontColor('#5C7192')
+          Text(this.sortByDelay ? '按延迟排序' : '默认顺序')
+            .fontSize(11)
+            .fontColor(this.theme.accent)
+            .padding({ left: 8, right: 8, top: 3, bottom: 3 })
+            .borderRadius(8)
+            .backgroundColor(this.theme.accentSoft)
+            .onClick(() => {
+              this.sortByDelay = !this.sortByDelay;
+            })
         }
         .width('100%')
-        .margin({ top: 6, bottom: 2 })
+        .padding({ left: 4, right: 4, bottom: 2 })
 
-        Column() {
-          ForEach(this.nodeList, (item: ConfigEntry) => {
-            Row() {
-              Text(item.name)
-                .fontSize(13)
-                .fontColor(item.id === this.selectedId ? '#54C4FF' : '#D6E4F7')
+        if (this.nodeList.length === 0 && this.subs.length === 0) {
+          Column({ space: 14 }) {
+            Stack({ alignContent: Alignment.Center }) {
+              SymbolGlyph($r('sys.symbol.paperplane_fill'))
+                .fontSize(26)
+                .fontColor([this.theme.accent])
+            }
+            .width(54)
+            .height(54)
+            .borderRadius(16)
+            .backgroundColor(this.theme.accentSoft)
+
+            Text('还没有节点或订阅')
+              .fontSize(17)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(this.theme.textPrimary)
+            Text('支持扫码导入、主流协议链接、订阅地址与 JSON 配置')
+              .fontSize(13)
+              .fontColor(this.theme.textSecondary)
+              .textAlign(TextAlign.Center)
+
+            Row({ space: 10 }) {
+              Button() {
+                Row({ space: 6 }) {
+                  SymbolGlyph($r('sys.symbol.qrcode'))
+                    .fontSize(16)
+                    .fontColor([this.theme.accentOn])
+                  Text('扫码导入')
+                    .fontSize(14)
+                    .fontWeight(FontWeight.Medium)
+                    .fontColor(this.theme.accentOn)
+                }
+              }
+              .layoutWeight(1)
+              .height(44)
+              .backgroundColor(this.theme.accent)
+              .borderRadius(22)
+              .onClick(() => {
+                this.openAddMode(0, true);
+              })
+
+              Button('添加节点')
+                .layoutWeight(1)
+                .height(44)
+                .fontSize(14)
+                .fontWeight(FontWeight.Medium)
+                .fontColor(this.theme.textPrimary)
+                .backgroundColor(this.theme.surfaceMuted)
+                .borderRadius(22)
+                .onClick(() => {
+                  this.openAddMode(0, false);
+                })
+            }
+            .width('100%')
+            .margin({ top: 6 })
+          }
+          .width('100%')
+          .padding({ top: 44, bottom: 36, left: 24, right: 24 })
+          .backgroundColor(this.theme.surface)
+          .border({ width: 0.5, color: this.theme.border })
+          .borderRadius(20)
+        } else {
+          if (manualEntries(this.nodeList).length > 0) {
+            ForEach(this.manualNodeList(), (entry: ConfigEntry) => {
+              this.proxyItemRow(entry, false)
+            }, (entry: ConfigEntry) => entry.id)
+          }
+
+          ForEach(this.subs, (sub: SubscriptionRecord) => {
+            this.subscriptionAccordion(sub)
+          }, (sub: SubscriptionRecord) => sub.id + '|' + sub.updatedAt + '|' + sub.name + '|' + sub.url)
+        }
+      }
+      .width('100%')
+      .padding({
+        left: 16,
+        right: 16,
+        top: this.headerHeight + 4,
+        bottom: this.insets.bottom + 96
+      })
+    }
+    .layoutWeight(1)
+    .scrollBar(BarState.Off)
+    .align(Alignment.Top)
+  }
+
+  @Builder
+  proxyItemRow(entry: ConfigEntry, inContainer: boolean) {
+    Row() {
+      Column({ space: 6 }) {
+        Row({ space: 6 }) {
+          Text(entry.name)
+            .fontSize(14)
+            .fontWeight(entry.id === this.selectedId ? FontWeight.Medium : FontWeight.Regular)
+            .fontColor(this.theme.textPrimary)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .constraintSize({ maxWidth: '88%' })
+          if (entry.id === this.selectedId) {
+            SymbolGlyph($r('sys.symbol.checkmark'))
+              .fontSize(14)
+              .fontWeight(FontWeight.Bold)
+              .fontColor([this.theme.accent])
+          }
+        }
+        .width('100%')
+
+        Row({ space: 5 }) {
+          ForEach(extractNodeBadges(entry.type, entry.json), (badge: NodeBadge) => {
+            Text(badge.text)
+              .fontSize(9)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(badge.fg)
+              .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+              .borderRadius(5)
+              .backgroundColor(badge.bg)
+          }, (badge: NodeBadge) => badge.text)
+        }
+        .width('100%')
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+      .onClick(() => {
+        this.pickNode(entry);
+      })
+
+      Text(this.latencyText(entry.id))
+        .fontSize(12)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(this.latencyColor(entry.id))
+        .textAlign(TextAlign.End)
+        .constraintSize({ minWidth: 56 })
+        .padding({ left: 8, right: 2, top: 8, bottom: 8 })
+        .onClick(() => {
+          this.probeSingleNode(entry);
+        })
+    }
+    .width('100%')
+    .padding({ left: 14, right: 14, top: 12, bottom: 12 })
+    .backgroundColor(entry.id === this.selectedId
+      ? this.theme.surfaceSelected
+      : (inContainer ? this.theme.surfaceMuted : this.theme.surface))
+    .border({
+      width: entry.id === this.selectedId ? 1 : 0.5,
+      color: entry.id === this.selectedId ? this.theme.accent : this.theme.border
+    })
+    .borderRadius(16)
+    .bindContextMenu(this.proxyContextMenu(entry, inContainer), ResponseType.LongPress)
+  }
+
+  @Builder
+  proxyContextMenu(entry: ConfigEntry, owned: boolean) {
+    Menu() {
+      MenuItem({ content: '测试延迟' })
+        .onClick(() => {
+          this.probeSingleNode(entry);
+        })
+      if (entry.server.length > 0) {
+        MenuItem({ content: '复制服务器地址' })
+          .onClick(() => {
+            this.copyPlainText(entry.server, '服务器地址');
+          })
+      }
+      if (!owned) {
+        MenuItem({ content: '删除节点' })
+          .contentFontColor(this.theme.danger)
+          .onClick(() => {
+            this.confirmDeleteNode(entry);
+          })
+      }
+    }
+  }
+
+  @Builder
+  subscriptionAccordion(sub: SubscriptionRecord) {
+    Column() {
+      if (this.editingSubId === sub.id) {
+        Column({ space: 10 }) {
+          Text('编辑订阅')
+            .fontSize(14)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.theme.textPrimary)
+            .width('100%')
+          TextInput({ text: this.editSubName, placeholder: '订阅名称' })
+            .height(40)
+            .fontSize(13)
+            .fontColor(this.theme.textPrimary)
+            .placeholderColor(this.theme.textTertiary)
+            .backgroundColor(this.theme.surfaceMuted)
+            .borderRadius(12)
+            .width('100%')
+            .onChange((value: string) => {
+              this.editSubName = value;
+            })
+          TextInput({ text: this.editSubUrl, placeholder: 'https://example.com/sub?token=...' })
+            .height(40)
+            .fontSize(12)
+            .fontColor(this.theme.textPrimary)
+            .placeholderColor(this.theme.textTertiary)
+            .backgroundColor(this.theme.surfaceMuted)
+            .borderRadius(12)
+            .width('100%')
+            .onChange((value: string) => {
+              this.editSubUrl = value;
+            })
+          Row({ space: 10 }) {
+            Button('取消')
+              .layoutWeight(1)
+              .height(38)
+              .fontSize(13)
+              .fontColor(this.theme.textSecondary)
+              .backgroundColor(this.theme.surfaceMuted)
+              .borderRadius(12)
+              .onClick(() => {
+                this.editingSubId = '';
+              })
+            Button('保存')
+              .layoutWeight(1)
+              .height(38)
+              .fontSize(13)
+              .fontColor(this.theme.accentOn)
+              .backgroundColor(this.theme.accent)
+              .borderRadius(12)
+              .onClick(() => {
+                this.commitEditSub(sub.id);
+              })
+          }
+          .width('100%')
+        }
+        .width('100%')
+      } else {
+        Row({ space: 12 }) {
+          Stack({ alignContent: Alignment.Center }) {
+            SymbolGlyph($r('sys.symbol.worldclock_fill'))
+              .fontSize(17)
+              .fontColor([this.subContainsSelected(sub.id) ? this.theme.accent : this.theme.textSecondary])
+          }
+          .width(34)
+          .height(34)
+          .borderRadius(10)
+          .backgroundColor(this.subContainsSelected(sub.id) ? this.theme.accentSoft : this.theme.surfaceMuted)
+
+          Column({ space: 3 }) {
+            Row({ space: 8 }) {
+              Text(sub.name)
+                .fontSize(15)
+                .fontWeight(FontWeight.Medium)
+                .fontColor(this.theme.textPrimary)
                 .maxLines(1)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
                 .layoutWeight(1)
-              Text(this.latencyText(item.id))
-                .fontSize(10)
-                .fontColor(this.latencyColor(item.id))
-                .margin({ right: 10 })
-              Text(nodeTypeLabel(item.type))
-                .fontSize(9)
-                .fontColor('#7C8FA9')
-                .padding({ left: 6, right: 6, top: 2, bottom: 2 })
-                .backgroundColor('#0F1728')
-                .borderRadius(6)
-                .margin({ right: 10 })
-              Text(item.id === this.selectedId ? '✓' : '')
-                .fontSize(13)
-                .fontColor('#54C4FF')
+              if (this.isUpdatingSub(sub.id)) {
+                LoadingProgress()
+                  .width(14)
+                  .height(14)
+                  .color(this.theme.accent)
+              }
+              Text('' + entriesOfSub(this.nodeList, sub.id).length)
+                .fontSize(11)
+                .fontWeight(FontWeight.Medium)
+                .fontColor(this.theme.accent)
+                .padding({ left: 8, right: 8, top: 2, bottom: 2 })
+                .borderRadius(10)
+                .backgroundColor(this.theme.accentSoft)
+              SymbolGlyph(this.expandedSubId === sub.id
+                ? $r('sys.symbol.chevron_up')
+                : $r('sys.symbol.chevron_down'))
+                .fontSize(14)
+                .fontColor([this.theme.textTertiary])
             }
             .width('100%')
-            .padding({ top: 10, bottom: 10 })
-            .onClick(() => {
-              this.pickNode(item);
-            })
-          }, (item: ConfigEntry) => item.id)
+
+            if (this.expandedSubId === sub.id) {
+              Text((sub.total > 0 || sub.upload > 0 || sub.download > 0)
+                ? formatQuota(sub.upload + sub.download, sub.total)
+                : ('更新于 ' + this.formatShortStamp(sub.updatedAt)))
+                .fontSize(11)
+                .fontColor(this.theme.textSecondary)
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+            }
+          }
+          .alignItems(HorizontalAlign.Start)
+          .layoutWeight(1)
         }
         .width('100%')
-        .margin({ top: 2 })
+        .onClick(() => {
+          this.expandedSubId = this.expandedSubId === sub.id ? '' : sub.id;
+        })
+
+        if (this.expandedSubId === sub.id) {
+          if (sub.total > 0 || sub.upload > 0 || sub.download > 0) {
+            Progress({
+              value: sub.upload + sub.download,
+              total: sub.total > 0 ? sub.total : 1,
+              type: ProgressType.Linear
+            })
+              .width('100%')
+              .height(4)
+              .color(this.theme.accent)
+              .backgroundColor(this.theme.surfaceMuted)
+              .margin({ top: 10 })
+
+            Row() {
+              Text('到期 ' + formatExpire(sub.expire))
+                .fontSize(11)
+                .fontColor(this.theme.textTertiary)
+                .layoutWeight(1)
+              Text('更新于 ' + this.formatShortStamp(sub.updatedAt))
+                .fontSize(11)
+                .fontColor(this.theme.textTertiary)
+            }
+            .width('100%')
+            .margin({ top: 6 })
+          }
+
+          Row({ space: 6 }) {
+            this.subActionBtn(
+              $r('sys.symbol.arrow_clockwise'),
+              this.isUpdatingSub(sub.id) ? '更新中' : '更新',
+              this.isUpdatingSub(sub.id) ? this.theme.textTertiary : this.theme.accent,
+              () => {
+                if (!this.isUpdatingSub(sub.id)) {
+                  this.refreshOneSub(sub.id);
+                }
+              }
+            )
+            this.subActionBtn(
+              $r('sys.symbol.bolt_1'),
+              '测速',
+              this.nodeProbing ? this.theme.textTertiary : this.theme.success,
+              () => {
+                if (!this.nodeProbing) {
+                  this.probeScope(this.subNodeList(sub.id));
+                }
+              }
+            )
+            this.subActionBtn(
+              $r('sys.symbol.square_and_pencil'),
+              '编辑',
+              this.theme.textSecondary,
+              () => {
+                this.beginEditSub(sub.id);
+              }
+            )
+            this.subActionBtn(
+              $r('sys.symbol.text_clipboard'),
+              '复制',
+              this.theme.textSecondary,
+              () => {
+                this.copyPlainText(sub.url, '订阅链接');
+              }
+            )
+            this.subActionBtn(
+              $r('sys.symbol.trash'),
+              '删除',
+              this.theme.danger,
+              () => {
+                this.confirmDeleteSub(sub.id);
+              }
+            )
+          }
+          .width('100%')
+          .margin({ top: 10 })
+
+          Divider().color(this.theme.divider).margin({ top: 12, bottom: 10 })
+
+          if (entriesOfSub(this.nodeList, sub.id).length === 0) {
+            Text('该订阅暂无节点，请点上方「更新」拉取。')
+              .fontSize(12)
+              .fontColor(this.theme.textTertiary)
+              .width('100%')
+              .padding({ top: 6, bottom: 6 })
+          } else {
+            Column({ space: 8 }) {
+              ForEach(this.subNodeList(sub.id), (entry: ConfigEntry) => {
+                this.proxyItemRow(entry, true)
+              }, (entry: ConfigEntry) => entry.id)
+            }
+            .width('100%')
+          }
+        }
       }
     }
     .width('100%')
-    .padding(16)
-    .backgroundColor('#101827')
+    .padding(14)
+    .backgroundColor(this.theme.surface)
+    .border({
+      width: 0.5,
+      color: this.expandedSubId === sub.id ? this.theme.borderStrong : this.theme.border
+    })
     .borderRadius(20)
-    .border({ width: 1, color: '#0AFFFFFF' })
-    .shadow({ radius: 26, color: '#3D000000', offsetY: 8 })
   }
 
   @Builder
-  rulesCard() {
-    Column() {
-      // Collapsed by default: only the section name and the active mode. Tap
-      // anywhere on this row to unfold the full card, tap again to fold it.
-      Row() {
-        Text('规则')
-          .fontSize(14)
-          .fontColor('#A9BAD1')
-        Text(this.modeName(this.routeMode))
-          .fontSize(13)
-          .fontColor('#54C4FF')
-          .margin({ left: 10 })
-          .layoutWeight(1)
-        Text(this.rulesExpanded ? '收起' : '展开')
-          .fontSize(11)
-          .fontColor('#5C7192')
-          .margin({ right: 6 })
-        Text(this.rulesExpanded ? '⌃' : '⌄')
-          .fontSize(14)
-          .fontColor('#5C7192')
-      }
-      .width('100%')
-      .onClick(() => {
-        this.rulesExpanded = !this.rulesExpanded;
-      })
+  subActionBtn(symbol: Resource, label: string, color: string, onTap: () => void) {
+    Row({ space: 4 }) {
+      SymbolGlyph(symbol)
+        .fontSize(12)
+        .fontColor([color])
+      Text(label)
+        .fontSize(11)
+        .fontColor(color)
+    }
+    .layoutWeight(1)
+    .height(32)
+    .justifyContent(FlexAlign.Center)
+    .borderRadius(10)
+    .backgroundColor(this.theme.surfaceMuted)
+    .onClick(onTap)
+  }
 
-      if (this.rulesExpanded) {
-      Row() {
-        Text('全局模式即不分流')
-          .fontSize(10)
-          .fontColor('#44536B')
-          .layoutWeight(1)
+  // ==================== TAB 2: SETTINGS (Anywhere ToolboxView + Themes + About/Updater) ====================
+
+  @Builder
+  settingsTab() {
+    Scroll() {
+      Column({ space: 16 }) {
+        if (this.settingsSubPage === '') {
+          this.settingsRootList()
+        } else if (this.settingsSubPage === 'appearance') {
+          this.settingsAppearancePage()
+        } else if (this.settingsSubPage === 'routing') {
+          this.settingsRoutingPage()
+        } else if (this.settingsSubPage === 'privacy') {
+          this.settingsPrivacyPage()
+        } else if (this.settingsSubPage === 'keepalive') {
+          this.settingsKeepAlivePage()
+        } else if (this.settingsSubPage === 'wifi') {
+          this.settingsWifiPage()
+        } else if (this.settingsSubPage === 'logs') {
+          this.settingsLogsPage()
+        } else {
+          this.settingsAboutPage()
+        }
       }
       .width('100%')
-      .margin({ top: 8 })
+      .padding({
+        left: 18,
+        right: 18,
+        top: this.headerHeight + 6,
+        bottom: this.insets.bottom + 96
+      })
+    }
+    .layoutWeight(1)
+    .scrollBar(BarState.Off)
+    .align(Alignment.Top)
+  }
+
+  @Builder
+  settingsRootList() {
+    // Section 1: Appearance & Personalization (matches Anywhere Personalization section)
+    Column() {
+      this.settingsNavRow(
+        $r('sys.symbol.slider_vertical_3'),
+        '#EC4899',
+        '外观与主题',
+        this.theme.name,
+        () => {
+          this.openSettingsSubPage('appearance');
+        }
+      )
+    }
+    .width('100%')
+    .backgroundColor(this.theme.surface)
+    .border({ width: 0.5, color: this.theme.border })
+    .borderRadius(20)
+
+    // Section 2: VPN & Routing
+    Column() {
+      this.settingsNavRow(
+        $r('sys.symbol.slider_horizontal_2'),
+        '#8B5CF6',
+        '分流与路由',
+        this.useRuleSet && this.hasRuleSet ? '自定义规则' : this.modeName(this.routeMode),
+        () => {
+          this.openSettingsSubPage('routing');
+        }
+      )
+      Divider().color(this.theme.divider).margin({ left: 58 })
+      this.settingsNavRow(
+        $r('sys.symbol.lock_fill'),
+        '#3B82F6',
+        '隧道与隐私防护',
+        this.privacySummary(),
+        () => {
+          this.openSettingsSubPage('privacy');
+        }
+      )
+    }
+    .width('100%')
+    .backgroundColor(this.theme.surface)
+    .border({ width: 0.5, color: this.theme.border })
+    .borderRadius(20)
+
+    // Section 3: HarmonyOS Keep-Alive & Trusted Network
+    Column() {
+      this.settingsNavRow(
+        $r('sys.symbol.bell_fill'),
+        '#10B981',
+        '后台保活与通知',
+        this.keepAliveOnRemove ? '无窗口保活' : '标准',
+        () => {
+          this.openSettingsSubPage('keepalive');
+        }
+      )
+      Divider().color(this.theme.divider).margin({ left: 58 })
+      this.settingsNavRow(
+        $r('sys.symbol.wifi'),
+        '#06B6D4',
+        '受信任 Wi-Fi',
+        this.rules.length > 0 ? (this.rules.length + ' 条规则') : '未设置',
+        () => {
+          this.openSettingsSubPage('wifi');
+        }
+      )
+    }
+    .width('100%')
+    .backgroundColor(this.theme.surface)
+    .border({ width: 0.5, color: this.theme.border })
+    .borderRadius(20)
+
+    // Section 4: Diagnostics & About/Core
+    Column() {
+      this.settingsNavRow(
+        $r('sys.symbol.waveform'),
+        '#6366F1',
+        '实时连接监控',
+        this.state === 'running' ? (this.flows + ' 条活跃') : '',
+        () => {
+          this.openConnections();
+        }
+      )
+      Divider().color(this.theme.divider).margin({ left: 58 })
+      this.settingsNavRow(
+        $r('sys.symbol.doc_plaintext_fill'),
+        '#F59E0B',
+        '诊断与运行日志',
+        this.debugLog ? '诊断已开' : '',
+        () => {
+          this.openSettingsSubPage('logs');
+        }
+      )
+      Divider().color(this.theme.divider).margin({ left: 58 })
+      this.settingsNavRow(
+        $r('sys.symbol.info_circle_fill'),
+        '#64748B',
+        '内核与关于',
+        'v' + APP_VERSION_NAME,
+        () => {
+          this.openSettingsSubPage('about');
+        }
+      )
+    }
+    .width('100%')
+    .backgroundColor(this.theme.surface)
+    .border({ width: 0.5, color: this.theme.border })
+    .borderRadius(20)
+  }
+
+  @Builder
+  settingsNavRow(icon: Resource, badgeBg: string, title: string, value: string, onTap: () => void) {
+    Row({ space: 14 }) {
+      Stack({ alignContent: Alignment.Center }) {
+        SymbolGlyph(icon)
+          .fontSize(16)
+          .fontColor(['#FFFFFF'])
+      }
+      .width(30)
+      .height(30)
+      .borderRadius(8)
+      .backgroundColor(badgeBg)
+
+      Text(title)
+        .fontSize(15)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(this.theme.textPrimary)
+        .layoutWeight(1)
+
+      if (value.length > 0) {
+        Text(value)
+          .fontSize(13)
+          .fontColor(this.theme.textSecondary)
+      }
+
+      SymbolGlyph($r('sys.symbol.chevron_right'))
+        .fontSize(14)
+        .fontColor([this.theme.textTertiary])
+    }
+    .width('100%')
+    .padding({ left: 14, right: 16, top: 14, bottom: 14 })
+    .onClick(onTap)
+  }
+
+  @Builder
+  settingsSectionHeader(title: string) {
+    Text(title)
+      .fontSize(12)
+      .fontWeight(FontWeight.Medium)
+      .fontColor(this.theme.textSecondary)
+      .width('100%')
+      .padding({ left: 6 })
+  }
+
+  @Builder
+  settingsToggleRow(title: string, subtitle: string, value: boolean, onChange: (v: boolean) => void) {
+    Row({ space: 12 }) {
+      Column({ space: 3 }) {
+        Text(title)
+          .fontSize(15)
+          .fontColor(this.theme.textPrimary)
+        if (subtitle.length > 0) {
+          Text(subtitle)
+            .fontSize(12)
+            .fontColor(this.theme.textSecondary)
+        }
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+
+      Toggle({ type: ToggleType.Switch, isOn: value })
+        .selectedColor(this.theme.accent)
+        .onChange(onChange)
+    }
+    .width('100%')
+    .padding({ left: 16, right: 14, top: 13, bottom: 13 })
+  }
+
+  // ---- Sub-page: Appearance & Themes ----
+  @Builder
+  settingsAppearancePage() {
+    this.settingsSectionHeader('选择界面主题')
+    Column() {
+      ForEach(ALL_THEMES, (item: AppTheme, idx: number) => {
+        Column() {
+          if (idx > 0) {
+            Divider().color(this.theme.divider).margin({ left: 62 })
+          }
+          Row({ space: 14 }) {
+            // Dual-tone theme swatch preview
+            Stack({ alignContent: Alignment.BottomEnd }) {
+              Column()
+                .width(34)
+                .height(34)
+                .borderRadius(10)
+                .backgroundColor(item.previewBg)
+                .border({ width: 1, color: this.theme.borderStrong })
+              Circle()
+                .width(12)
+                .height(12)
+                .fill(item.previewAccent)
+                .border({ width: 1.5, color: item.previewBg })
+                .margin({ right: 3, bottom: 3 })
+            }
+            .width(34)
+            .height(34)
+
+            Column({ space: 2 }) {
+              Text(item.name)
+                .fontSize(15)
+                .fontWeight(FontWeight.Medium)
+                .fontColor(this.theme.textPrimary)
+              Text(item.subtitle)
+                .fontSize(12)
+                .fontColor(this.theme.textSecondary)
+            }
+            .alignItems(HorizontalAlign.Start)
+            .layoutWeight(1)
+
+            if (this.themeId === item.id) {
+              SymbolGlyph($r('sys.symbol.checkmark_circle_fill_1'))
+                .fontSize(20)
+                .fontColor([this.theme.accent])
+            }
+          }
+          .width('100%')
+          .padding({ left: 14, right: 16, top: 13, bottom: 13 })
+          .onClick(() => {
+            this.selectTheme(item.id);
+          })
+        }
+      }, (item: AppTheme) => item.id)
+    }
+    .width('100%')
+    .backgroundColor(this.theme.surface)
+    .border({ width: 0.5, color: this.theme.border })
+    .borderRadius(20)
+  }
+
+  // ---- Sub-page: Routing ----
+  @Builder
+  settingsRoutingPage() {
+    this.settingsSectionHeader('路由模式')
+    Column({ space: 10 }) {
+      Row({ space: 4 }) {
+        this.modeSegment(MODE_GFW, 'GFW')
+        this.modeSegment(MODE_BYPASS, '绕过大陆')
+        this.modeSegment(MODE_GLOBAL, '全局')
+      }
+      .width('100%')
+      .padding(4)
+      .backgroundColor(this.theme.surfaceMuted)
+      .borderRadius(14)
 
       Text(this.routeMode === MODE_GFW
-        ? 'GFW 模式：仅被屏蔽的站点走节点，其余直连。'
+        ? '仅受限站点走节点，其余国内与常见海外站点直连。'
         : (this.routeMode === MODE_GLOBAL
-          ? '全局模式：所有流量都走节点。'
-          : '绕过大陆：局域网与国内域名/IP 直连，其余走节点。'))
-        .fontSize(11)
-        .fontColor('#5C7192')
+          ? '所有公网流量与远程 DNS 全部经由代理节点转发。'
+          : '局域网与大陆域名/IP 直连，其余海外流量走节点。'))
+        .fontSize(12)
+        .fontColor(this.theme.textSecondary)
         .width('100%')
-        .margin({ top: 6 })
+    }
+    .width('100%')
+    .padding(14)
+    .backgroundColor(this.theme.surface)
+    .border({ width: 0.5, color: this.theme.border })
+    .borderRadius(20)
 
-      Row() {
-        Text('GFW')
-          .fontSize(12)
-          .fontColor(this.routeMode === MODE_GFW ? '#0B1020' : '#7C8FA9')
-          .backgroundColor(this.routeMode === MODE_GFW ? '#54C4FF' : '#101A2E')
-          .textAlign(TextAlign.Center)
-          .layoutWeight(1)
-          .height(32)
-          .borderRadius(8)
-          .onClick(() => {
-            this.selectMode(MODE_GFW);
-          })
-        Text('绕过大陆')
-          .fontSize(12)
-          .fontColor(this.routeMode === MODE_BYPASS ? '#0B1020' : '#7C8FA9')
-          .backgroundColor(this.routeMode === MODE_BYPASS ? '#54C4FF' : '#101A2E')
-          .textAlign(TextAlign.Center)
-          .layoutWeight(1)
-          .height(32)
-          .borderRadius(8)
-          .margin({ left: 8 })
-          .onClick(() => {
-            this.selectMode(MODE_BYPASS);
-          })
-        Text('全局')
-          .fontSize(12)
-          .fontColor(this.routeMode === MODE_GLOBAL ? '#0B1020' : '#7C8FA9')
-          .backgroundColor(this.routeMode === MODE_GLOBAL ? '#54C4FF' : '#101A2E')
-          .textAlign(TextAlign.Center)
-          .layoutWeight(1)
-          .height(32)
-          .borderRadius(8)
-          .margin({ left: 8 })
-          .onClick(() => {
-            this.selectMode(MODE_GLOBAL);
-          })
+    this.settingsSectionHeader('规则集与地理数据')
+    Column() {
+      Row({ space: 12 }) {
+        Column({ space: 3 }) {
+          Text('自定义规则')
+            .fontSize(15)
+            .fontColor(this.theme.textPrimary)
+          Text(this.hasRuleSet ? this.ruleSetText : '未添加（默认使用极简基础规则）')
+            .fontSize(12)
+            .fontColor(this.theme.textSecondary)
+            .maxLines(2)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+
+        Text(this.hasRuleSet ? '编辑' : '添加')
+          .fontSize(13)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.theme.accent)
+        SymbolGlyph($r('sys.symbol.chevron_right'))
+          .fontSize(14)
+          .fontColor([this.theme.textTertiary])
       }
       .width('100%')
-      .margin({ top: 10 })
+      .padding({ left: 16, right: 16, top: 14, bottom: 14 })
+      .onClick(() => {
+        this.openCustomRules();
+      })
 
-      Row() {
-        Column() {
-          Text('规则文件 geosite/geoip')
-            .fontSize(13)
-            .fontColor('#D6E4F7')
+      if (this.hasRuleSet) {
+        Divider().color(this.theme.divider).margin({ left: 16 })
+        this.settingsToggleRow(
+          '启用自定义规则',
+          '开启后优先按自定义规则分流',
+          this.useRuleSet,
+          (v: boolean) => {
+            this.toggleRuleSet(v);
+          }
+        )
+      }
+
+      Divider().color(this.theme.divider).margin({ left: 16 })
+
+      Row({ space: 12 }) {
+        Column({ space: 3 }) {
+          Text('GeoData 规则文件')
+            .fontSize(15)
+            .fontColor(this.theme.textPrimary)
           Text(this.geoText)
-            .fontSize(11)
-            .fontColor('#5C7192')
-            .margin({ top: 2 })
+            .fontSize(12)
+            .fontColor(this.theme.textSecondary)
         }
         .alignItems(HorizontalAlign.Start)
         .layoutWeight(1)
 
         Text(this.geoBusy ? '更新中…' : '更新')
           .fontSize(12)
-          .fontColor(this.geoBusy ? '#4C5D77' : '#54C4FF')
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.geoBusy ? this.theme.textTertiary : this.theme.accent)
           .padding({ left: 12, right: 12, top: 6, bottom: 6 })
-          .borderRadius(8)
-          .backgroundColor('#101A2E')
+          .borderRadius(12)
+          .backgroundColor(this.theme.accentSoft)
           .onClick(() => {
             if (!this.geoBusy) {
               this.runGeodataUpdate(false);
@@ -2651,495 +4718,748 @@ struct Index {
           })
       }
       .width('100%')
-      .margin({ top: 12 })
+      .padding({ left: 16, right: 14, top: 13, bottom: 13 })
 
-      Row() {
-        Column() {
-          Text('屏蔽 QUIC')
-            .fontSize(13)
-            .fontColor('#D6E4F7')
-          Text('拒绝 UDP 443，让应用回退到 TCP（推荐）')
-            .fontSize(11)
-            .fontColor('#5C7192')
-            .margin({ top: 2 })
-        }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
+      Divider().color(this.theme.divider).margin({ left: 16 })
 
-        Toggle({ type: ToggleType.Switch, isOn: this.blockQuic })
-          .selectedColor('#54C4FF')
-          .onChange((value: boolean) => {
-            this.blockQuic = value;
-            this.persist();
-          })
-      }
-      .width('100%')
-      .margin({ top: 10 })
-
-      Row() {
-        Column() {
-          Text('诊断日志')
-            .fontSize(13)
-            .fontColor('#D6E4F7')
-          Text('记录每条连接的路由决策，排查后再关（默认关闭）')
-            .fontSize(11)
-            .fontColor('#5C7192')
-            .margin({ top: 2 })
-        }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
-
-        Toggle({ type: ToggleType.Switch, isOn: this.debugLog })
-          .selectedColor('#54C4FF')
-          .onChange((value: boolean) => {
-            this.debugLog = value;
-            this.persist();
-          })
-      }
-      .width('100%')
-      .margin({ top: 10 })
-
-      Divider().color('#1C2740').margin({ top: 12, bottom: 12 })
-
-      Row() {
-        Column() {
-          Text('分流规则集')
-            .fontSize(13)
-            .fontColor('#D6E4F7')
-          Text(this.ruleBusy ? ('下载中 ' + this.ruleProgress) : this.ruleSetText)
-            .fontSize(10)
-            .fontColor(this.hasRuleSet ? '#7C8FA9' : '#5C7192')
-            .margin({ top: 2 })
-            .maxLines(2)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-        }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
-
-        Text(this.ruleBusy ? '…' : '更换')
-          .fontSize(12)
-          .fontColor(this.ruleBusy ? '#4C5D77' : '#54C4FF')
-          .padding({ left: 12, right: 12, top: 6, bottom: 6 })
-          .borderRadius(8)
-          .backgroundColor('#101A2E')
-          .bindMenu(this.ruleMenu())
-      }
-      .width('100%')
-      .margin({ top: 2 })
-
-      Row() {
-        Column() {
-          Text('使用规则集')
-            .fontSize(13)
-            .fontColor('#D6E4F7')
-          Text('开启后由规则集决定哪些直连、哪些走节点')
-            .fontSize(11)
-            .fontColor('#5C7192')
-            .margin({ top: 2 })
-        }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
-
-        Toggle({ type: ToggleType.Switch, isOn: this.useRuleSet })
-          .selectedColor('#54C4FF')
-          .onChange((value: boolean) => {
-            this.toggleRuleSet(value);
-          })
-      }
-      .width('100%')
-      .margin({ top: 10 })
-
-      Row() {
-        Column() {
-          Text('拦截广告')
-            .fontSize(13)
-            .fontColor(this.useRuleSet ? '#D6E4F7' : '#5C7192')
-          Text(this.useRuleSet
-            ? '丢弃规则集里 ' + this.blockAdText + ' 条广告域名（BanAD / BanProgramAD）'
-            : '需要先开启「使用规则集」')
-            .fontSize(11)
-            .fontColor('#5C7192')
-            .margin({ top: 2 })
-        }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
-
-        Toggle({ type: ToggleType.Switch, isOn: this.blockAds })
-          .selectedColor('#54C4FF')
-          .enabled(this.useRuleSet)
-          .opacity(this.useRuleSet ? 1 : 0.4)
-          .onChange((value: boolean) => {
-            this.blockAds = value;
-            this.persist();
-            const blocking = this.ctx;
-            if (blocking !== null) {
-              this.applyRoutingChange(blocking, value ? '已开启广告拦截' : '已关闭广告拦截');
-            }
-          })
-      }
-      .width('100%')
-      .margin({ top: 10 })
-
-      Row() {
-        Column() {
-          Text('DoH DNS')
-            .fontSize(13)
-            .fontColor('#D6E4F7')
-          Text(this.dohDns
-            ? '国内 223.5.5.5 直连 · 国外 1.1.1.1 走节点（HTTPS 加密查询）'
-            : '关闭时使用配置自带的普通 DNS')
-            .fontSize(11)
-            .fontColor('#5C7192')
-            .margin({ top: 2 })
-        }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
-
-        Toggle({ type: ToggleType.Switch, isOn: this.dohDns })
-          .selectedColor('#54C4FF')
-          .onChange((value: boolean) => {
-            this.toggleDoh(value);
-          })
-      }
-      .width('100%')
-      .margin({ top: 10 })
-
-
-      Row() {
-        Column() {
-          Text('FakeIP')
-            .fontSize(13)
-            .fontColor('#D6E4F7')
-          Text('域名优先；规则集模式也生效')
-            .fontSize(11)
-            .fontColor('#5C7192')
-            .margin({ top: 2 })
-        }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
-
-        Toggle({ type: ToggleType.Switch, isOn: this.fakeDns })
-          .selectedColor('#54C4FF')
-          .onChange((value: boolean) => {
-            this.toggleFakeDns(value);
-          })
-      }
-      .width('100%')
-      .margin({ top: 10 })
-
-      Row() {
-        Column() {
-          Text('规则源')
-            .fontSize(13)
-            .fontColor('#D6E4F7')
-          Text(this.geoSourceName + ' · 点击切换下载源')
-            .fontSize(11)
-            .fontColor('#5C7192')
-            .margin({ top: 2 })
+      Row({ space: 12 }) {
+        Column({ space: 3 }) {
+          Text('规则下载源')
+            .fontSize(15)
+            .fontColor(this.theme.textPrimary)
+          Text(this.geoSourceName)
+            .fontSize(12)
+            .fontColor(this.theme.textSecondary)
         }
         .alignItems(HorizontalAlign.Start)
         .layoutWeight(1)
 
         Text('切换')
           .fontSize(12)
-          .fontColor('#54C4FF')
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.theme.accent)
           .padding({ left: 12, right: 12, top: 6, bottom: 6 })
-          .borderRadius(8)
-          .backgroundColor('#101A2E')
+          .borderRadius(12)
+          .backgroundColor(this.theme.accentSoft)
           .onClick(() => {
             this.cycleGeoSource();
           })
       }
       .width('100%')
-      .margin({ top: 10 })
-      }
+      .padding({ left: 16, right: 14, top: 13, bottom: 13 })
     }
     .width('100%')
-    .padding(16)
-    .backgroundColor('#101827')
+    .backgroundColor(this.theme.surface)
+    .border({ width: 0.5, color: this.theme.border })
     .borderRadius(20)
-    .border({ width: 1, color: '#0AFFFFFF' })
-    .shadow({ radius: 26, color: '#3D000000', offsetY: 8 })
   }
 
+  // ---- Sub-page: Tunnel & Privacy ----
   @Builder
-  ssidCard() {
+  settingsPrivacyPage() {
+    this.settingsSectionHeader('防泄露保护')
     Column() {
-      // Collapsed: 按需启动 + summary + the quick toggle; tap the row to expand.
-      Row() {
-        Text('按需启动')
-          .fontSize(14)
-          .fontColor('#A9BAD1')
-        Text(this.rules.length > 0 ? ('已加 ' + this.rules.length + ' 条') : '未添加')
-          .fontSize(12)
-          .fontColor('#54C4FF')
-          .margin({ left: 10 })
-          .layoutWeight(1)
-        Text(this.ssidExpanded ? '⌃' : '⌄')
-          .fontSize(14)
-          .fontColor('#5C7192')
-      }
-      .width('100%')
-      .onClick(() => {
-        this.ssidExpanded = !this.ssidExpanded;
-      })
-
-      if (this.ssidExpanded) {
-        Row() {
-          Column() {
-            Text('后台运行 VPN')
-              .fontSize(13)
-              .fontColor('#D6E4F7')
-            Text('无需添加卡片，开启后立即生效')
-              .fontSize(11)
-              .fontColor('#5C7192')
-              .margin({ top: 2 })
-          }
-          .alignItems(HorizontalAlign.Start)
-          .layoutWeight(1)
-          Toggle({ type: ToggleType.Switch, isOn: this.keepAliveOnRemove })
-            .selectedColor('#54C4FF')
-            .onChange((value: boolean) => {
-              this.toggleKeepAliveOnRemove(value);
-            })
+      this.settingsToggleRow(
+        '防 DNS 泄露',
+        '拦截 53/853 逃逸与 IPv6 DNS 泄露，海外及全局强制远程解析',
+        this.dnsLeakProtect,
+        (v: boolean) => {
+          this.toggleDnsLeakProtect(v);
         }
-        .width('100%')
-        .margin({ top: 10 })
+      )
+      Divider().color(this.theme.divider).margin({ left: 16 })
+      this.settingsToggleRow(
+        '防 WebRTC 泄露',
+        '阻断 STUN/TURN 探测真实 IP；如需语音视频通话可热关闭',
+        this.webrtcLeakProtect,
+        (v: boolean) => {
+          this.toggleWebrtcLeakProtect(v);
+        }
+      )
+    }
+    .width('100%')
+    .backgroundColor(this.theme.surface)
+    .border({ width: 0.5, color: this.theme.border })
+    .borderRadius(20)
 
-        Text(this.rules.length > 0
-          ? ('按 Wi-Fi 自动挂起 · 已添加 ' + this.rules.length + ' 条')
-          : '添加 Wi-Fi 规则后启用按需启动；删除全部规则即关闭')
-          .fontSize(11)
-          .fontColor('#5C7192')
-          .width('100%')
-          .margin({ top: 6 })
+    this.settingsSectionHeader('DNS 与传输')
+    Column() {
+      this.settingsToggleRow(
+        'DoH 加密 DNS',
+        this.dohDns ? '国内 223.5.5.5 直连 · 海外 1.1.1.1 走节点' : '使用普通 DNS 解析',
+        this.dohDns,
+        (v: boolean) => {
+          this.toggleDoh(v);
+        }
+      )
+      Divider().color(this.theme.divider).margin({ left: 16 })
+      this.settingsToggleRow(
+        'FakeIP 域名优先',
+        '减少海外连接 DNS 等待，重连后生效',
+        this.fakeDns,
+        (v: boolean) => {
+          this.toggleFakeDns(v);
+        }
+      )
+      Divider().color(this.theme.divider).margin({ left: 16 })
+      this.settingsToggleRow(
+        '屏蔽 QUIC (UDP 443)',
+        '拒绝 UDP 443 回退至 TCP，热生效',
+        this.blockQuic,
+        (v: boolean) => {
+          this.toggleBlockQuic(v);
+        }
+      )
+    }
+    .width('100%')
+    .backgroundColor(this.theme.surface)
+    .border({ width: 0.5, color: this.theme.border })
+    .borderRadius(20)
+  }
 
-        Text(this.currentWifi.length > 0 ? ('当前 Wi-Fi：' + this.currentWifi) : '当前未连接 Wi-Fi')
-            .fontSize(11)
-            .fontColor(this.currentWifi.length > 0 ? '#7C8FA9' : '#4C5D77')
-            .width('100%')
-            .margin({ top: 6 })
-
-          TextInput({ placeholder: this.currentWifi.length > 0 ? this.currentWifi : '输入 Wi-Fi 名称', text: this.manualSsid })
-            .height(34)
+  // ---- Sub-page: HarmonyOS Keep-Alive & Notifications ----
+  @Builder
+  settingsKeepAlivePage() {
+    this.settingsSectionHeader('后台运行与实况窗')
+    Column() {
+      this.settingsToggleRow(
+        '后台运行 VPN',
+        '划掉主窗口后保持 VPN 在线（更新或开关均不弹卡片）',
+        this.keepAliveOnRemove,
+        (v: boolean) => {
+          this.toggleKeepAliveOnRemove(v);
+        }
+      )
+      Divider().color(this.theme.divider).margin({ left: 16 })
+      this.settingsToggleRow(
+        '常驻流量实况窗',
+        '锁屏自动心跳续命 · 状态点（🟢运行 · 🟡挂起 · 🔴异常）',
+        this.notifyMe,
+        (v: boolean) => {
+          this.notifyMe = v;
+          this.persist();
+        }
+      )
+      Divider().color(this.theme.divider).margin({ left: 16 })
+      Row({ space: 12 }) {
+        Column({ space: 3 }) {
+          Text('恢复实况窗通知')
+            .fontSize(15)
+            .fontColor(this.theme.textPrimary)
+          Text(this.keepAliveTaskCanceled ? '实况窗曾被系统清理，将自动恢复或点右侧立即补发' : '锁屏掉通知时自动重连，亦可手动补发')
             .fontSize(12)
-            .fontColor('#E4EEFF')
-            .placeholderColor('#7C8FA9')
-            .backgroundColor(Color.Transparent)
-            .border({ width: 1, color: '#35507A' })
-            .borderRadius(8)
-            .width('100%')
-            .margin({ top: 6 })
-            .onChange((value: string) => {
-              this.manualSsid = value;
-            })
-
-          Row() {
-            Text('添加')
-              .fontSize(12)
-              .fontColor('#0B1020')
-              .fontWeight(FontWeight.Medium)
-              .textAlign(TextAlign.Center)
-              .layoutWeight(1)
-              .height(32)
-              .borderRadius(8)
-              .backgroundColor('#54C4FF')
-              .onClick(() => {
-                this.addRuleFromInput(SSID_SUSPEND);
-              })
-            Text('清空')
-              .fontSize(12)
-              .fontColor('#FF5C7A')
-              .textAlign(TextAlign.Center)
-              .width(48)
-              .height(32)
-              .margin({ left: 8 })
-              .onClick(() => {
-                this.clearRules();
-              })
-          }
-          .width('100%')
-          .margin({ top: 8 })
-
-          ForEach(this.rules, (rule: SsidRule) => {
-            Row() {
-              Text(rule.ssid)
-                .fontSize(12)
-                .fontColor('#C7D6EC')
-                .layoutWeight(1)
-                .maxLines(1)
-                .textOverflow({ overflow: TextOverflow.Ellipsis })
-              Text('挂起')
-                .fontSize(11)
-                .fontColor('#7C8FA9')
-                .margin({ right: 12 })
-              Text('删')
-                .fontSize(11)
-                .fontColor('#FF5C7A')
-                .onClick(() => {
-                  this.deleteRule(rule.ssid);
-                })
-            }
-            .width('100%')
-            .margin({ top: 6 })
-          }, (rule: SsidRule) => rule.ssid)
-      }
-    }
-    .width('100%')
-    .padding(16)
-    .backgroundColor('#101827')
-    .borderRadius(20)
-    .border({ width: 1, color: '#0AFFFFFF' })
-    .shadow({ radius: 26, color: '#3D000000', offsetY: 8 })
-  }
-
-  @Builder
-  keepAliveCard() {
-    Column() {
-      Text('保活')
-        .fontSize(14)
-        .fontColor('#A9BAD1')
-        .width('100%')
-      Row() {
-        Column() {
-          Text('常驻通知')
-            .fontSize(13)
-            .fontColor('#D6E4F7')
-          Text('在通知栏显示实时流量')
-            .fontSize(11)
-            .fontColor('#5C7192')
-            .margin({ top: 2 })
-        }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
-        Toggle({ type: ToggleType.Switch, isOn: this.notifyMe })
-          .selectedColor('#54C4FF')
-          .onChange((value: boolean) => {
-            this.notifyMe = value;
-            this.persist();
-          })
-      }
-      .width('100%')
-      .margin({ top: 10 })
-
-      Row() {
-        Column() {
-          Text('断网自动重连')
-            .fontSize(13)
-            .fontColor('#D6E4F7')
-          Text('网络切换时重建底层连接')
-            .fontSize(11)
-            .fontColor('#5C7192')
-            .margin({ top: 2 })
-        }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
-        Toggle({ type: ToggleType.Switch, isOn: this.rebindOnNetChange })
-          .selectedColor('#54C4FF')
-          .onChange((value: boolean) => {
-            this.rebindOnNetChange = value;
-            this.persist();
-          })
-      }
-      .width('100%')
-      .margin({ top: 12 })
-
-      Row() {
-        Column() {
-          Text('打开应用自动连接')
-            .fontSize(13)
-            .fontColor('#D6E4F7')
-          Text(this.autoConnect ? '上次退出时是连接状态，启动 App 自动连上' : '启动 App 不自动连接')
-            .fontSize(11)
-            .fontColor('#5C7192')
-            .margin({ top: 2 })
+            .fontColor(this.keepAliveTaskCanceled ? this.theme.warning : this.theme.textSecondary)
         }
         .alignItems(HorizontalAlign.Start)
         .layoutWeight(1)
 
-        Toggle({ type: ToggleType.Switch, isOn: this.autoConnect })
-          .selectedColor('#54C4FF')
-          .onChange((value: boolean) => {
-            this.autoConnect = value;
-            this.persist();
-          })
-      }
-      .width('100%')
-      .margin({ top: 12 })
-
-      Row() {
-        Column() {
-          Text('保活入口（卡片预览）')
-            .fontSize(13)
-            .fontColor('#D6E4F7')
-          Text('打开系统卡片预览后直接退出，无需添加卡片')
-            .fontSize(11)
-            .fontColor('#5C7192')
-            .margin({ top: 2 })
-        }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
-
-        Button('打开')
+        Text('恢复')
           .fontSize(12)
-          .height(30)
-          .padding({ left: 14, right: 14 })
-          .backgroundColor('#1E2C46')
-          .fontColor('#8FC7FF')
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.theme.accent)
+          .padding({ left: 14, right: 14, top: 7, bottom: 7 })
+          .borderRadius(12)
+          .backgroundColor(this.theme.accentSoft)
+          .onClick(() => {
+            if (!this.isTunnelRunning()) {
+              promptAction.showToast({ message: '请先连接 VPN' });
+              return;
+            }
+            this.taskReviveAttempts = 0;
+            this.reviveTask().then(() => {
+              promptAction.showToast({ message: '已恢复流量实况窗' });
+            }).catch(() => {
+              promptAction.showToast({ message: '恢复通知失败' });
+            });
+          })
+      }
+      .width('100%')
+      .padding({ left: 16, right: 14, top: 13, bottom: 13 })
+
+      Divider().color(this.theme.divider).margin({ left: 16 })
+      Row({ space: 12 }) {
+        Column({ space: 3 }) {
+          Text('桌面快捷卡片（可选）')
+            .fontSize(15)
+            .fontColor(this.theme.textPrimary)
+          Text('仅在需要把开关添加到桌面时手动打开')
+            .fontSize(12)
+            .fontColor(this.theme.textSecondary)
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+
+        Text('添加')
+          .fontSize(12)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.theme.textSecondary)
+          .padding({ left: 14, right: 14, top: 7, bottom: 7 })
+          .borderRadius(12)
+          .backgroundColor(this.theme.surfaceMuted)
           .onClick(() => {
             this.openKeepAliveForm();
           })
       }
       .width('100%')
-      .margin({ top: 12 })
-
-      Text('连接后内核运行在 VPN 扩展进程。点「保活入口」打开系统卡片预览，进入后直接退出即可拉起后台保活，不需要把卡片加到桌面。开启「打开应用自动连接」时，手动划掉后台会完整停止 VPN（不会在后台偷偷重启），下次打开 App 自动重连；关闭则下次启动保持断开。系统重启后需手动打开应用恢复。')
-        .fontSize(11)
-        .fontColor('#4C5D77')
-        .margin({ top: 12 })
+      .padding({ left: 16, right: 14, top: 13, bottom: 13 })
     }
     .width('100%')
-    .padding(16)
-    .backgroundColor('#131A2C')
-    .borderRadius(16)
+    .backgroundColor(this.theme.surface)
+    .border({ width: 0.5, color: this.theme.border })
+    .borderRadius(20)
+
+    this.settingsSectionHeader('自动恢复')
+    Column() {
+      this.settingsToggleRow(
+        '断网自动重连',
+        'Wi-Fi 与蜂窝切换时自动重绑底层连接',
+        this.rebindOnNetChange,
+        (v: boolean) => {
+          this.rebindOnNetChange = v;
+          this.persist();
+        }
+      )
+      Divider().color(this.theme.divider).margin({ left: 16 })
+      this.settingsToggleRow(
+        '打开应用自动连接',
+        '若上次退出时处于连接状态，下次启动自动恢复',
+        this.autoConnect,
+        (v: boolean) => {
+          this.autoConnect = v;
+          this.persist();
+        }
+      )
+    }
+    .width('100%')
+    .backgroundColor(this.theme.surface)
+    .border({ width: 0.5, color: this.theme.border })
+    .borderRadius(20)
   }
 
+  // ---- Sub-page: Trusted Wi-Fi ----
   @Builder
-  logCard() {
-    Column() {
-      Row() {
-        Text('日志')
-          .fontSize(14)
-          .fontColor('#A9BAD1')
-          .layoutWeight(1)
-        Text(this.showLogs ? '隐藏' : '查看')
+  settingsWifiPage() {
+    this.settingsSectionHeader('当前网络')
+    Row({ space: 12 }) {
+      Stack({ alignContent: Alignment.Center }) {
+        SymbolGlyph($r('sys.symbol.wifi'))
+          .fontSize(17)
+          .fontColor([this.currentWifi.length > 0 ? this.theme.success : this.theme.textTertiary])
+      }
+      .width(34)
+      .height(34)
+      .borderRadius(10)
+      .backgroundColor(this.currentWifi.length > 0 ? this.theme.successSoft : this.theme.surfaceMuted)
+
+      Column({ space: 2 }) {
+        Text(this.currentWifi.length > 0 ? this.currentWifi : '未获取到当前 Wi-Fi')
+          .fontSize(15)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.theme.textPrimary)
+        Text(this.currentWifi.length > 0 ? '加入列表后连入该 Wi-Fi 自动挂起（通知栏显示🟡）' : '需要大致位置权限以读取 Wi-Fi 名称')
           .fontSize(12)
-          .fontColor('#54C4FF')
+          .fontColor(this.theme.textSecondary)
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+
+      if (this.currentWifi.length === 0) {
+        Text('授权')
+          .fontSize(12)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.theme.accent)
+          .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+          .borderRadius(12)
+          .backgroundColor(this.theme.accentSoft)
           .onClick(() => {
-            this.showLogs = !this.showLogs;
-            if (this.showLogs && this.ctx !== null) {
-              this.logs = readLogs(this.ctx, 6000);
+            this.requestLocation();
+          })
+      }
+    }
+    .width('100%')
+    .padding(14)
+    .backgroundColor(this.theme.surface)
+    .border({ width: 0.5, color: this.theme.border })
+    .borderRadius(20)
+
+    this.settingsSectionHeader('添加受信任 Wi-Fi（自动挂起）')
+    Column({ space: 10 }) {
+      TextInput({
+        placeholder: this.currentWifi.length > 0 ? this.currentWifi : '输入 Wi-Fi 名称 (SSID)',
+        text: this.manualSsid
+      })
+        .height(44)
+        .fontSize(14)
+        .fontColor(this.theme.textPrimary)
+        .placeholderColor(this.theme.textTertiary)
+        .backgroundColor(this.theme.surfaceMuted)
+        .border({ width: 0.5, color: this.theme.border })
+        .borderRadius(12)
+        .padding({ left: 12, right: 12 })
+        .width('100%')
+        .onChange((value: string) => {
+          this.manualSsid = value;
+        })
+
+      Row({ space: 10 }) {
+        Button('添加到挂起列表')
+          .layoutWeight(1)
+          .height(40)
+          .fontSize(13)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.theme.accentOn)
+          .backgroundColor(this.theme.accent)
+          .borderRadius(12)
+          .onClick(() => {
+            this.addRuleFromInput(SSID_SUSPEND);
+          })
+        if (this.rules.length > 0) {
+          Button('清空')
+            .width(72)
+            .height(40)
+            .fontSize(13)
+            .fontColor(this.theme.danger)
+            .backgroundColor(this.theme.dangerSoft)
+            .borderRadius(12)
+            .onClick(() => {
+              this.clearRules();
+            })
+        }
+      }
+      .width('100%')
+    }
+    .width('100%')
+    .padding(14)
+    .backgroundColor(this.theme.surface)
+    .border({ width: 0.5, color: this.theme.border })
+    .borderRadius(20)
+
+    if (this.rules.length > 0) {
+      this.settingsSectionHeader('已添加规则（' + this.rules.length + '）')
+      Column() {
+        ForEach(this.rules, (rule: SsidRule, idx: number) => {
+          Column() {
+            if (idx > 0) {
+              Divider().color(this.theme.divider).margin({ left: 16 })
             }
+            Row({ space: 10 }) {
+              Text(rule.ssid)
+                .fontSize(14)
+                .fontColor(this.theme.textPrimary)
+                .layoutWeight(1)
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+              Text('自动挂起')
+                .fontSize(11)
+                .fontColor(this.theme.textSecondary)
+              Stack({ alignContent: Alignment.Center }) {
+                SymbolGlyph($r('sys.symbol.trash'))
+                  .fontSize(15)
+                  .fontColor([this.theme.danger])
+              }
+              .width(30)
+              .height(30)
+              .borderRadius(8)
+              .backgroundColor(this.theme.dangerSoft)
+              .onClick(() => {
+                this.deleteRule(rule.ssid);
+              })
+            }
+            .width('100%')
+            .padding({ left: 16, right: 14, top: 12, bottom: 12 })
+          }
+        }, (rule: SsidRule) => rule.ssid)
+      }
+      .width('100%')
+      .backgroundColor(this.theme.surface)
+      .border({ width: 0.5, color: this.theme.border })
+      .borderRadius(20)
+    }
+  }
+
+  // ---- Sub-page: Diagnostics & Logs ----
+  @Builder
+  settingsLogsPage() {
+    Column() {
+      this.settingsToggleRow(
+        '诊断日志',
+        '记录每条连接的路由决策，排查完成后建议关闭',
+        this.debugLog,
+        (v: boolean) => {
+          this.debugLog = v;
+          this.persist();
+        }
+      )
+    }
+    .width('100%')
+    .backgroundColor(this.theme.surface)
+    .border({ width: 0.5, color: this.theme.border })
+    .borderRadius(20)
+
+    Row() {
+      Text('运行日志')
+        .fontSize(12)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(this.theme.textSecondary)
+      Blank()
+      Row({ space: 12 }) {
+        Text('刷新')
+          .fontSize(12)
+          .fontColor(this.theme.accent)
+          .onClick(() => {
+            if (this.ctx !== null) {
+              this.logs = readLogs(this.ctx, 6000);
+              promptAction.showToast({ message: '日志已刷新' });
+            }
+          })
+        Text('复制')
+          .fontSize(12)
+          .fontColor(this.theme.textSecondary)
+          .onClick(() => {
+            this.copyPlainText(this.logs, '运行日志');
+          })
+      }
+    }
+    .width('100%')
+    .padding({ left: 6, right: 6 })
+
+    Column() {
+      Text(this.logs.length > 0 ? this.logs : '（暂无日志）')
+        .fontSize(11)
+        .fontColor(this.theme.textSecondary)
+        .width('100%')
+        .lineHeight(17)
+    }
+    .width('100%')
+    .padding(14)
+    .backgroundColor(this.theme.surface)
+    .border({ width: 0.5, color: this.theme.border })
+    .borderRadius(18)
+  }
+
+  // ---- Sub-page: Core, Updates, Repositories & Disclaimer ----
+  @Builder
+  settingsAboutPage() {
+    // App Hero Card with new minimalist app icon & GitHub update checker
+    Column({ space: 10 }) {
+      Image($r('app.media.app_icon'))
+        .width(64)
+        .height(64)
+        .borderRadius(16)
+
+      Text('way')
+        .fontSize(22)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(this.theme.textPrimary)
+      Text('v' + APP_VERSION_NAME + ' · 内核 ' + this.coreState.activeCore + ' ' + this.coreState.activeVersion + ' (ABI ' + this.coreInfo + ')')
+        .fontSize(12)
+        .fontColor(this.theme.textSecondary)
+
+      Button(this.updateChecking ? '正在检查更新…' : '检测 GitHub 更新')
+        .height(38)
+        .padding({ left: 22, right: 22 })
+        .fontSize(13)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(this.theme.accentOn)
+        .backgroundColor(this.theme.accent)
+        .borderRadius(19)
+        .enabled(!this.updateChecking)
+        .margin({ top: 4 })
+        .onClick(() => {
+          this.runUpdateCheck();
+        })
+
+      if (this.updateResult !== null) {
+        Column({ space: 6 }) {
+          if (this.updateResult.error.length > 0) {
+            Text(this.updateResult.error)
+              .fontSize(12)
+              .fontColor(this.theme.danger)
+          } else {
+            if (this.updateResult.app !== null) {
+              Row() {
+                Text('客户端最新：' + this.updateResult.app.tag + (this.updateResult.app.hasUpdate ? '（有更新）' : '（已是最新）'))
+                  .fontSize(12)
+                  .fontColor(this.updateResult.app.hasUpdate ? this.theme.success : this.theme.textSecondary)
+                  .layoutWeight(1)
+                Text('查看 ›')
+                  .fontSize(12)
+                  .fontColor(this.theme.accent)
+                  .onClick(() => {
+                    if (this.updateResult !== null && this.updateResult.app !== null) {
+                      this.openExternalUrl(this.updateResult.app.url, '客户端发布页');
+                    }
+                  })
+              }
+              .width('100%')
+            }
+            if (this.updateResult.coreRust !== null) {
+              Row() {
+                Text('xray-rust 上游：' + this.updateResult.coreRust.tag +
+                  (this.updateResult.coreRust.hasUpdate ? '（有更新）' : '（已是最新）'))
+                  .fontSize(12)
+                  .fontColor(this.updateResult.coreRust.hasUpdate ? this.theme.success : this.theme.textSecondary)
+                  .layoutWeight(1)
+                Text('查看 ›')
+                  .fontSize(12)
+                  .fontColor(this.theme.accent)
+                  .onClick(() => {
+                    if (this.updateResult !== null && this.updateResult.coreRust !== null) {
+                      this.openExternalUrl(this.updateResult.coreRust.url, 'xray-rust 发布页');
+                    }
+                  })
+              }
+              .width('100%')
+            }
+            if (this.updateResult.coreUpstream !== null) {
+              Row() {
+                Text('Xray-core 上游：' + this.updateResult.coreUpstream.tag)
+                  .fontSize(12)
+                  .fontColor(this.theme.textSecondary)
+                  .layoutWeight(1)
+                Text('查看 ›')
+                  .fontSize(12)
+                  .fontColor(this.theme.accent)
+                  .onClick(() => {
+                    if (this.updateResult !== null && this.updateResult.coreUpstream !== null) {
+                      this.openExternalUrl(this.updateResult.coreUpstream.url, 'Xray-core 发布页');
+                    }
+                  })
+              }
+              .width('100%')
+            }
+            if (this.updateResult.manifest.length > 0) {
+              Text('GitHub 自动构建内核清单已同步（' + this.updateResult.manifest.length + ' 项）')
+                .fontSize(11)
+                .fontColor(this.theme.accent)
+                .width('100%')
+            }
+          }
+        }
+        .width('100%')
+        .padding(12)
+        .margin({ top: 4 })
+        .backgroundColor(this.theme.surfaceMuted)
+        .borderRadius(14)
+      }
+    }
+    .width('100%')
+    .padding({ top: 22, bottom: 20, left: 16, right: 16 })
+    .backgroundColor(this.theme.surface)
+    .border({ width: 0.5, color: this.theme.border })
+    .borderRadius(20)
+
+    // Core Selection & Automatic Rollback Protection
+    this.settingsSectionHeader('代理内核与安全回退')
+    Column() {
+      Row({ space: 12 }) {
+        Stack({ alignContent: Alignment.Center }) {
+          SymbolGlyph($r('sys.symbol.memory_module'))
+            .fontSize(16)
+            .fontColor(['#FFFFFF'])
+        }
+        .width(30)
+        .height(30)
+        .borderRadius(8)
+        .backgroundColor('#10B981')
+
+        Column({ space: 2 }) {
+          Text('当前内核 · ' + this.coreState.activeCore)
+            .fontSize(15)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(this.theme.textPrimary)
+          Text('版本 ' + this.coreState.activeVersion + ' · ABI ' + this.coreInfo + ' · 更新报错自动回退上一版本')
+            .fontSize(12)
+            .fontColor(this.theme.textSecondary)
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+
+        Text('校验')
+          .fontSize(12)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.theme.accent)
+          .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+          .borderRadius(10)
+          .backgroundColor(this.theme.accentSoft)
+          .onClick(() => {
+            this.verifyCoreIntegrity();
           })
       }
       .width('100%')
+      .padding({ left: 14, right: 14, top: 14, bottom: 14 })
 
-      if (this.showLogs) {
-        Text(this.logs.length > 0 ? this.logs : '（暂无日志）')
-          .fontSize(10)
-          .fontColor('#8FA3BF')
-          .width('100%')
-          .margin({ top: 10 })
-          .maxLines(30)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      Divider().color(this.theme.divider).margin({ left: 14 })
+
+      // Core Option 1: xray-rust (bundled)
+      Row({ space: 12 }) {
+        Column({ space: 2 }) {
+          Row({ space: 6 }) {
+            Text('xray-rust（Rust 轻量内核）')
+              .fontSize(14)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(this.theme.textPrimary)
+            Text('已内置')
+              .fontSize(10)
+              .fontColor(this.theme.success)
+              .padding({ left: 6, right: 6, top: 1, bottom: 1 })
+              .borderRadius(6)
+              .backgroundColor(this.theme.successSoft)
+          }
+          Text('低内存占用 · 同步 aimalygin/xray-rust 自动构建')
+            .fontSize(11)
+            .fontColor(this.theme.textSecondary)
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+
+        if (this.coreState.activeCore === CORE_ID_RUST) {
+          SymbolGlyph($r('sys.symbol.checkmark_circle_fill_1'))
+            .fontSize(20)
+            .fontColor([this.theme.accent])
+        }
+      }
+      .width('100%')
+      .padding({ left: 16, right: 14, top: 12, bottom: 12 })
+      .onClick(() => {
+        this.selectCoreEngine(CORE_ID_RUST);
+      })
+
+      Divider().color(this.theme.divider).margin({ left: 14 })
+
+      // Core Option 2: XTLS/Xray-core (GitHub Actions dual-core build)
+      Row({ space: 12 }) {
+        Column({ space: 2 }) {
+          Row({ space: 6 }) {
+            Text('Xray-core（原版 XTLS 内核）')
+              .fontSize(14)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(this.theme.textPrimary)
+            Text(isCoreBundled(CORE_ID_UPSTREAM) ? '已内置' : 'GitHub 自动构建')
+              .fontSize(10)
+              .fontColor(isCoreBundled(CORE_ID_UPSTREAM) ? this.theme.success : this.theme.accent)
+              .padding({ left: 6, right: 6, top: 1, bottom: 1 })
+              .borderRadius(6)
+              .backgroundColor(isCoreBundled(CORE_ID_UPSTREAM) ? this.theme.successSoft : this.theme.accentSoft)
+          }
+          Text('完整原版协议特性 · 切换异常时自动回退至 xray-rust')
+            .fontSize(11)
+            .fontColor(this.theme.textSecondary)
+        }
+        .alignItems(HorizontalAlign.Start)
+        .layoutWeight(1)
+
+        if (this.coreState.activeCore === CORE_ID_UPSTREAM) {
+          SymbolGlyph($r('sys.symbol.checkmark_circle_fill_1'))
+            .fontSize(20)
+            .fontColor([this.theme.accent])
+        }
+      }
+      .width('100%')
+      .padding({ left: 16, right: 14, top: 12, bottom: 12 })
+      .onClick(() => {
+        this.selectCoreEngine(CORE_ID_UPSTREAM);
+      })
+
+      if (this.coreState.lastRollbackReason.length > 0) {
+        Divider().color(this.theme.divider).margin({ left: 14 })
+        Row({ space: 8 }) {
+          SymbolGlyph($r('sys.symbol.info_circle_fill'))
+            .fontSize(15)
+            .fontColor([this.theme.warning])
+          Text(this.coreState.lastRollbackReason)
+            .fontSize(12)
+            .fontColor(this.theme.warning)
+            .layoutWeight(1)
+        }
+        .width('100%')
+        .padding({ left: 14, right: 14, top: 10, bottom: 12 })
       }
     }
     .width('100%')
+    .backgroundColor(this.theme.surface)
+    .border({ width: 0.5, color: this.theme.border })
+    .borderRadius(20)
+
+    // Project & Core Repositories
+    this.settingsSectionHeader('开源地址')
+    Column() {
+      this.aboutLinkRow('项目地址', PROJECT_REPO_URL)
+      Divider().color(this.theme.divider).margin({ left: 16 })
+      this.aboutLinkRow('当前内核（xray-rust）', CORE_RUST_REPO_URL)
+      Divider().color(this.theme.divider).margin({ left: 16 })
+      this.aboutLinkRow('上游内核（Xray-core）', CORE_UPSTREAM_REPO_URL)
+    }
+    .width('100%')
+    .backgroundColor(this.theme.surface)
+    .border({ width: 0.5, color: this.theme.border })
+    .borderRadius(20)
+
+    // Disclaimer
+    this.settingsSectionHeader('免责声明')
+    Column({ space: 8 }) {
+      Text(DISCLAIMER_TEXT)
+        .fontSize(12)
+        .lineHeight(20)
+        .fontColor(this.theme.textSecondary)
+        .width('100%')
+      Row() {
+        Text('应用包名')
+          .fontSize(12)
+          .fontColor(this.theme.textTertiary)
+        Blank()
+        Text(appBundleName(this.ctx))
+          .fontSize(12)
+          .fontColor(this.theme.textSecondary)
+      }
+      .width('100%')
+      .padding({ top: 6 })
+    }
+    .width('100%')
     .padding(16)
-    .backgroundColor('#131A2C')
-    .borderRadius(16)
+    .backgroundColor(this.theme.surface)
+    .border({ width: 0.5, color: this.theme.border })
+    .borderRadius(20)
+  }
+
+  @Builder
+  aboutLinkRow(title: string, url: string) {
+    Row({ space: 10 }) {
+      Column({ space: 2 }) {
+        Text(title)
+          .fontSize(14)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.theme.textPrimary)
+        Text(url)
+          .fontSize(11)
+          .fontColor(this.theme.textSecondary)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+      .onClick(() => {
+        this.openExternalUrl(url, title);
+      })
+
+      Stack({ alignContent: Alignment.Center }) {
+        SymbolGlyph($r('sys.symbol.text_clipboard'))
+          .fontSize(15)
+          .fontColor([this.theme.accent])
+      }
+      .width(32)
+      .height(32)
+      .borderRadius(10)
+      .backgroundColor(this.theme.accentSoft)
+      .onClick(() => {
+        this.copyPlainText(url, title);
+      })
+    }
+    .width('100%')
+    .padding({ left: 16, right: 14, top: 12, bottom: 12 })
   }
 }
+
 
 
 

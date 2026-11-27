@@ -212,27 +212,16 @@ export function clearRuleSet(context: common.Context): void {
   }
 }
 
-// First launch (or after a clear): install the rule set that ships with the HAP.
-export function seedRuleSet(context: common.Context, force: boolean = false): boolean {
-  if (!force && readRuleSet(context) !== null) {
-    return false;
-  }
-  try {
-    const bytes: Uint8Array = context.resourceManager.getRawFileContentSync(BUNDLED_FILE);
-    if (bytes.length === 0) {
-      return false;
-    }
-    const text: string = util.TextDecoder.create('utf-8').decodeToString(bytes);
-    const parsed: WayRuleSet | null = parseRuleSet(text);
-    if (parsed === null) {
-      return false;
-    }
-    parsed.origin = ORIGIN_BUNDLED;
-    writeRuleSet(context, parsed);
+// Built-in ACL4SSR and ad-block rule sets were removed so the app ships with
+// minimal base rules only. If an upgrade left an older bundled ACL4SSR file on
+// disk, purge it while preserving any user-imported custom rule set.
+export function seedRuleSet(context: common.Context, _force: boolean = false): boolean {
+  const existing: WayRuleSet | null = readRuleSet(context);
+  if (existing !== null && (existing.origin === ORIGIN_BUNDLED || existing.origin === ORIGIN_UPDATE)) {
+    clearRuleSet(context);
     return true;
-  } catch (error) {
-    return false;
   }
+  return false;
 }
 
 export function ruleSetCount(ruleSet: WayRuleSet, target: string): number {
@@ -373,6 +362,26 @@ export function dohEnabled(context: common.Context): boolean {
   try {
     const store = preferences.getPreferencesSync(context, { name: 'xray_prefs' });
     return store.getSync('dohDns', true) as boolean;
+  } catch (error) {
+    return true;
+  }
+}
+
+// 防 DNS 泄露开关（主页「防 DNS 泄露」），默认开启，持久化在同一个 prefs 里。
+export function dnsLeakProtectEnabled(context: common.Context): boolean {
+  try {
+    const store = preferences.getPreferencesSync(context, { name: 'xray_prefs' });
+    return store.getSync('dnsLeakProtect', true) as boolean;
+  } catch (error) {
+    return true;
+  }
+}
+
+// 防 WebRTC 泄露开关（主页「防 WebRTC 泄露」），默认开启，持久化在同一个 prefs 里。
+export function webrtcLeakProtectEnabled(context: common.Context): boolean {
+  try {
+    const store = preferences.getPreferencesSync(context, { name: 'xray_prefs' });
+    return store.getSync('webrtcLeakProtect', true) as boolean;
   } catch (error) {
     return true;
   }

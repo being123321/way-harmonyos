@@ -4,14 +4,27 @@
 // HAP ships a single native library and no dlopen path juggling is needed.
 #include <napi/native_api.h>
 
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <malloc.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
-#include <vector>
 #include <thread>
-#include <atomic>
+#include <vector>
 
 #include "xray_ffi.h"
 
@@ -135,7 +148,20 @@ bool ParseStartArgs(napi_env env, napi_callback_info info, StartArgs *out, std::
 // step is refused by the host sandbox (it used to abort the whole load on
 // HarmonyOS), the second attempt starts the same config without core logging
 // instead of failing the tunnel.
+void ConfigureAllocatorForLowMemory() {
+#ifdef M_DELAYED_FREE
+  mallopt(M_DELAYED_FREE, M_DELAYED_FREE_DISABLE);
+#endif
+}
+
+void FlushAllocatorCache() {
+#ifdef M_FLUSH_THREAD_CACHE
+  mallopt(M_FLUSH_THREAD_CACHE, 0);
+#endif
+}
+
 bool StartLocked(const StartArgs &args, std::string *error) {
+  ConfigureAllocatorForLowMemory();
   for (int attempt = 0; attempt < 2; ++attempt) {
     const bool withLogging = attempt == 0 && !args.logDir.empty();
     XrayError *err = nullptr;
@@ -166,7 +192,10 @@ bool StartLocked(const StartArgs &args, std::string *error) {
       TakeError(&err, "geodata dir");
     }
     XRAY_STEP(xray_core_set_tun_mtu(core, static_cast<uint32_t>(args.mtu), &err));
-    XRAY_STEP(xray_core_set_tun_runtime_profile(core, XRAY_TUN_RUNTIME_PROFILE_MOBILE_PLUS, &err));
+    // LowMemory profile keeps TUN queues (256/512), flow caps (128 TCP/UDP),
+    // and remote buffer ceiling (12 MB pressure / 20 MB hard) tight so mobile
+    // VPN extension PSS stays flat instead of drifting upward over time.
+    XRAY_STEP(xray_core_set_tun_runtime_profile(core, XRAY_TUN_RUNTIME_PROFILE_LOW_MEMORY, &err));
     XRAY_STEP(xray_core_set_tun_fd(core, args.tunFd, XRAY_TUN_FD_PACKET_FORMAT_RAW_IP,
                                    XRAY_TUN_FD_CLOSE_POLICY_BORROWED, &err));
 
@@ -198,6 +227,8 @@ bool StartLocked(const StartArgs &args, std::string *error) {
 
     g_core = core;
     g_unhealthy = false;
+    // Release temporary JSON/geodata parse arenas back to the OS right after boot.
+    FlushAllocatorCache();
     return true;
   }
   *error = "failed to start the core";
@@ -216,6 +247,7 @@ void StopLocked() {
   g_core = nullptr;
   g_warnings.clear();
   g_unhealthy = false;
+  FlushAllocatorCache();
 }
 
 napi_value Version(napi_env env, napi_callback_info info) {
@@ -534,10 +566,10 @@ napi_value ProbeOutbound(napi_env env, napi_callback_info info) {
 }
 
 
-// v2rayNG-style speed test: build a temporary core from a TUN-less config
-// (the profile outbounds only), probe each tagged outbound, then tear it down.
-// The live tunnel/core are untouched, so the router and the running VPN keep
-// their state while the node list is being measured.
+// Native warmed real-delay speed test: build a temporary TUN-less core from
+// the profile outbounds, run xray_core_probe_outbound_url (which performs a
+// 2-step Keep-Alive warmed HTTP probe inside Rust and returns the pure 1-RTT
+// delay), then tear down and flush allocator caches so RSS drops immediately.
 struct ProfileProbeSpec {
   std::string tag;
   std::string url;
@@ -573,19 +605,24 @@ void ProbeProfilesExecute(napi_env, void *data) {
   }
   if (!w->geodata.empty()) {
     xray_core_set_geodata_search_dir(core, w->geodata.c_str(), &err);
+    TakeError(&err, "geodata dir");
   }
   if (xray_core_load_config_json(core, w->config.c_str(), &err) != XRAY_STATUS_OK) {
     w->error = "probe config rejected: " + TakeError(&err, "config error");
     xray_core_free(core);
+    FlushAllocatorCache();
     return;
   }
   if (xray_core_start(core, &err) != XRAY_STATUS_OK) {
     w->error = "probe core start failed: " + TakeError(&err, "start error");
     xray_core_stop(core, &err);
+    TakeError(&err, "stop");
     xray_core_free(core);
+    FlushAllocatorCache();
     return;
   }
-  // v2rayN-style: probe many outbounds at once instead of one by one.
+
+  // Cap probe workers at 6 to avoid RSS spikes during batch latency checks.
   w->outcomes.resize(w->specs.size());
   std::atomic<size_t> next{0};
   auto worker = [&]() {
@@ -597,10 +634,10 @@ void ProbeProfilesExecute(napi_env, void *data) {
       const auto &spec = w->specs[index];
       ProfileProbeOutcome o;
       o.tag = spec.tag;
-      XrayError *probeErr = nullptr;
       uint64_t delayMs = 0;
       int32_t failureKind = 0;
       uint16_t httpStatus = 0;
+      XrayError *probeErr = nullptr;
       o.status = static_cast<int32_t>(xray_core_probe_outbound_url(
           core, spec.url.c_str(), static_cast<uint64_t>(spec.timeoutMs),
           spec.tag.empty() ? nullptr : spec.tag.c_str(), &delayMs, &failureKind,
@@ -614,10 +651,7 @@ void ProbeProfilesExecute(napi_env, void *data) {
       w->outcomes[index] = o;
     }
   };
-  const size_t hardware = std::thread::hardware_concurrency();
-  size_t workers = hardware == 0 ? 8 : hardware * 2;
-  if (workers < 8) workers = 8;
-  if (workers > 24) workers = 24;
+  size_t workers = 6;
   if (workers > w->specs.size()) workers = w->specs.size();
   std::vector<std::thread> threads;
   for (size_t i = 0; i < workers; i++) {
@@ -627,7 +661,9 @@ void ProbeProfilesExecute(napi_env, void *data) {
     t.join();
   }
   xray_core_stop(core, &err);
+  TakeError(&err, "probe stop");
   xray_core_free(core);
+  FlushAllocatorCache();
 }
 
 void ProbeProfilesComplete(napi_env env, napi_status status, void *data) {
@@ -861,6 +897,13 @@ napi_value Rebind(napi_env env, napi_callback_info info) {
   return result;
 }
 
+napi_value TrimMemory(napi_env env, napi_callback_info info) {
+  FlushAllocatorCache();
+  napi_value result = nullptr;
+  napi_get_boolean(env, true, &result);
+  return result;
+}
+
 }  // namespace
 
 EXTERN_C_START
@@ -883,6 +926,7 @@ static napi_value Init(napi_env env, napi_value exports) {
       {"replaceRouting", nullptr, ReplaceRouting, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"connectionSnapshot", nullptr, ConnectionSnapshot, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"closeConnection", nullptr, CloseConnection, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"trimMemory", nullptr, TrimMemory, nullptr, nullptr, nullptr, napi_default, nullptr},
   };
   napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
   return exports;

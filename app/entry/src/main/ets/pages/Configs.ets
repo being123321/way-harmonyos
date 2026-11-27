@@ -1,67 +1,92 @@
 import { common } from '@kit.AbilityKit';
 import type { BusinessError } from '@kit.BasicServicesKit';
+import { pasteboard } from '@kit.BasicServicesKit';
 import { promptAction, router } from '@kit.ArkUI';
-import { Insets, cancelProbes, nodeTypeLabel, pageInsets, tunnelOutboundTags, tunnelUp } from '../common/Xray';
+import {
+  Insets, NodeBadge, cancelProbes, extractNodeBadges, pageInsets, tunnelOutboundTags, tunnelUp
+} from '../common/Xray';
+import { initIpcAuth } from '../common/IpcAuth';
 import { LatencyEntry, readLatencyCache, recordLatency } from '../common/LatencyStore';
 import {
-  ConfigEntry, ConfigStore, SubscriptionRecord, entriesOfSub, manualEntries, readStore, readSubs,
-  removeEntry, removeSub, selectEntry, updateSub
+  ConfigEntry, ConfigStore, SubscriptionRecord, entriesOfSub, findById, manualEntries, readStore,
+  readSubs, removeEntry, removeSub, selectEntry, subIdOf, updateSub
 } from '../common/Store';
 import { formatExpire, formatQuota, refreshSubscription } from '../common/Subscription';
 import {
-  LatencyResult, TEST_CONCURRENCY, TEST_TIMEOUT_MS, latencyText, msOf, resultOf, sortByLatency, testAll,
-  testOne, viaText
+  LatencyResult, TEST_CONCURRENCY, TEST_TIMEOUT_MS, latencyText, msOf, resultOf, sortByLatency,
+  testNodesRealDelay, testOne
 } from '../common/Speedtest';
 
-const TAB_NODES: number = 0;
-const TAB_SUBS: number = 1;
-
-// Two lists that mirror v2rayNG's split: nodes that were imported by hand and
-// subscriptions that own their own node set. Nothing is mixed in one list, so a
-// refresh can never overwrite a hand-picked profile.
+// Anywhere-style unified Proxies & Subscriptions page:
+//   * Single scrollable list: standalone (manual) nodes at the top, followed by
+//     collapsible subscription accordion cards (no split tab bar).
+//   * Opening the page automatically expands the subscription owning the
+//     currently selected node.
+//   * Each proxy row renders Anywhere-style protocol/transport/security/flow
+//     color badges and a tappable monospaced latency label (<300 green,
+//     <500 yellow, >=500 red).
 @Entry
 @Component
 struct Configs {
   @State items: ConfigEntry[] = [];
   @State selectedId: string = '';
   @State subs: SubscriptionRecord[] = [];
-  @State tab: number = TAB_NODES;
   @State insets: Insets = { top: 0, bottom: 0 };
   @State latency: LatencyResult[] = [];
+  @State testingIds: string[] = [];
   @State testing: boolean = false;
   @State testDone: number = 0;
   @State testTotal: number = 0;
   @State viaTunnel: boolean = false;
-  // Outbound tags of the running tunnel config; a node in this list can be
-  // measured by the core itself (real delay through the proxy).
   @State probeTags: string[] = [];
-  @State expandedId: string = '';
-  @State editingId: string = '';
+  @State expandedSubId: string = '';
+  @State editingSubId: string = '';
   @State editName: string = '';
   @State editUrl: string = '';
-  @State busySubId: string = '';
+  @State updatingSubIds: string[] = [];
+  @State sortByDelay: boolean = false;
 
   private ctx: common.UIAbilityContext | null = null;
   private disposed: boolean = false;
+  private initialExpandedDone: boolean = false;
 
   aboutToAppear(): void {
     this.ctx = getContext(this) as common.UIAbilityContext;
+    initIpcAuth(this.ctx);
     pageInsets(this.ctx).then((value: Insets) => {
       this.insets = value;
     });
     this.refresh();
     this.loadLatency();
+    this.autoExpandSelectedSub();
   }
 
   onPageShow(): void {
     this.refresh();
     this.loadLatency();
+    if (!this.initialExpandedDone) {
+      this.autoExpandSelectedSub();
+    }
   }
 
   aboutToDisappear(): void {
     this.disposed = true;
-    // Leaving the page: stop the probes still in flight for this list.
-    cancelProbes();
+    cancelProbes(this.ctx);
+  }
+
+  private autoExpandSelectedSub(): void {
+    this.initialExpandedDone = true;
+    const selected: ConfigEntry | null = findById(this.items, this.selectedId);
+    if (selected !== null) {
+      const sid: string = subIdOf(selected);
+      if (sid.length > 0) {
+        this.expandedSubId = sid;
+        return;
+      }
+    }
+    if (this.manualCount() === 0 && this.subs.length > 0 && this.expandedSubId.length === 0) {
+      this.expandedSubId = this.subs[0].id;
+    }
   }
 
   private refresh(): void {
@@ -88,10 +113,48 @@ struct Configs {
     return null;
   }
 
-  // The card is built from a @Builder parameter, and ArkUI keeps that parameter
-  // frozen across re-renders (only `this.*` state is observed). Every mutable
-  // field is therefore read back through these helpers, otherwise a refresh
-  // showed the new node count next to the old quota/timestamp.
+  private isUpdatingSub(id: string): boolean {
+    return this.updatingSubIds.indexOf(id) >= 0;
+  }
+
+  private addUpdatingSub(id: string): void {
+    if (!this.isUpdatingSub(id)) {
+      const next: string[] = this.updatingSubIds.slice();
+      next.push(id);
+      this.updatingSubIds = next;
+    }
+  }
+
+  private removeUpdatingSub(id: string): void {
+    const next: string[] = [];
+    for (const item of this.updatingSubIds) {
+      if (item !== id) {
+        next.push(item);
+      }
+    }
+    this.updatingSubIds = next;
+  }
+
+  private isTestingNode(id: string): boolean {
+    return this.testingIds.indexOf(id) >= 0;
+  }
+
+  private markTestingNodes(ids: string[], active: boolean): void {
+    const set: Set<string> = new Set(this.testingIds);
+    for (const id of ids) {
+      if (active) {
+        set.add(id);
+      } else {
+        set.delete(id);
+      }
+    }
+    const next: string[] = [];
+    set.forEach((id: string) => {
+      next.push(id);
+    });
+    this.testingIds = next;
+  }
+
   private subName(id: string): string {
     const record: SubscriptionRecord | null = this.findSub(id);
     return record === null ? '' : record.name;
@@ -108,6 +171,11 @@ struct Configs {
       return '';
     }
     return formatQuota(record.upload + record.download, record.total);
+  }
+
+  private subHasTraffic(id: string): boolean {
+    const record: SubscriptionRecord | null = this.findSub(id);
+    return record !== null && (record.total > 0 || record.upload > 0 || record.download > 0);
   }
 
   private subUsed(id: string): number {
@@ -136,34 +204,53 @@ struct Configs {
     return formatTimeShort(record.updatedAt);
   }
 
+  private subContainsSelected(subId: string): boolean {
+    if (this.selectedId.length === 0) {
+      return false;
+    }
+    const selected: ConfigEntry | null = findById(this.items, this.selectedId);
+    return selected !== null && subIdOf(selected) === subId;
+  }
+
   private manualCount(): number {
     return manualEntries(this.items).length;
   }
 
   private manualList(): ConfigEntry[] {
-    return sortByLatency(manualEntries(this.items), this.latency);
+    const raw: ConfigEntry[] = manualEntries(this.items);
+    return this.sortByDelay ? sortByLatency(raw, this.latency) : raw;
   }
 
   private subNodes(subId: string): ConfigEntry[] {
-    return sortByLatency(entriesOfSub(this.items, subId), this.latency);
+    const raw: ConfigEntry[] = entriesOfSub(this.items, subId);
+    return this.sortByDelay ? sortByLatency(raw, this.latency) : raw;
   }
 
   private subNodeCount(subId: string): number {
     return entriesOfSub(this.items, subId).length;
   }
 
-  private allSubNodes(): ConfigEntry[] {
-    const all: ConfigEntry[] = [];
-    for (const sub of this.subs) {
-      for (const entry of entriesOfSub(this.items, sub.id)) {
-        all.push(entry);
+  // Matches Anywhere ProxiesView toolbar test button: tests standalone nodes
+  // plus the currently expanded subscription's nodes (or all nodes if nothing
+  // is expanded and there are no standalone nodes).
+  private visibleTestTargets(): ConfigEntry[] {
+    const targets: ConfigEntry[] = [];
+    for (const item of manualEntries(this.items)) {
+      targets.push(item);
+    }
+    if (this.expandedSubId.length > 0) {
+      for (const item of entriesOfSub(this.items, this.expandedSubId)) {
+        targets.push(item);
       }
     }
-    return all;
+    if (targets.length === 0) {
+      return this.items.slice();
+    }
+    return targets;
   }
 
-  private add(mode: number): void {
-    const params: Record<string, Object> = { 'mode': mode };
+  private add(mode: number, autoScan: boolean = false): void {
+    const params: Record<string, Object> = { 'mode': mode, 'autoScan': autoScan };
     router.pushUrl({ url: 'pages/AddConfig', params: params }).catch((error: BusinessError) => {
       promptAction.showToast({ message: '打开添加页失败: ' + error.message });
     });
@@ -177,6 +264,22 @@ struct Configs {
     selectEntry(context, entry.id);
     this.selectedId = entry.id;
     router.back();
+  }
+
+  private copyText(text: string, label: string): void {
+    if (text.length === 0) {
+      return;
+    }
+    try {
+      const data: pasteboard.PasteData = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, text);
+      pasteboard.getSystemPasteboard().setData(data).then(() => {
+        promptAction.showToast({ message: '已复制' + label });
+      }).catch(() => {
+        promptAction.showToast({ message: '复制失败' });
+      });
+    } catch (error) {
+      promptAction.showToast({ message: '复制失败' });
+    }
   }
 
   private confirmDeleteNode(entry: ConfigEntry): void {
@@ -218,6 +321,9 @@ struct Configs {
           const context = this.ctx;
           if (context !== null) {
             this.subs = removeSub(context, id);
+            if (this.expandedSubId === id) {
+              this.expandedSubId = '';
+            }
             this.refresh();
             promptAction.showToast({ message: '订阅已删除' });
           }
@@ -226,33 +332,37 @@ struct Configs {
     });
   }
 
-  private latencyOf(id: string): string {
+  private latencyLabelText(id: string): string {
+    if (this.isTestingNode(id)) {
+      return '…';
+    }
     const result: LatencyResult | null = resultOf(this.latency, id);
     if (result === null) {
-      return '';
+      return '测速';
     }
-    const via: string = viaText(result.via);
-    return via.length > 0 ? latencyText(result.ms) + ' · ' + via : latencyText(result.ms);
+    return latencyText(result.ms);
   }
 
-  private latencyColor(id: string): string {
-    const ms: number = msOf(this.latency, id);
+  // Matches Anywhere LatencyLabel color thresholds: <300 green, <500 yellow, >=500 red.
+  private latencyLabelColor(id: string): string {
+    if (this.isTestingNode(id)) {
+      return '#54C4FF';
+    }
+    const result: LatencyResult | null = resultOf(this.latency, id);
+    if (result === null) {
+      return '#4C5D77';
+    }
+    const ms: number = result.ms;
     if (ms < 0) {
       return '#5C7192';
     }
-    return ms < 500 ? '#3DDC97' : (ms < 1500 ? '#FFC857' : '#FF8A5B');
-  }
-
-  private hasLatency(id: string): boolean {
-    return resultOf(this.latency, id) !== null;
-  }
-
-  private subtitleOf(entry: ConfigEntry): string {
-    const base: string = entry.server.length > 0 ? entry.server : nodeTypeLabel(entry.type);
-    if (!this.hasLatency(entry.id)) {
-      return base;
+    if (ms < 300) {
+      return '#3DDC97';
     }
-    return base + ' · ' + this.latencyOf(entry.id);
+    if (ms < 500) {
+      return '#FFC857';
+    }
+    return '#FF5C7A';
   }
 
   private pushResult(result: LatencyResult): void {
@@ -263,6 +373,7 @@ struct Configs {
     if (context !== null) {
       recordLatency(context, result.id, result.ms, result.via);
     }
+    this.markTestingNodes([result.id], false);
     const next: LatencyResult[] = [result];
     for (const item of this.latency) {
       if (item.id !== result.id) {
@@ -272,9 +383,6 @@ struct Configs {
     this.latency = next;
   }
 
-  // Rows show the last delay measured anywhere (this page or the dashboard);
-  // the "· TCP / · HTTP" suffix keeps the metric visible, and no list probes on
-  // its own just because it was opened.
   private loadLatency(): void {
     const context = this.ctx;
     if (context === null) {
@@ -304,48 +412,40 @@ struct Configs {
     this.probeTags = this.viaTunnel ? tunnelOutboundTags(context) : [];
     this.testTotal = scope.length;
     this.testDone = 0;
+    const ids: string[] = [];
+    for (const item of scope) {
+      ids.push(item.id);
+    }
+    this.markTestingNodes(ids, true);
     const via: boolean = this.viaTunnel;
     const tags: string[] = this.probeTags;
     try {
-      await testAll(scope, via, tags, (result: LatencyResult) => {
+      await testNodesRealDelay(scope, via, tags, null, (result: LatencyResult) => {
         this.pushResult(result);
         this.testDone++;
-      });
+      }, context);
     } finally {
+      this.markTestingNodes(ids, false);
       this.testing = false;
-    }
-  }
-
-  private testVisible(): void {
-    if (this.tab === TAB_NODES) {
-      this.runTest(this.manualList());
-    } else {
-      this.runTest(this.allSubNodes());
     }
   }
 
   private async testOneEntry(entry: ConfigEntry): Promise<void> {
     const context = this.ctx;
-    if (context === null) {
+    if (context === null || this.isTestingNode(entry.id)) {
       return;
     }
-    const via: boolean = tunnelUp(context);
-    this.viaTunnel = via;
-    this.probeTags = via ? tunnelOutboundTags(context) : [];
-    const tag: string = this.probeTagOf(entry.id);
-    const result: LatencyResult = await testOne(entry, via, tag);
-    this.pushResult(result);
-  }
-
-  // The running config tags every node with its entry id; a node that is not in
-  // it (older config, or the single-node fallback) is probed directly instead.
-  private probeTagOf(id: string): string {
-    for (const tag of this.probeTags) {
-      if (tag === id) {
-        return tag;
-      }
+    this.markTestingNodes([entry.id], true);
+    try {
+      const via: boolean = tunnelUp(context);
+      this.viaTunnel = via;
+      this.probeTags = via ? tunnelOutboundTags(context) : [];
+      const liveTag: string = this.probeTags.indexOf(entry.id) >= 0 ? entry.id : '';
+      const result: LatencyResult = await testOne(entry, via, liveTag, null, context);
+      this.pushResult(result);
+    } finally {
+      this.markTestingNodes([entry.id], false);
     }
-    return '';
   }
 
   private beginEdit(id: string): void {
@@ -353,7 +453,7 @@ struct Configs {
     if (record === null) {
       return;
     }
-    this.editingId = id;
+    this.editingSubId = id;
     this.editName = record.name;
     this.editUrl = record.url;
   }
@@ -372,10 +472,9 @@ struct Configs {
     }
     const moved: boolean = url !== record.url;
     updateSub(context, id, url, name);
-    this.editingId = '';
+    this.editingSubId = '';
     this.refresh();
     if (moved) {
-      // The address changed, so the node set has to follow it right away.
       await this.refreshOne(id);
     } else {
       promptAction.showToast({ message: '订阅已保存' });
@@ -385,10 +484,10 @@ struct Configs {
   private async refreshOne(id: string): Promise<void> {
     const context = this.ctx;
     const record: SubscriptionRecord | null = this.findSub(id);
-    if (context === null || record === null || this.busySubId.length > 0) {
+    if (context === null || record === null || this.isUpdatingSub(id)) {
       return;
     }
-    this.busySubId = id;
+    this.addUpdatingSub(id);
     try {
       const next: SubscriptionRecord = await refreshSubscription(context, record);
       this.refresh();
@@ -397,8 +496,111 @@ struct Configs {
       const err = error as BusinessError;
       promptAction.showToast({ message: '更新失败: ' + (err.message ?? '网络错误') });
     } finally {
-      this.busySubId = '';
+      this.removeUpdatingSub(id);
     }
+  }
+
+  private async refreshAllSubs(): Promise<void> {
+    const context = this.ctx;
+    if (context === null || this.subs.length === 0) {
+      promptAction.showToast({ message: '还没有订阅' });
+      return;
+    }
+    let okCount: number = 0;
+    let failCount: number = 0;
+    const snapshot: SubscriptionRecord[] = this.subs.slice();
+    for (const sub of snapshot) {
+      if (this.isUpdatingSub(sub.id)) {
+        continue;
+      }
+      this.addUpdatingSub(sub.id);
+      try {
+        await refreshSubscription(context, sub);
+        okCount++;
+        this.refresh();
+      } catch (error) {
+        failCount++;
+      } finally {
+        this.removeUpdatingSub(sub.id);
+      }
+    }
+    promptAction.showToast({
+      message: failCount === 0
+        ? ('已更新全部 ' + okCount + ' 个订阅')
+        : ('更新完成：成功 ' + okCount + '，失败 ' + failCount)
+    });
+  }
+
+  private moreMenu(): MenuElement[] {
+    const items: MenuElement[] = [];
+    items.push({
+      value: this.sortByDelay ? '排序：按延迟（点击切回默认）' : '排序：默认顺序（点击按延迟）',
+      action: () => {
+        this.sortByDelay = !this.sortByDelay;
+      }
+    });
+    items.push({
+      value: '测速全部节点',
+      action: () => {
+        if (!this.testing) {
+          this.runTest(this.items.slice());
+        }
+      }
+    });
+    if (this.subs.length > 0) {
+      items.push({
+        value: '更新全部订阅',
+        action: () => {
+          this.refreshAllSubs();
+        }
+      });
+    }
+    items.push({
+      value: '扫描二维码（节点 / 订阅）',
+      action: () => {
+        this.add(0, true);
+      }
+    });
+    items.push({
+      value: '添加订阅',
+      action: () => {
+        this.add(1);
+      }
+    });
+    items.push({
+      value: '导入 JSON 配置',
+      action: () => {
+        this.add(2);
+      }
+    });
+    return items;
+  }
+
+  private nodeContextMenu(entry: ConfigEntry, owned: boolean): MenuElement[] {
+    const items: MenuElement[] = [];
+    items.push({
+      value: '测速',
+      action: () => {
+        this.testOneEntry(entry);
+      }
+    });
+    if (entry.server.length > 0) {
+      items.push({
+        value: '复制服务器地址',
+        action: () => {
+          this.copyText(entry.server, '服务器地址');
+        }
+      });
+    }
+    if (!owned) {
+      items.push({
+        value: '删除节点',
+        action: () => {
+          this.confirmDeleteNode(entry);
+        }
+      });
+    }
+    return items;
   }
 
   build() {
@@ -411,12 +613,43 @@ struct Configs {
 
       Column() {
         this.topBar()
-        this.segment()
-        this.hint()
-        if (this.tab === TAB_NODES) {
-          this.nodesView()
+        this.hintBar()
+        if (this.items.length === 0 && this.subs.length === 0) {
+          this.emptyState()
         } else {
-          this.subsView()
+          Scroll() {
+            Column({ space: 10 }) {
+              if (this.manualCount() > 0) {
+                ForEach(this.manualList(), (entry: ConfigEntry) => {
+                  this.proxyRow(entry, false)
+                }, (entry: ConfigEntry) => entry.id)
+              }
+
+              ForEach(this.subs, (sub: SubscriptionRecord) => {
+                this.subscriptionCard(sub)
+              }, (sub: SubscriptionRecord) => sub.id + '|' + sub.updatedAt + '|' + sub.name + '|' + sub.url)
+
+              Row({ space: 10 }) {
+                Button('添加节点 / 订阅')
+                  .layoutWeight(1)
+                  .height(44)
+                  .fontSize(14)
+                  .fontColor('#54C4FF')
+                  .backgroundColor('#101A2E')
+                  .borderRadius(14)
+                  .margin({ top: 6 })
+                  .onClick(() => {
+                    this.add(0);
+                  })
+              }
+              .width('100%')
+            }
+            .width('100%')
+            .padding({ left: 14, right: 14, bottom: 24 })
+          }
+          .layoutWeight(1)
+          .scrollBar(BarState.Off)
+          .align(Alignment.Top)
         }
       }
       .width('100%')
@@ -430,380 +663,385 @@ struct Configs {
 
   @Builder
   topBar() {
-    Row() {
-      Text('‹')
-        .fontSize(30)
-        .fontColor('#A9BAD1')
-        .width(36)
-        .onClick(() => {
-          router.back();
-        })
+    Row({ space: 8 }) {
+      Stack({ alignContent: Alignment.Center }) {
+        SymbolGlyph($r('sys.symbol.chevron_left'))
+          .fontSize(20)
+          .fontColor(['#9FB0C9'])
+      }
+      .width(34)
+      .height(34)
+      .borderRadius(17)
+      .backgroundColor('#161F33')
+      .onClick(() => {
+        router.back();
+      })
       Text('节点')
-        .fontSize(18)
-        .fontWeight(FontWeight.Medium)
-        .fontColor('#E8F1FF')
+        .fontSize(20)
+        .fontWeight(FontWeight.Bold)
+        .fontColor('#F1F5FF')
         .layoutWeight(1)
-        .textAlign(TextAlign.Center)
-      Text(this.testing ? (this.testDone + '/' + this.testTotal) : '测速')
-        .fontSize(12)
-        .fontColor(this.testing ? '#4C5D77' : '#54C4FF')
-        .padding({ left: 8, right: 8, top: 4, bottom: 4 })
-        .borderRadius(6)
-        .backgroundColor('#101A2E')
-        .onClick(() => {
-          if (!this.testing) {
-            this.testVisible();
-          }
-        })
-      Text('＋')
-        .fontSize(26)
-        .fontColor('#54C4FF')
-        .width(36)
-        .textAlign(TextAlign.End)
-        .onClick(() => {
-          this.add(this.tab === TAB_SUBS ? 1 : 0);
-        })
-    }
-    .width('100%')
-    .padding({ left: 10, right: 16, top: 8, bottom: 10 })
-  }
-
-  @Builder
-  segment() {
-    Row() {
-      Text('节点 ' + this.manualCount())
-        .fontSize(13)
-        .fontColor(this.tab === TAB_NODES ? '#06121F' : '#7C8FA9')
-        .height(34)
-        .layoutWeight(1)
-        .textAlign(TextAlign.Center)
-        .borderRadius(8)
-        .backgroundColor(this.tab === TAB_NODES ? '#54C4FF' : '#00000000')
-        .onClick(() => {
-          this.tab = TAB_NODES;
-        })
-      Text('订阅 ' + this.subs.length)
-        .fontSize(13)
-        .fontColor(this.tab === TAB_SUBS ? '#06121F' : '#7C8FA9')
-        .height(34)
-        .layoutWeight(1)
-        .textAlign(TextAlign.Center)
-        .borderRadius(8)
-        .backgroundColor(this.tab === TAB_SUBS ? '#54C4FF' : '#00000000')
-        .margin({ left: 4 })
-        .onClick(() => {
-          this.tab = TAB_SUBS;
-        })
-    }
-    .width('100%')
-    .padding(4)
-    .backgroundColor('#101A2E')
-    .borderRadius(10)
-    .margin({ left: 16, right: 16, bottom: 8 })
-  }
-
-  @Builder
-  hint() {
-    Text('测速 ' + (this.viaTunnel ? '已连接 · 内核 HTTP（经代理）' : '未连接 · TCP/UDP 探测') +
-      ' · 并发 ' + TEST_CONCURRENCY + ' · 超时 ' + (TEST_TIMEOUT_MS / 1000) + ' 秒 · 按延迟排序')
-      .fontSize(10)
-      .fontColor('#4C5D77')
-      .width('100%')
-      .padding({ left: 16, right: 16, bottom: 8 })
-  }
-
-  @Builder
-  nodesView() {
-    if (this.manualCount() === 0) {
-      this.emptyNodes()
-    } else {
-      Scroll() {
-        Column({ space: 10 }) {
-          ForEach(this.manualList(), (entry: ConfigEntry) => {
-            this.nodeRow(entry, false)
-          }, (entry: ConfigEntry) => entry.id)
-          this.addButtons()
-        }
-        .width('100%')
-        .padding({ left: 16, right: 16, bottom: 20 })
+        .textAlign(TextAlign.Start)
+        .margin({ left: 2 })
+      Row({ space: 4 }) {
+        SymbolGlyph($r('sys.symbol.bolt_1'))
+          .fontSize(14)
+          .fontColor([this.testing ? '#566782' : '#3B9EFF'])
+        Text(this.testing ? (this.testDone + '/' + this.testTotal) : '测速')
+          .fontSize(12)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(this.testing ? '#566782' : '#3B9EFF')
       }
-      .layoutWeight(1)
-      .scrollBar(BarState.Off)
-      .align(Alignment.Top)
-    }
-  }
-
-  @Builder
-  subsView() {
-    if (this.subs.length === 0) {
-      this.emptySubs()
-    } else {
-      Scroll() {
-        Column({ space: 10 }) {
-          ForEach(this.subs, (sub: SubscriptionRecord) => {
-            this.subCard(sub)
-          }, (sub: SubscriptionRecord) => sub.id + '|' + sub.updatedAt + '|' + sub.name + '|' + sub.url)
-          this.addButtons()
+      .padding({ left: 10, right: 10, top: 7, bottom: 7 })
+      .borderRadius(16)
+      .backgroundColor('#161F33')
+      .border({ width: 0.5, color: '#14FFFFFF' })
+      .onClick(() => {
+        if (!this.testing) {
+          this.runTest(this.visibleTestTargets());
         }
-        .width('100%')
-        .padding({ left: 16, right: 16, bottom: 20 })
+      })
+      Stack({ alignContent: Alignment.Center }) {
+        SymbolGlyph($r('sys.symbol.plus'))
+          .fontSize(18)
+          .fontColor(['#3B9EFF'])
       }
-      .layoutWeight(1)
-      .scrollBar(BarState.Off)
-      .align(Alignment.Top)
-    }
-  }
-
-  @Builder
-  addButtons() {
-    Row({ space: 10 }) {
-      Button(this.tab === TAB_SUBS ? '添加订阅' : '添加节点')
-        .layoutWeight(1)
-        .height(44)
-        .fontSize(14)
-        .fontColor('#54C4FF')
-        .backgroundColor('#101A2E')
-        .borderRadius(12)
-        .margin({ top: 6 })
-        .onClick(() => {
-          this.add(this.tab === TAB_SUBS ? 1 : 0);
-        })
+      .width(34)
+      .height(34)
+      .borderRadius(17)
+      .backgroundColor('#161F33')
+      .border({ width: 0.5, color: '#14FFFFFF' })
+      .onClick(() => {
+        this.add(0);
+      })
+      Stack({ alignContent: Alignment.Center }) {
+        SymbolGlyph($r('sys.symbol.ellipsis_circle'))
+          .fontSize(18)
+          .fontColor(['#9FB0C9'])
+      }
+      .width(34)
+      .height(34)
+      .borderRadius(17)
+      .backgroundColor('#161F33')
+      .border({ width: 0.5, color: '#14FFFFFF' })
+      .bindMenu(this.moreMenu())
     }
     .width('100%')
+    .padding({ left: 14, right: 14, top: 8, bottom: 8 })
   }
 
   @Builder
-  nodeRow(entry: ConfigEntry, owned: boolean) {
+  hintBar() {
     Row() {
-      // Selecting a node lives on this inner row only: with the handler on the
-      // outer Row a tap on 「测速」 also fired the row's click, switched the node
-      // and left the page before the probe result could be shown.
-      Row() {
-        Text(nodeTypeLabel(entry.type))
-          .fontSize(owned ? 9 : 10)
-          .fontColor('#06121F')
-          .width(owned ? 42 : 52)
-          .height(24)
-          .textAlign(TextAlign.Center)
-          .borderRadius(7)
-          .backgroundColor(entry.id === this.selectedId ? '#54C4FF' : '#2A3550')
+      Text('共 ' + this.items.length + ' 节点 · ' + this.subs.length + ' 订阅')
+        .fontSize(11)
+        .fontColor('#5C7192')
+      Blank()
+      Text('预热 HTTP 测速 · 并发 ' + TEST_CONCURRENCY + ' · ' + (this.sortByDelay ? '延迟排序' : '默认顺序'))
+        .fontSize(10)
+        .fontColor('#4C5D77')
+    }
+    .width('100%')
+    .padding({ left: 16, right: 16, bottom: 8 })
+  }
 
-        Column() {
+  @Builder
+  proxyRow(entry: ConfigEntry, inContainer: boolean) {
+    Row() {
+      // Main tap target: select node and switch.
+      Column({ space: 6 }) {
+        Row({ space: 6 }) {
           Text(entry.name)
-            .fontSize(owned ? 13 : 14)
-            .fontColor('#E4EEFF')
+            .fontSize(14)
+            .fontWeight(entry.id === this.selectedId ? FontWeight.Medium : FontWeight.Regular)
+            .fontColor(entry.id === this.selectedId ? '#FFFFFF' : '#E4EEFF')
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
-          Text(this.subtitleOf(entry))
-            .fontSize(10)
-            .fontColor(this.hasLatency(entry.id) ? this.latencyColor(entry.id) : '#5C7192')
-            .margin({ top: 3 })
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .constraintSize({ maxWidth: '88%' })
+          if (entry.id === this.selectedId) {
+            SymbolGlyph($r('sys.symbol.checkmark'))
+              .fontSize(14)
+              .fontWeight(FontWeight.Bold)
+              .fontColor(['#3B9EFF'])
+          }
         }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
-        .margin({ left: 10 })
-        .onClick(() => {
-          this.choose(entry);
-        })
+        .width('100%')
+
+        Row({ space: 5 }) {
+          ForEach(extractNodeBadges(entry.type, entry.json), (badge: NodeBadge) => {
+            Text(badge.text)
+              .fontSize(9)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(badge.fg)
+              .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+              .borderRadius(5)
+              .backgroundColor(badge.bg)
+          }, (badge: NodeBadge) => badge.text)
+        }
+        .width('100%')
       }
+      .alignItems(HorizontalAlign.Start)
       .layoutWeight(1)
       .onClick(() => {
         this.choose(entry);
       })
-      .gesture(
-        LongPressGesture({ repeat: false })
-          .onAction(() => {
-            if (owned) {
-              promptAction.showToast({ message: '订阅节点由订阅管理，请用「更新」刷新' });
-            } else {
-              this.confirmDeleteNode(entry);
-            }
-          })
-      )
 
-      Text('测速')
-        .fontSize(11)
-        .fontColor('#54C4FF')
-        .padding({ left: 8, right: 8, top: 4, bottom: 4 })
-        .borderRadius(6)
-        .backgroundColor('#101A2E')
-        .margin({ right: 6 })
+      // Anywhere-style tappable latency badge on the right: tap to re-test only this node.
+      Text(this.latencyLabelText(entry.id))
+        .fontSize(12)
+        .fontWeight(FontWeight.Medium)
+        .fontColor(this.latencyLabelColor(entry.id))
+        .textAlign(TextAlign.End)
+        .constraintSize({ minWidth: 56 })
+        .padding({ left: 8, right: 2, top: 8, bottom: 8 })
         .onClick(() => {
           this.testOneEntry(entry);
         })
-      if (entry.id === this.selectedId) {
-        Text('✓')
-          .fontSize(16)
-          .fontColor('#3DDC97')
-          .margin({ right: 8 })
-      }
-      Text('›')
-        .fontSize(20)
-        .fontColor('#4C5D77')
-        .padding({ left: 4, right: 2 })
-        .onClick(() => {
-          this.choose(entry);
-        })
     }
     .width('100%')
-    .padding({ left: owned ? 22 : 14, right: 14, top: owned ? 9 : 12, bottom: owned ? 9 : 12 })
-    .backgroundColor(owned ? '#101A2E' : '#131A2C')
-    .borderRadius(owned ? 10 : 14)
+    .padding({ left: 14, right: 14, top: 12, bottom: 12 })
+    .backgroundColor(entry.id === this.selectedId
+      ? '#16243D'
+      : (inContainer ? '#10182A' : '#131A2C'))
+    .border({
+      width: entry.id === this.selectedId ? 1 : 0,
+      color: '#3D54C4FF'
+    })
+    .borderRadius(16)
+    .bindContextMenu(this.nodeMenuBuilder(entry, inContainer), ResponseType.LongPress)
   }
 
   @Builder
-  subCard(sub: SubscriptionRecord) {
+  nodeMenuBuilder(entry: ConfigEntry, owned: boolean) {
+    Menu() {
+      MenuItem({ content: '测试延迟' })
+        .onClick(() => {
+          this.testOneEntry(entry);
+        })
+      if (entry.server.length > 0) {
+        MenuItem({ content: '复制服务器地址' })
+          .onClick(() => {
+            this.copyText(entry.server, '服务器地址');
+          })
+      }
+      if (!owned) {
+        MenuItem({ content: '删除节点' })
+          .contentFontColor('#FF5C7A')
+          .onClick(() => {
+            this.confirmDeleteNode(entry);
+          })
+      }
+    }
+  }
+
+  @Builder
+  subscriptionCard(sub: SubscriptionRecord) {
     Column() {
-      if (this.editingId === sub.id) {
+      if (this.editingSubId === sub.id) {
         this.subEditor(sub)
       } else {
-        Row() {
-          Column() {
-            Text(this.subName(sub.id))
-              .fontSize(14)
-              .fontColor('#E4EEFF')
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-            Text(this.subUrlText(sub.id))
-              .fontSize(10)
-              .fontColor('#4C5D77')
-              .margin({ top: 3 })
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-            Text(this.subQuota(sub.id))
-              .fontSize(11)
-              .fontColor('#7C8FA9')
-              .margin({ top: 4 })
+        // Collapsible subscription header (Anywhere style)
+        Row({ space: 12 }) {
+          Stack({ alignContent: Alignment.Center }) {
+            SymbolGlyph($r('sys.symbol.worldclock_fill'))
+              .fontSize(this.expandedSubId === sub.id ? 18 : 15)
+              .fontColor([this.subContainsSelected(sub.id) ? '#3B9EFF' : '#7D8FA9'])
+          }
+          .width(this.expandedSubId === sub.id ? 34 : 28)
+          .height(this.expandedSubId === sub.id ? 34 : 28)
+          .borderRadius(10)
+          .backgroundColor('#162238')
+
+          Column({ space: 3 }) {
+            Row({ space: 8 }) {
+              Text(this.subName(sub.id))
+                .fontSize(15)
+                .fontWeight(FontWeight.Medium)
+                .fontColor('#F1F5FF')
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .layoutWeight(1)
+              if (this.isUpdatingSub(sub.id)) {
+                Text('更新中…')
+                  .fontSize(11)
+                  .fontColor('#3B9EFF')
+              }
+              Text('' + this.subNodeCount(sub.id))
+                .fontSize(11)
+                .fontWeight(FontWeight.Medium)
+                .fontColor('#3B9EFF')
+                .padding({ left: 8, right: 8, top: 2, bottom: 2 })
+                .borderRadius(10)
+                .backgroundColor('#1A3B9EFF')
+              SymbolGlyph(this.expandedSubId === sub.id ? $r('sys.symbol.chevron_up') : $r('sys.symbol.chevron_down'))
+                .fontSize(14)
+                .fontColor(['#6B7E9B'])
+            }
+            .width('100%')
+
+            if (this.expandedSubId === sub.id) {
+              Text(this.subHasTraffic(sub.id)
+                ? this.subQuota(sub.id)
+                : ('更新于 ' + this.subUpdated(sub.id)))
+                .fontSize(11)
+                .fontColor('#7C8FA9')
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+            }
           }
           .alignItems(HorizontalAlign.Start)
           .layoutWeight(1)
-
-          Text(this.expandedId === sub.id ? '收起' : (this.subNodeCount(sub.id) + ' 个'))
-            .fontSize(11)
-            .fontColor('#54C4FF')
-            .padding({ left: 8, right: 8, top: 5, bottom: 5 })
-            .borderRadius(8)
-            .backgroundColor('#101A2E')
-            .onClick(() => {
-              this.expandedId = this.expandedId === sub.id ? '' : sub.id;
-            })
         }
         .width('100%')
-
-        Progress({
-          value: this.subUsed(sub.id),
-          total: this.subTotal(sub.id),
-          type: ProgressType.Linear
+        .onClick(() => {
+          this.expandedSubId = this.expandedSubId === sub.id ? '' : sub.id;
         })
-          .width('100%')
-          .height(6)
-          .color('#54C4FF')
-          .backgroundColor('#101A2E')
-          .margin({ top: 10 })
 
-        Row() {
-          Text('到期 ' + this.subExpire(sub.id))
-            .fontSize(10)
-            .fontColor('#4C5D77')
-            .layoutWeight(1)
-          Text('更新于 ' + this.subUpdated(sub.id))
-            .fontSize(10)
-            .fontColor('#4C5D77')
-        }
-        .width('100%')
-        .margin({ top: 6 })
+        if (this.expandedSubId === sub.id) {
+          if (this.subHasTraffic(sub.id)) {
+            Progress({
+              value: this.subUsed(sub.id),
+              total: this.subTotal(sub.id),
+              type: ProgressType.Linear
+            })
+              .width('100%')
+              .height(5)
+              .color('#54C4FF')
+              .backgroundColor('#0D1526')
+              .margin({ top: 10 })
 
-        Row({ space: 8 }) {
-          Text(this.busySubId === sub.id ? '更新中…' : '更新')
-            .fontSize(12)
-            .fontColor(this.busySubId === sub.id ? '#4C5D77' : '#54C4FF')
-            .textAlign(TextAlign.Center)
-            .layoutWeight(1)
-            .height(32)
-            .borderRadius(8)
-            .backgroundColor('#101A2E')
-            .onClick(() => {
-              if (this.busySubId.length === 0) {
-                this.refreshOne(sub.id);
-              }
-            })
-          Text('编辑')
-            .fontSize(12)
-            .fontColor('#A9BAD1')
-            .textAlign(TextAlign.Center)
-            .layoutWeight(1)
-            .height(32)
-            .borderRadius(8)
-            .backgroundColor('#101A2E')
-            .onClick(() => {
-              this.beginEdit(sub.id);
-            })
-          Text('删除')
-            .fontSize(12)
-            .fontColor('#FF5C7A')
-            .textAlign(TextAlign.Center)
-            .width(56)
-            .height(32)
-            .borderRadius(8)
-            .backgroundColor('#101A2E')
-            .onClick(() => {
-              this.confirmDeleteSub(sub.id);
-            })
-        }
-        .width('100%')
-        .margin({ top: 10 })
-      }
-
-      if (this.expandedId === sub.id) {
-        Divider().color('#1C2740').margin({ top: 10, bottom: 8 })
-        if (this.subNodeCount(sub.id) === 0) {
-          Text('这个订阅还没有节点，点「更新」拉取。')
-            .fontSize(11)
-            .fontColor('#5C7192')
+            Row() {
+              Text('到期 ' + this.subExpire(sub.id))
+                .fontSize(10)
+                .fontColor('#5C7192')
+                .layoutWeight(1)
+              Text('更新于 ' + this.subUpdated(sub.id))
+                .fontSize(10)
+                .fontColor('#5C7192')
+            }
             .width('100%')
-        } else {
-          Column({ space: 6 }) {
-            ForEach(this.subNodes(sub.id), (entry: ConfigEntry) => {
-              this.nodeRow(entry, true)
-            }, (entry: ConfigEntry) => entry.id)
+            .margin({ top: 5 })
+          }
+
+          Row({ space: 6 }) {
+            Text(this.isUpdatingSub(sub.id) ? '更新中…' : '更新')
+              .fontSize(11)
+              .fontColor(this.isUpdatingSub(sub.id) ? '#4C5D77' : '#54C4FF')
+              .textAlign(TextAlign.Center)
+              .layoutWeight(1)
+              .height(30)
+              .borderRadius(8)
+              .backgroundColor('#101A2E')
+              .onClick(() => {
+                if (!this.isUpdatingSub(sub.id)) {
+                  this.refreshOne(sub.id);
+                }
+              })
+            Text('测速')
+              .fontSize(11)
+              .fontColor(this.testing ? '#4C5D77' : '#3DDC97')
+              .textAlign(TextAlign.Center)
+              .layoutWeight(1)
+              .height(30)
+              .borderRadius(8)
+              .backgroundColor('#101A2E')
+              .onClick(() => {
+                if (!this.testing) {
+                  this.runTest(this.subNodes(sub.id));
+                }
+              })
+            Text('编辑')
+              .fontSize(11)
+              .fontColor('#A9BAD1')
+              .textAlign(TextAlign.Center)
+              .layoutWeight(1)
+              .height(30)
+              .borderRadius(8)
+              .backgroundColor('#101A2E')
+              .onClick(() => {
+                this.beginEdit(sub.id);
+              })
+            Text('复制')
+              .fontSize(11)
+              .fontColor('#A9BAD1')
+              .textAlign(TextAlign.Center)
+              .width(44)
+              .height(30)
+              .borderRadius(8)
+              .backgroundColor('#101A2E')
+              .onClick(() => {
+                this.copyText(this.subUrlText(sub.id), '订阅链接');
+              })
+            Text('删除')
+              .fontSize(11)
+              .fontColor('#FF5C7A')
+              .textAlign(TextAlign.Center)
+              .width(44)
+              .height(30)
+              .borderRadius(8)
+              .backgroundColor('#101A2E')
+              .onClick(() => {
+                this.confirmDeleteSub(sub.id);
+              })
           }
           .width('100%')
+          .margin({ top: 10 })
+
+          Divider().color('#1C2740').margin({ top: 12, bottom: 10 })
+
+          if (this.subNodeCount(sub.id) === 0) {
+            Text('这个订阅还没有节点，点「更新」拉取。')
+              .fontSize(12)
+              .fontColor('#5C7192')
+              .width('100%')
+              .padding({ top: 6, bottom: 6 })
+          } else {
+            Column({ space: 8 }) {
+              ForEach(this.subNodes(sub.id), (entry: ConfigEntry) => {
+                this.proxyRow(entry, true)
+              }, (entry: ConfigEntry) => entry.id)
+            }
+            .width('100%')
+          }
         }
       }
     }
     .width('100%')
-    .padding(14)
-    .backgroundColor('#131A2C')
-    .borderRadius(14)
+    .padding(this.expandedSubId === sub.id ? 14 : 14)
+    .backgroundColor(this.expandedSubId === sub.id ? '#0E1526' : '#131A2C')
+    .border({
+      width: 1,
+      color: this.expandedSubId === sub.id ? '#243554' : '#0DFFFFFF'
+    })
+    .borderRadius(20)
   }
 
   @Builder
   subEditor(sub: SubscriptionRecord) {
     Column({ space: 8 }) {
       Text('编辑订阅')
-        .fontSize(12)
-        .fontColor('#A9BAD1')
+        .fontSize(13)
+        .fontWeight(FontWeight.Medium)
+        .fontColor('#E4EEFF')
         .width('100%')
       TextInput({ text: this.editName, placeholder: '订阅名称' })
-        .height(34)
+        .height(36)
         .fontSize(12)
         .fontColor('#E4EEFF')
         .placeholderColor('#5C7192')
-        .backgroundColor('#0D1526')
-        .borderRadius(8)
+        .backgroundColor('#0B1020')
+        .borderRadius(10)
         .width('100%')
         .onChange((value: string) => {
           this.editName = value;
         })
       TextInput({ text: this.editUrl, placeholder: 'https://example.com/sub?token=...' })
-        .height(34)
+        .height(36)
         .fontSize(11)
         .fontColor('#E4EEFF')
         .placeholderColor('#5C7192')
-        .backgroundColor('#0D1526')
-        .borderRadius(8)
+        .backgroundColor('#0B1020')
+        .borderRadius(10)
         .width('100%')
         .onChange((value: string) => {
           this.editUrl = value;
@@ -814,19 +1052,20 @@ struct Configs {
           .fontColor('#A9BAD1')
           .textAlign(TextAlign.Center)
           .layoutWeight(1)
-          .height(32)
-          .borderRadius(8)
+          .height(34)
+          .borderRadius(10)
           .backgroundColor('#101A2E')
           .onClick(() => {
-            this.editingId = '';
+            this.editingSubId = '';
           })
         Text('保存')
           .fontSize(12)
           .fontColor('#06121F')
+          .fontWeight(FontWeight.Medium)
           .textAlign(TextAlign.Center)
           .layoutWeight(1)
-          .height(32)
-          .borderRadius(8)
+          .height(34)
+          .borderRadius(10)
           .backgroundColor('#54C4FF')
           .onClick(() => {
             this.commitEdit(sub.id);
@@ -838,53 +1077,29 @@ struct Configs {
   }
 
   @Builder
-  emptyNodes() {
+  emptyState() {
     Column() {
-      Text('还没有节点')
-        .fontSize(15)
-        .fontColor('#7C8FA9')
-      Text('粘贴分享链接或 JSON 配置导入')
+      Text('还没有节点或订阅')
+        .fontSize(16)
+        .fontWeight(FontWeight.Medium)
+        .fontColor('#A9BAD1')
+      Text('粘贴分享链接、订阅地址或 JSON 配置即可自动识别导入')
         .fontSize(12)
-        .fontColor('#4C5D77')
-        .margin({ top: 6 })
-      Button('添加节点')
-        .width(160)
-        .height(44)
-        .fontSize(14)
-        .fontColor('#06121F')
-        .backgroundColor('#54C4FF')
-        .borderRadius(12)
-        .margin({ top: 18 })
-        .onClick(() => {
-          this.add(0);
-        })
-    }
-    .width('100%')
-    .layoutWeight(1)
-    .justifyContent(FlexAlign.Center)
-  }
-
-  @Builder
-  emptySubs() {
-    Column() {
-      Text('还没有订阅')
-        .fontSize(15)
-        .fontColor('#7C8FA9')
-      Text('订阅和手动导入的节点分开管理，互不覆盖')
-        .fontSize(12)
-        .fontColor('#4C5D77')
-        .margin({ top: 6 })
-      Button('添加订阅')
-        .width(160)
-        .height(44)
-        .fontSize(14)
-        .fontColor('#06121F')
-        .backgroundColor('#54C4FF')
-        .borderRadius(12)
-        .margin({ top: 18 })
-        .onClick(() => {
-          this.add(1);
-        })
+        .fontColor('#5C7192')
+        .margin({ top: 8 })
+      Row({ space: 10 }) {
+        Button('添加链接 / 订阅')
+          .height(44)
+          .padding({ left: 22, right: 22 })
+          .fontSize(14)
+          .fontColor('#06121F')
+          .backgroundColor('#54C4FF')
+          .borderRadius(12)
+          .onClick(() => {
+            this.add(0);
+          })
+      }
+      .margin({ top: 20 })
     }
     .width('100%')
     .layoutWeight(1)
@@ -898,6 +1113,3 @@ function formatTimeShort(ts: number): string {
   return pad(date.getMonth() + 1) + '-' + pad(date.getDate()) + ' ' +
     pad(date.getHours()) + ':' + pad(date.getMinutes());
 }
-
-
-

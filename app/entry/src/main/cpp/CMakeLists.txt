@@ -26,6 +26,6 @@ target_link_libraries(entry PUBLIC
   m
 )
 
-# The Rust archive carries a large static symbol table; keep only dynamic
-# symbols so the HAP stays a reasonable size.
-set_target_properties(entry PROPERTIES LINK_FLAGS "-Wl,--strip-all")
+# Reclaim dead Rust sections and keep internal libxray_ffi.a symbols unexported
+# while preserving standard NAPI exports and libunwind symbols.
+set_target_properties(entry PROPERTIES LINK_FLAGS "-Wl,--gc-sections -Wl,--exclude-libs,libxray_ffi.a -Wl,-O2 -Wl,--strip-all")

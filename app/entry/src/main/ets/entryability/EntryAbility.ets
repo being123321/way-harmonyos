@@ -3,12 +3,15 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
 import type { BusinessError } from '@kit.BasicServicesKit';
 import { appLog } from '../common/AppLog';
-import { readStatus, startVpn, stopVpn, vpnWant, clearStatus } from '../common/Xray';
+import { initIpcAuth } from '../common/IpcAuth';
+import { appBundleName, readStatus, startVpn, stopVpn, vpnWant, clearStatus } from '../common/Xray';
 import { SSID_SUSPEND, appliedSsidAction, currentSsid, findRule, setAppliedSsidAction, setSsidSuspended, setSuspendOverride, ssidSuspended, suspendOverride } from '../common/Ssid';
 import { selectedEntry } from '../common/Store';
 import { MODE_BYPASS, MODE_DIRECT, SplitOptions } from '../common/Rules';
 import { buildAndSaveTunnel } from '../common/TunnelConfig';
-import { activeRuleSet, dohEnabled, ruleSetAdsEnabled } from '../common/RuleSet';
+import {
+  activeRuleSet, dnsLeakProtectEnabled, dohEnabled, ruleSetAdsEnabled, webrtcLeakProtectEnabled
+} from '../common/RuleSet';
 import { geodataReady } from '../common/Geodata';
 import { preferences } from '@kit.ArkData';
 import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
@@ -24,6 +27,7 @@ export default class EntryAbility extends UIAbility {
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(DOMAIN, TAG, 'onCreate');
+    initIpcAuth(this.context);
     this.startWifiWatch();
     this.stashCardOp(want).catch((): void => {
     });
@@ -69,10 +73,17 @@ export default class EntryAbility extends UIAbility {
       }
       this.wifiHandler = null;
     }
-    // A TempAbility armed from the widget preview owns the task and keeps the
-    // VPN alive; swiping the main window is not an explicit exit in that case.
-    if (this.tempKeepAliveActive()) {
-      appLog(this.context, 'lifecycle', 'onDestroy with TempAbility keepalive, tunnel left running');
+    // When "后台运行 VPN" (keepAliveOnRemove) is ON, removing the main UI window
+    // leaves the independent VpnExtensionAbility and background continuous task
+    // untouched — matching the verified way-xray-latest behavior. Do NOT call
+    // stopBackgroundRunning here, as EntryAbility and TempAbility share the main
+    // process and revoking the task kills background VPN keepalive.
+    if (this.keepAliveOnRemoveEnabled()) {
+      appLog(this.context, 'lifecycle', 'onDestroy with keepAliveOnRemove=true, tunnel & task left running');
+      if (this.wifiTimer !== -1) {
+        clearInterval(this.wifiTimer);
+        this.wifiTimer = -1;
+      }
     } else {
       // 用户手动清后台：把隧道停掉并清「已连接」标记，之后不自动重连。
       this.stopForManualKill().catch((): void => {
@@ -80,15 +91,12 @@ export default class EntryAbility extends UIAbility {
     }
   }
 
-  private tempKeepAliveActive(): boolean {
+  private keepAliveOnRemoveEnabled(): boolean {
     try {
       const way = preferences.getPreferencesSync(this.context, { name: 'way' });
-      // FlClash's "remove from recents" switch keeps the VPN service alive even
-      // before the widget has armed TempAbility; TempAbility itself is gated by
-      // the same flag.
-      const temp: boolean = way.getSync('tempKeepAlive', false) as boolean;
       const keepOnRemove: boolean = way.getSync('keepAliveOnRemove', false) as boolean;
-      return temp || keepOnRemove;
+      const temp: boolean = way.getSync('tempKeepAlive', false) as boolean;
+      return keepOnRemove || temp;
     } catch (error) {
       return false;
     }
@@ -255,6 +263,8 @@ export default class EntryAbility extends UIAbility {
       geodata: geodataReady(this.context),
       mode: mode,
       blockQuic: store.getSync('blockQuic', true) as boolean,
+      dnsLeakProtect: dnsLeakProtectEnabled(this.context),
+      webrtcLeakProtect: webrtcLeakProtectEnabled(this.context),
       debugLog: store.getSync('debugLog', false) as boolean,
       ruleSet: activeRuleSet(this.context),
       blockAds: ruleSetAdsEnabled(this.context),
@@ -273,7 +283,7 @@ export default class EntryAbility extends UIAbility {
       const info: wantAgent.WantAgentInfo = {
         wants: [
           {
-            bundleName: 'com.way.app',
+            bundleName: appBundleName(this.context),
             abilityName: 'EntryAbility'
           }
         ],

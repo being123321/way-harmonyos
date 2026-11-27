@@ -1,0 +1,167 @@
+name: Auto Build & Release way HAP
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  OHOS_CMDLINE_TOOLS_URL: ${{ vars.OHOS_CMDLINE_TOOLS_URL || '' }}
+
+jobs:
+  build-hap:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 两个内核分别出包，不再提供手动选择
+        kernel: [xray-rust, xray-core]
+    steps:
+      - name: Checkout way-harmonyos
+        uses: actions/checkout@v4
+
+      - name: Read app version from app/AppScope/app.json5
+        id: meta
+        run: |
+          VER=$(python3 -c "import re; raw=open('app/AppScope/app.json5').read(); print(re.search(r'\"versionName\"\s*:\s*\"([^\"]+)\"', raw).group(1))")
+          CODE=$(python3 -c "import re; raw=open('app/AppScope/app.json5').read(); print(re.search(r'\"versionCode\"\s*:\s*([0-9]+)', raw).group(1))")
+          echo "version=${VER}" >> "${GITHUB_OUTPUT}"
+          echo "code=${CODE}" >> "${GITHUB_OUTPUT}"
+
+      - name: Fetch prebuilt kernel from kernels-latest release
+        run: |
+          set -euo pipefail
+          KERNEL="${{ matrix.kernel }}"
+          BASE_URL="https://github.com/${{ github.repository }}/releases/download/kernels-latest"
+          mkdir -p app/entry/libs/arm64-v8a
+          curl -fsSL "${BASE_URL}/libentry_rust.so" -o app/entry/libs/arm64-v8a/libentry.so
+          if [ "${KERNEL}" = "xray-core" ]; then
+            curl -fsSL "${BASE_URL}/libxray_core_ohos.so" -o app/entry/libs/arm64-v8a/libxray_core_ohos.so
+          fi
+          sha256sum app/entry/libs/arm64-v8a/*.so > build-info.txt
+          cat build-info.txt
+
+      - name: Setup JDK 17 for HarmonyOS Command Line Tools
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup HarmonyOS Command Line Tools (hvigorw + SDK)
+        id: ohos_tools
+        run: |
+          set -euo pipefail
+          if [ -z "${OHOS_CMDLINE_TOOLS_URL}" ]; then
+            echo "ready=false" >> "${GITHUB_OUTPUT}"
+            echo "::warning::OHOS_CMDLINE_TOOLS_URL repository variable is not set; skipping hvigorw HAP build and uploading staged native libs only."
+            exit 0
+          fi
+          mkdir -p "${RUNNER_TEMP}/cmdline-tools"
+          curl -fSL "${OHOS_CMDLINE_TOOLS_URL}" -o "${RUNNER_TEMP}/cmdline-tools.zip"
+          unzip -q "${RUNNER_TEMP}/cmdline-tools.zip" -d "${RUNNER_TEMP}/cmdline-tools"
+          TOOL_HOME=$(find "${RUNNER_TEMP}/cmdline-tools" -maxdepth 3 -type d -name 'command-line-tools' | head -n 1)
+          [ -n "${TOOL_HOME}" ] || TOOL_HOME="${RUNNER_TEMP}/cmdline-tools"
+          LIBCXX=$(find "${TOOL_HOME}" -name 'libc++_shared.so' -path '*aarch64-linux-ohos*' | head -n 1)
+          if [ -n "${LIBCXX}" ]; then
+            cp "${LIBCXX}" app/entry/libs/arm64-v8a/libc++_shared.so
+          fi
+          echo "tool_home=${TOOL_HOME}" >> "${GITHUB_OUTPUT}"
+          echo "libcxx=${LIBCXX}" >> "${GITHUB_OUTPUT}"
+          echo "ready=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Build & Repack HAP (ZIP_STORED native libs)
+        id: package
+        if: steps.ohos_tools.outputs.ready == 'true'
+        working-directory: app
+        env:
+          NODE_OPTIONS: "--max-old-space-size=1536"
+          UV_THREADPOOL_SIZE: "2"
+        run: |
+          set -euo pipefail
+          export PATH="${steps.ohos_tools.outputs.tool_home}/bin:${PATH}"
+          hvigorw assembleHap --mode module -p product=default --no-daemon --max-workers=2 -p buildMode=release
+          RAW_HAP=$(find entry/build -name '*unsigned*.hap' | head -n 1)
+          OUT_HAP="way-${{ steps.meta.outputs.version }}-${{ matrix.kernel }}-unsigned.hap"
+          python3 - "${RAW_HAP}" "${OUT_HAP}" "entry/libs/arm64-v8a/libentry.so" "${steps.ohos_tools.outputs.libcxx}" <<'PY'
+          import sys, zipfile
+          src, dst, so_entry, so_cxx = sys.argv[1:5]
+          with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, 'w') as zout:
+              for item in zin.infolist():
+                  if item.filename.startswith('libs/'):
+                      continue
+                  data = zin.read(item.filename)
+                  zi = zipfile.ZipInfo(item.filename, date_time=item.date_time)
+                  zi.external_attr = item.external_attr
+                  zi.compress_type = zipfile.ZIP_STORED if (not item.filename.endswith(('.so', '.abc')) and item.compress_type == zipfile.ZIP_STORED) else zipfile.ZIP_DEFLATED
+                  zout.writestr(zi, data)
+              for name, path in (('libs/arm64-v8a/libentry.so', so_entry), ('libs/arm64-v8a/libc++_shared.so', so_cxx)):
+                  if not path:
+                      continue
+                  zi = zipfile.ZipInfo(name, date_time=(2026, 11, 27, 0, 0, 0))
+                  zi.compress_type = zipfile.ZIP_STORED
+                  zi.external_attr = 0o755 << 16
+                  with open(path, 'rb') as f:
+                      zout.writestr(zi, f.read())
+          PY
+          unzip -v "${OUT_HAP}" | grep -E 'libs/|module\.json'
+          sha256sum "${OUT_HAP}" > "${OUT_HAP}.sha256"
+          echo "hap_path=app/${OUT_HAP}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload HAP / staged libs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hap-${{ matrix.kernel }}
+          path: |
+            app/way-*.hap
+            app/way-*.hap.sha256
+            app/entry/libs/arm64-v8a/*.so
+            build-info.txt
+
+  publish-hap:
+    needs: build-hap
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download built HAPs
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Show artifacts
+        run: ls -la dist && cat dist/build-info.txt 2>/dev/null || true
+
+      - name: Publish HAPs to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          FILES=(dist/way-*.hap dist/way-*.hap.sha256)
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "::warning::No HAP produced (OHOS_CMDLINE_TOOLS_URL missing or build failed); skipping release."
+            exit 0
+          fi
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            if gh release view "${TAG}" >/dev/null 2>&1; then
+              gh release upload "${TAG}" "${FILES[@]}" --clobber
+            else
+              gh release create "${TAG}" "${FILES[@]}" \
+                --title "way ${TAG}" \
+                --notes "Auto-built HarmonyOS unsigned HAP（xray-rust / xray-core 双内核各一份）。"
+            fi
+          else
+            if gh release view hap-latest >/dev/null 2>&1; then
+              gh release upload hap-latest "${FILES[@]}" --clobber
+            else
+              gh release create hap-latest "${FILES[@]}" \
+                --prerelease \
+                --title "way Latest Auto-Built HAP" \
+                --notes "Latest automatically packaged unsigned HAPs (xray-rust + xray-core) from main / kernels-latest."
+            fi
+          fi

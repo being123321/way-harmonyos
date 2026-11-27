@@ -1,16 +1,10 @@
 import { socket } from '@kit.NetworkKit';
+import { isFakeOrReservedIp } from './Latency';
 
-// Plain-UDP DNS resolver used before the tunnel exists.
-//
-// The speed test goes through `xray_core_probe_outbound_url`, and the core
-// resolves the probe host with its configured DNS — which on this app is DoH,
-// so every probe first pays a DoH round trip (through the tunnel while
-// connected). Resolving those names once over UDP and writing them into
-// `dns.hosts` keeps the probe a pure TCP+HTTP round trip through the node.
+// Plain-UDP DNS resolver used for probe bootstrap (both pre-connect and inside
+// the protectProcessNet() VPN extension so probes never receive FakeIP 198.19.x.x).
+const DNS_SERVERS: string[] = ['223.5.5.5', '119.29.29.29', '114.114.114.114'];
 
-const DNS_SERVERS: string[] = ['223.5.5.5', '119.29.29.29'];
-
-// Builds a single-question A query: header, QNAME, QTYPE=A, QCLASS=IN.
 function buildQuery(id: number, host: string): Uint8Array {
   const labels: string[] = host.split('.');
   let size: number = 12 + 1 + 4;
@@ -54,7 +48,6 @@ function skipName(data: Uint8Array, start: number): number {
   return off;
 }
 
-// Reads the A records of the answer section; anything unexpected yields [].
 function parseAnswer(data: Uint8Array, id: number): string[] {
   const ips: string[] = [];
   if (data.length < 12) {
@@ -78,8 +71,11 @@ function parseAnswer(data: Uint8Array, id: number): string[] {
     const length: number = (data[off + 8] << 8) | data[off + 9];
     off += 10;
     if (type === 1 && length === 4 && off + 4 <= data.length) {
-      ips.push(data[off].toString() + '.' + data[off + 1].toString() + '.' +
-        data[off + 2].toString() + '.' + data[off + 3].toString());
+      const ip: string = data[off].toString() + '.' + data[off + 1].toString() + '.' +
+        data[off + 2].toString() + '.' + data[off + 3].toString();
+      if (!isFakeOrReservedIp(ip) && ips.indexOf(ip) < 0) {
+        ips.push(ip);
+      }
     }
     off += length;
   }
@@ -131,13 +127,34 @@ function queryOnce(host: string, server: string, timeoutMs: number): Promise<str
   });
 }
 
-// Tries the configured plain-UDP resolvers in order.
+// Races all plain-UDP resolvers concurrently and returns the first clean IPv4 answer.
 export async function resolveUdp(host: string, timeoutMs: number): Promise<string[]> {
-  for (const server of DNS_SERVERS) {
-    const ips: string[] = await queryOnce(host, server, timeoutMs);
-    if (ips.length > 0) {
-      return ips;
+  return new Promise<string[]>((resolve) => {
+    let settled: boolean = false;
+    let remaining: number = DNS_SERVERS.length;
+    const done = (ips: string[]): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve(ips);
+    };
+    for (const server of DNS_SERVERS) {
+      queryOnce(host, server, timeoutMs).then((ips: string[]) => {
+        if (ips.length > 0) {
+          done(ips);
+          return;
+        }
+        remaining--;
+        if (remaining <= 0) {
+          done([]);
+        }
+      }).catch(() => {
+        remaining--;
+        if (remaining <= 0) {
+          done([]);
+        }
+      });
     }
-  }
-  return [];
+  });
 }

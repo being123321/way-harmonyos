@@ -2,7 +2,10 @@ import { common } from '@kit.AbilityKit';
 import type { BusinessError } from '@kit.BasicServicesKit';
 import { promptAction, router } from '@kit.ArkUI';
 import { Insets, pageInsets } from '../common/Xray';
-import { RuleList, TARGET_BLOCK, TARGET_DIRECT, TARGET_PROXY, WayRuleSet, importCustomRuleSet, parseRuleSet } from '../common/RuleSet';
+import {
+  RuleList, TARGET_BLOCK, TARGET_DIRECT, TARGET_PROXY, WayRuleSet,
+  clearRuleSet, importCustomRuleSet, parseRuleSet
+} from '../common/RuleSet';
 import { appLog } from '../common/AppLog';
 
 interface RuleSetDraft {
@@ -197,11 +200,30 @@ struct AddRules {
               this.previewCard()
             }
 
-            Text('保存后可在主页「规则 → 使用规则集」里启用；想回到 ACL4SSR，用「内置」或「备份」。整份大规则集也可以直接推到 filesDir/xray/rules.json。')
+            Text('保存后可在主页「规则 → 使用自定义规则」中开启；不启用时使用极简基础规则（私有 IP 直连 + 绕过大陆 / GFW / 全局）。')
               .fontSize(10)
               .fontColor('#44536B')
               .width('100%')
+
+            Button('清空自定义规则（恢复基础规则）')
+              .width('100%')
+              .height(40)
+              .fontSize(12)
+              .fontColor('#FF5C7A')
+              .backgroundColor('#101A2E')
+              .borderRadius(12)
               .margin({ bottom: 20 })
+              .onClick(() => {
+                const context = this.ctx;
+                if (context !== null) {
+                  clearRuleSet(context);
+                  this.text = '';
+                  this.preview = null;
+                  this.error = '';
+                  promptAction.showToast({ message: '已清空自定义规则，恢复基础规则' });
+                  router.back();
+                }
+              })
           }
           .width('100%')
           .padding({ left: 16, right: 16, top: 4 })

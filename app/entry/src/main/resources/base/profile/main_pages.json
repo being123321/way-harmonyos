@@ -4,6 +4,7 @@
     "pages/Configs",
     "pages/AddConfig",
     "pages/AddRules",
-    "pages/Connections"
+    "pages/Connections",
+    "pages/TempKeepAlive"
   ]
 }

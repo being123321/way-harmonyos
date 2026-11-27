@@ -1,0 +1,358 @@
+name: Auto Build Upstream Kernels (HarmonyOS arm64-v8a)
+
+on:
+  schedule:
+    # Check upstream / user fork releases every 12 hours (UTC)
+    - cron: '15 */12 * * *'
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: 'Force rebuild even when upstream versions match kernels-latest'
+        required: false
+        default: 'false'
+        type: boolean
+      xray_rust_ref:
+        description: 'Override xray-rust ref/tag (leave empty for latest release/tag)'
+        required: false
+        default: ''
+        type: string
+      xray_core_ref:
+        description: 'Override Xray-core ref/tag (leave empty for latest release/tag)'
+        required: false
+        default: ''
+        type: string
+  repository_dispatch:
+    types: [upstream-kernel-updated]
+
+permissions:
+  contents: write
+
+env:
+  # Point these repository variables to your personal forks if desired:
+  # Settings -> Secrets and variables -> Actions -> Variables:
+  #   XRAY_RUST_REPO (default: aimalygin/xray-rust)
+  #   XRAY_CORE_REPO (default: XTLS/Xray-core)
+  XRAY_RUST_REPO: ${{ vars.XRAY_RUST_REPO || 'aimalygin/xray-rust' }}
+  XRAY_CORE_REPO: ${{ vars.XRAY_CORE_REPO || 'XTLS/Xray-core' }}
+  OHOS_NDK_URL: ${{ vars.OHOS_NDK_URL || 'https://cidownload.openharmony.cn/version/Master_Version/ohos-sdk-public_ohos/20250401_020155/version-Master_Version-ohos-sdk-public_ohos-20250401_020155-ohos-sdk-public_ohos.tar.gz' }}
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      rust_tag: ${{ steps.versions.outputs.rust_tag }}
+      core_tag: ${{ steps.versions.outputs.core_tag }}
+      build_rust: ${{ steps.versions.outputs.build_rust }}
+      build_core: ${{ steps.versions.outputs.build_core }}
+      need_release: ${{ steps.versions.outputs.need_release }}
+    steps:
+      - name: Query latest upstream / fork versions and current manifest
+        id: versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          query_latest() {
+            local repo="$1"
+            local tag
+            tag=$(curl -fsSL -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null \
+              | jq -r '.tag_name // empty' || true)
+            if [ -z "${tag}" ]; then
+              tag=$(curl -fsSL -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                "https://api.github.com/repos/${repo}/tags?per_page=1" 2>/dev/null \
+                | jq -r '.[0].name // empty' || true)
+            fi
+            if [ -z "${tag}" ]; then
+              tag=$(curl -fsSL -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                "https://api.github.com/repos/${repo}/commits?per_page=1" 2>/dev/null \
+                | jq -r '.[0].sha[0:10] // "main"' || true)
+            fi
+            echo "${tag}"
+          }
+
+          RUST_TAG="${{ github.event.inputs.xray_rust_ref }}"
+          [ -n "${RUST_TAG}" ] || RUST_TAG=$(query_latest "${XRAY_RUST_REPO}")
+          CORE_TAG="${{ github.event.inputs.xray_core_ref }}"
+          [ -n "${CORE_TAG}" ] || CORE_TAG=$(query_latest "${XRAY_CORE_REPO}")
+
+          MANIFEST_URL="https://github.com/${{ github.repository }}/releases/download/kernels-latest/kernels-manifest.json"
+          CUR_RUST=""
+          CUR_CORE=""
+          if curl -fsSL "${MANIFEST_URL}" -o /tmp/cur-manifest.json 2>/dev/null; then
+            CUR_RUST=$(jq -r '.kernels[] | select(.id=="xray-rust") | .version // empty' /tmp/cur-manifest.json || true)
+            CUR_CORE=$(jq -r '.kernels[] | select(.id=="xray-core") | .version // empty' /tmp/cur-manifest.json || true)
+          fi
+
+          FORCE="${{ github.event.inputs.force_rebuild }}"
+          BUILD_RUST="false"
+          BUILD_CORE="false"
+          if [ "${FORCE}" = "true" ] || [ "${RUST_TAG}" != "${CUR_RUST}" ]; then
+            BUILD_RUST="true"
+          fi
+          if [ "${FORCE}" = "true" ] || [ "${CORE_TAG}" != "${CUR_CORE}" ]; then
+            BUILD_CORE="true"
+          fi
+          NEED_RELEASE="false"
+          if [ "${BUILD_RUST}" = "true" ] || [ "${BUILD_CORE}" = "true" ]; then
+            NEED_RELEASE="true"
+          fi
+
+          echo "xray-rust: current=${CUR_RUST:-none} target=${RUST_TAG} build=${BUILD_RUST}"
+          echo "xray-core: current=${CUR_CORE:-none} target=${CORE_TAG} build=${BUILD_CORE}"
+          {
+            echo "rust_tag=${RUST_TAG}"
+            echo "core_tag=${CORE_TAG}"
+            echo "build_rust=${BUILD_RUST}"
+            echo "build_core=${BUILD_CORE}"
+            echo "need_release=${NEED_RELEASE}"
+          } >> "${GITHUB_OUTPUT}"
+
+  build-xray-rust:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.build_rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout way-harmonyos
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (aarch64-unknown-linux-ohos)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Setup OpenHarmony Native NDK
+        id: ohos_ndk
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ohos-sdk"
+          curl -fSL "${OHOS_NDK_URL}" -o "${RUNNER_TEMP}/ohos-sdk.tar.gz"
+          tar -xzf "${RUNNER_TEMP}/ohos-sdk.tar.gz" -C "${RUNNER_TEMP}/ohos-sdk"
+          NATIVE_ZIP=$(find "${RUNNER_TEMP}/ohos-sdk" -name 'native-linux-x64-*.zip' | head -n 1)
+          mkdir -p "${RUNNER_TEMP}/ohos-native"
+          unzip -q "${NATIVE_ZIP}" -d "${RUNNER_TEMP}/ohos-native"
+          LLVM_BIN=$(find "${RUNNER_TEMP}/ohos-native" -type d -path '*/native/llvm/bin' | head -n 1)
+          SYSROOT=$(find "${RUNNER_TEMP}/ohos-native" -type d -path '*/native/sysroot' | head -n 1)
+          echo "llvm_bin=${LLVM_BIN}" >> "${GITHUB_OUTPUT}"
+          echo "sysroot=${SYSROOT}" >> "${GITHUB_OUTPUT}"
+
+          cat > "${RUNNER_TEMP}/ohos-clang-cc.sh" <<EOF
+          #!/usr/bin/env bash
+          exec "${LLVM_BIN}/clang" --target=aarch64-linux-ohos --sysroot="${SYSROOT}" "\$@"
+          EOF
+          cat > "${RUNNER_TEMP}/ohos-clang-cxx.sh" <<EOF
+          #!/usr/bin/env bash
+          exec "${LLVM_BIN}/clang++" --target=aarch64-linux-ohos --sysroot="${SYSROOT}" "\$@"
+          EOF
+          chmod +x "${RUNNER_TEMP}/ohos-clang-cc.sh" "${RUNNER_TEMP}/ohos-clang-cxx.sh"
+
+      - name: Checkout xray-rust (${{ needs.check-upstream.outputs.rust_tag }})
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ needs.check-upstream.outputs.rust_tag }}" \
+            "https://github.com/${XRAY_RUST_REPO}.git" "${RUNNER_TEMP}/xray-rust" \
+          || (git clone "https://github.com/${XRAY_RUST_REPO}.git" "${RUNNER_TEMP}/xray-rust" && \
+              git -C "${RUNNER_TEMP}/xray-rust" checkout "${{ needs.check-upstream.outputs.rust_tag }}")
+
+      - name: Cross-compile libxray_ffi.a and libentry_rust.so
+        env:
+          CC_aarch64_unknown_linux_ohos: ${{ runner.temp }}/ohos-clang-cc.sh
+          CXX_aarch64_unknown_linux_ohos: ${{ runner.temp }}/ohos-clang-cxx.sh
+          AR_aarch64_unknown_linux_ohos: ${{ steps.ohos_ndk.outputs.llvm_bin }}/llvm-ar
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_LINKER: ${{ runner.temp }}/ohos-clang-cc.sh
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: s
+          CARGO_PROFILE_RELEASE_LTO: thin
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 1
+          CARGO_PROFILE_RELEASE_PANIC: abort
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}/xray-rust"
+          cargo build -Z build-std=std,panic_abort --release \
+            --target aarch64-unknown-linux-ohos \
+            -p xray-ffi --lib
+
+          OUT_DIR="${GITHUB_WORKSPACE}/dist/xray-rust"
+          mkdir -p "${OUT_DIR}"
+          cp target/aarch64-unknown-linux-ohos/release/libxray_ffi.a "${OUT_DIR}/libxray_ffi.a"
+          if [ -f crates/xray-ffi/include/xray_ffi.h ]; then
+            cp crates/xray-ffi/include/xray_ffi.h "${OUT_DIR}/xray_ffi.h"
+          fi
+
+          # Link HarmonyOS NAPI wrapper into libentry_rust.so
+          "${RUNNER_TEMP}/ohos-clang-cxx.sh" -shared -fPIC -O2 -std=c++17 \
+            -I"${GITHUB_WORKSPACE}/app/entry/src/main/cpp/include" \
+            -I"${steps.ohos_ndk.outputs.sysroot}/usr/include" \
+            "${GITHUB_WORKSPACE}/app/entry/src/main/cpp/xray_napi.cpp" \
+            -Wl,--whole-archive "${OUT_DIR}/libxray_ffi.a" -Wl,--no-whole-archive \
+            -L"${steps.ohos_ndk.outputs.sysroot}/usr/lib/aarch64-linux-ohos" \
+            -lace_napi.z -lhilog_ndk.z -lc++_shared \
+            -Wl,--gc-sections -Wl,--exclude-libs,ALL -Wl,-O2 -Wl,--strip-all \
+            -o "${OUT_DIR}/libentry_rust.so"
+
+          # Sanity-check exported NAPI registration & absence of unexpected dynamic deps
+          "${steps.ohos_ndk.outputs.llvm_bin}/llvm-readelf" -d "${OUT_DIR}/libentry_rust.so" | grep -E 'NEEDED|SONAME' || true
+          sha256sum "${OUT_DIR}/libentry_rust.so" > "${OUT_DIR}/libentry_rust.so.sha256"
+
+      - name: Upload xray-rust artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-xray-rust
+          path: dist/xray-rust/libentry_rust.so*
+
+  build-xray-core:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.build_core == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout way-harmonyos
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Setup OpenHarmony Native NDK
+        id: ohos_ndk
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ohos-sdk"
+          curl -fSL "${OHOS_NDK_URL}" -o "${RUNNER_TEMP}/ohos-sdk.tar.gz"
+          tar -xzf "${RUNNER_TEMP}/ohos-sdk.tar.gz" -C "${RUNNER_TEMP}/ohos-sdk"
+          NATIVE_ZIP=$(find "${RUNNER_TEMP}/ohos-sdk" -name 'native-linux-x64-*.zip' | head -n 1)
+          mkdir -p "${RUNNER_TEMP}/ohos-native"
+          unzip -q "${NATIVE_ZIP}" -d "${RUNNER_TEMP}/ohos-native"
+          LLVM_BIN=$(find "${RUNNER_TEMP}/ohos-native" -type d -path '*/native/llvm/bin' | head -n 1)
+          SYSROOT=$(find "${RUNNER_TEMP}/ohos-native" -type d -path '*/native/sysroot' | head -n 1)
+          echo "llvm_bin=${LLVM_BIN}" >> "${GITHUB_OUTPUT}"
+          echo "sysroot=${SYSROOT}" >> "${GITHUB_OUTPUT}"
+
+          cat > "${RUNNER_TEMP}/ohos-clang-cc.sh" <<EOF
+          #!/usr/bin/env bash
+          exec "${LLVM_BIN}/clang" --target=aarch64-linux-ohos --sysroot="${SYSROOT}" "\$@"
+          EOF
+          chmod +x "${RUNNER_TEMP}/ohos-clang-cc.sh"
+
+      - name: Cross-compile XTLS/Xray-core Go C-ABI shared library (${{ needs.check-upstream.outputs.core_tag }})
+        env:
+          CGO_ENABLED: 1
+          GOOS: linux
+          GOARCH: arm64
+          CC: ${{ runner.temp }}/ohos-clang-cc.sh
+          CGO_CFLAGS: "-O2 -D__OHOS__"
+          CGO_LDFLAGS: "-Wl,-z,max-page-size=16384 -Wl,--strip-all"
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE}/app/native/xray-go-bridge"
+          CORE_TAG="${{ needs.check-upstream.outputs.core_tag }}"
+          # Support both official XTLS/Xray-core and user forks via go.mod replace
+          if [ "${XRAY_CORE_REPO}" != "XTLS/Xray-core" ]; then
+            go mod edit -replace "github.com/xtls/xray-core=github.com/${XRAY_CORE_REPO}@${CORE_TAG}"
+          else
+            go get "github.com/xtls/xray-core@${CORE_TAG}"
+          fi
+          go mod tidy
+
+          OUT_DIR="${GITHUB_WORKSPACE}/dist/xray-core"
+          mkdir -p "${OUT_DIR}"
+          go build -trimpath -buildmode=c-shared \
+            -ldflags="-s -w -X main.coreVersion=${CORE_TAG}" \
+            -o "${OUT_DIR}/libxray_core_ohos.so" .
+
+          "${steps.ohos_ndk.outputs.llvm_bin}/llvm-readelf" -d "${OUT_DIR}/libxray_core_ohos.so" | grep -E 'NEEDED|SONAME' || true
+          sha256sum "${OUT_DIR}/libxray_core_ohos.so" > "${OUT_DIR}/libxray_core_ohos.so.sha256"
+
+      - name: Upload Xray-core artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-xray-core
+          path: dist/xray-core/libxray_core_ohos.so*
+
+  publish-kernels:
+    needs: [check-upstream, build-xray-rust, build-xray-core]
+    if: always() && needs.check-upstream.outputs.need_release == 'true' && (needs.build-xray-rust.result == 'success' || needs.build-xray-core.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate kernels-manifest.json and publish kernels-latest Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          BUILT_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          BASE_URL="https://github.com/${{ github.repository }}/releases/download/kernels-latest"
+
+          # Preserve previous asset if only one of the two cores was rebuilt
+          if curl -fsSL "${BASE_URL}/kernels-manifest.json" -o /tmp/prev-manifest.json 2>/dev/null; then
+            echo "Loaded existing kernels-manifest.json"
+          else
+            echo '{"schemaVersion":1,"kernels":[]}' > /tmp/prev-manifest.json
+          fi
+
+          RUST_SHA=""
+          if [ -f release-assets/libentry_rust.so.sha256 ]; then
+            RUST_SHA=$(awk '{print $1}' release-assets/libentry_rust.so.sha256)
+          else
+            RUST_SHA=$(jq -r '.kernels[] | select(.id=="xray-rust") | .sha256 // ""' /tmp/prev-manifest.json)
+          fi
+
+          CORE_SHA=""
+          if [ -f release-assets/libxray_core_ohos.so.sha256 ]; then
+            CORE_SHA=$(awk '{print $1}' release-assets/libxray_core_ohos.so.sha256)
+          else
+            CORE_SHA=$(jq -r '.kernels[] | select(.id=="xray-core") | .sha256 // ""' /tmp/prev-manifest.json)
+          fi
+
+          jq -n \
+            --arg builtAt "${BUILT_AT}" \
+            --arg rustVer "${{ needs.check-upstream.outputs.rust_tag }}" \
+            --arg rustSha "${RUST_SHA}" \
+            --arg rustUrl "${BASE_URL}/libentry_rust.so" \
+            --arg coreVer "${{ needs.check-upstream.outputs.core_tag }}" \
+            --arg coreSha "${CORE_SHA}" \
+            --arg coreUrl "${BASE_URL}/libxray_core_ohos.so" \
+            '{
+              schemaVersion: 1,
+              updatedAt: $builtAt,
+              kernels: [
+                {
+                  id: "xray-rust",
+                  version: $rustVer,
+                  sha256: $rustSha,
+                  assetUrl: $rustUrl,
+                  builtAt: $builtAt
+                },
+                {
+                  id: "xray-core",
+                  version: $coreVer,
+                  sha256: $coreSha,
+                  assetUrl: $coreUrl,
+                  builtAt: $builtAt
+                }
+              ]
+            }' > release-assets/kernels-manifest.json
+
+          cat release-assets/kernels-manifest.json
+
+          if gh release view kernels-latest >/dev/null 2>&1; then
+            gh release upload kernels-latest release-assets/* --clobber
+          else
+            gh release create kernels-latest release-assets/* \
+              --title "Auto-Built HarmonyOS Kernels (xray-rust + Xray-core)" \
+              --notes "Automatically built arm64-v8a kernels for way-harmonyos. App automatically rolls back to the previous working kernel if any error occurs."
+          fi
+
+      - name: Trigger automatic HAP packaging
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run build-way-hap.yml --ref main || true

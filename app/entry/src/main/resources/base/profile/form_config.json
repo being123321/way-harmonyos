@@ -3,7 +3,7 @@
     {
       "name": "way_widget",
       "displayName": "way 快捷开关",
-      "description": "无需添加卡片；开启「后台运行 VPN」后立即生效。",
+      "description": "桌面快捷连接/断开开关（可选添加）。",
       "src": "./ets/card/WidgetCard.ets",
       "uiSyntax": "arkts",
       "window": {

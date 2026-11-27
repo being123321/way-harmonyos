@@ -97,69 +97,23 @@ function retagProxy(json: string, entryId: string): string {
   return JSON.stringify(root);
 }
 
-export function buildTunnelConfig(baseJson: string, selectedId: string, nodes: TunnelNode[],
+// Builds a lean single-node tunnel config (selected node + direct/block helpers)
+// instead of loading all saved subscription nodes into the live VPN core.
+// Speed tests run in an isolated short-lived probe core (`probeProfiles`), so
+// keeping unused nodes out of the live core cuts steady-state RAM and prevents
+// startup/reload stalls when a user imports 50-500 subscription nodes.
+export function buildTunnelConfig(baseJson: string, selectedId: string, _nodes: TunnelNode[],
   options: SplitOptions): TunnelConfigResult {
   const tagged: string = retagProxy(baseJson, selectedId);
   const single: string = applyBuiltInRules(tagged, options);
-  const fallback: TunnelConfigResult = { text: single, single: single, count: 1, multi: false };
-  let root: Record<string, Object>;
-  try {
-    root = JSON.parse(single) as Record<string, Object>;
-  } catch (error) {
-    return fallback;
-  }
-  const outbounds: Object[] = outboundList(root);
-  const tags: Set<string> = new Set();
-  for (const item of outbounds) {
-    const tag: string = outboundTag(item as Record<string, Object>);
-    if (tag.length > 0) {
-      tags.add(tag);
-    }
-  }
-  let count: number = 1;
-  for (const node of nodes) {
-    if (node.id === selectedId || tags.has(node.id)) {
-      continue;
-    }
-    const outbound: Record<string, Object> | null = proxyOutbound(node.json);
-    if (outbound === null) {
-      continue;
-    }
-    let copy: Record<string, Object>;
-    try {
-      copy = JSON.parse(JSON.stringify(outbound)) as Record<string, Object>;
-    } catch (error) {
-      continue;
-    }
-    copy['tag'] = node.id;
-    outbounds.push(copy);
-    tags.add(node.id);
-    count++;
-  }
-  if (count <= 1) {
-    return fallback;
-  }
-  root['outbounds'] = outbounds;
-  try {
-    const text: string = JSON.stringify(root);
-    const result: TunnelConfigResult = { text: text, single: single, count: count, multi: true };
-    return result;
-  } catch (error) {
-    return fallback;
-  }
+  const result: TunnelConfigResult = { text: single, single: single, count: 1, multi: false };
+  return result;
 }
 
-// Builds the tunnel config from every saved node and writes it as config.json.
-// Shared by connect, the watchdog restart and the per-Wi-Fi mode switch so all
-// three keep the rule set and the per-node probe tags in sync.
+// Builds the lean single-node tunnel config and writes it as config.json.
 export function buildAndSaveTunnel(context: common.Context, entry: ConfigEntry,
   options: SplitOptions): TunnelConfigResult {
-  const nodes: TunnelNode[] = [];
-  for (const item of readStore(context).items) {
-    const node: TunnelNode = { id: item.id, json: item.json };
-    nodes.push(node);
-  }
-  const tunnel: TunnelConfigResult = buildTunnelConfig(entry.json, entry.id, nodes, options);
+  const tunnel: TunnelConfigResult = buildTunnelConfig(entry.json, entry.id, [], options);
   const text: string = applyBootstrapHosts(tunnel.text, options.bootstrapHosts);
   const single: string = applyBootstrapHosts(tunnel.single, options.bootstrapHosts);
   const result: TunnelConfigResult = {
