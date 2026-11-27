@@ -129,6 +129,9 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout way-harmonyos (gh 需要在 git 仓库上下文中运行)
+        uses: actions/checkout@v4
+
       - name: Download built HAPs
         uses: actions/download-artifact@v4
         with:
