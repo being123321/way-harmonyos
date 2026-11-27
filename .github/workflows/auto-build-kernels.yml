@@ -158,6 +158,15 @@ jobs:
           || (git clone "https://github.com/${XRAY_RUST_REPO}.git" "${RUNNER_TEMP}/xray-rust" && \
               git -C "${RUNNER_TEMP}/xray-rust" checkout "${{ needs.check-upstream.outputs.rust_tag }}")
 
+      - name: Apply way OHOS patch (kernel/way-ohos.patch)
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}/xray-rust"
+          PATCH="${GITHUB_WORKSPACE}/kernel/way-ohos.patch"
+          [ -f "${PATCH}" ] || { echo "::error::kernel/way-ohos.patch not found"; exit 1; }
+          git apply -v --3way "${PATCH}" || patch -p1 --forward < "${PATCH}"
+          echo "patch applied"
+
       - name: Cross-compile libxray_ffi.a and libentry_rust.so
         env:
           # xray-rust 的 rust-toolchain.toml 钉在 1.96.0；直接用 nightly 会因新 lint
