@@ -26,6 +26,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 env:
   # Point these repository variables to your personal forks if desired:
