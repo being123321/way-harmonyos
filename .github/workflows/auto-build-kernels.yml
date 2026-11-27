@@ -100,7 +100,14 @@ jobs:
           CORE_SRC="${{ steps.src.outputs.core_src }}"
           RUST_TAG="${{ github.event.inputs.xray_rust_ref }}"
           [ -n "${RUST_TAG}" ] || RUST_TAG=$(query_latest "${RUST_SRC}")
+          # XTLS/Xray-core 的 v25+/v26+ tag 属于「大版本号但 module path 未加 /vN」，
+          # Go 会拒绝 go get；因此 core 改为跟随上游默认分支的 commit（pseudo-version）
           CORE_TAG="${{ github.event.inputs.xray_core_ref }}"
+          if [ -z "${CORE_TAG}" ]; then
+            CORE_TAG=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${CORE_SRC}/commits?per_page=1" 2>/dev/null \
+              | jq -r '.[0].sha[0:10] // empty' || true)
+          fi
           [ -n "${CORE_TAG}" ] || CORE_TAG=$(query_latest "${CORE_SRC}")
 
           MANIFEST_URL="https://github.com/${{ github.repository }}/releases/download/kernels-latest/kernels-manifest.json"
@@ -310,26 +317,11 @@ jobs:
           CORE_TAG="${{ needs.check-upstream.outputs.core_tag }}"
           # Support both official XTLS/Xray-core and user forks via go.mod replace
           CORE_SRC="${{ needs.check-upstream.outputs.core_src }}"
-          if [ "${CORE_SRC}" != "XTLS/Xray-core" ]; then
-            # fork：直接把上游模块替换成 fork 的提交
-            go mod edit -replace "github.com/xtls/xray-core=github.com/${CORE_SRC}@${CORE_TAG}"
-          else
-            # 上游：从 v25 起 module path 带大版本后缀（/v25、/v26 …），
-            # 桥接代码仍按 github.com/xtls/xray-core 引用，用 replace 映射过去
-            set +e
-            OUT=$(go get "github.com/xtls/xray-core@${CORE_TAG}" 2>&1)
-            RC=$?
-            set -e
-            if [ $RC -ne 0 ]; then
-              MODPATH=$(echo "${OUT}" | sed -n 's/.*module path must match major version ("\([^"]*\)").*/\1/p' | head -n 1)
-              if [ -n "${MODPATH}" ]; then
-                echo "detected versioned module path: ${MODPATH}"
-                go mod edit -replace "github.com/xtls/xray-core=${MODPATH}@${CORE_TAG}"
-              else
-                echo "${OUT}"
-                exit 1
-              fi
-            fi
+          # 先用上游 commit（pseudo-version）；失败则退回配置的 fork
+          if ! go get "github.com/xtls/xray-core@${CORE_TAG}" 2>/tmp/goget.err; then
+            echo "go get ${CORE_SRC}@${CORE_TAG} failed:"; cat /tmp/goget.err
+            echo "fallback -> ${XRAY_CORE_REPO}@${CORE_TAG}"
+            go mod edit -replace "github.com/xtls/xray-core=github.com/${XRAY_CORE_REPO}@${CORE_TAG}"
           fi
           go mod tidy
 
